@@ -1,0 +1,6 @@
+{
+  "name": "TMS VPN",
+  "description": "Professional VPN Management Platform & Control Center",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

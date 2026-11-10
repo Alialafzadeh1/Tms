@@ -1,0 +1,203 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidTimestamp(val) {
+      return val is timestamp && val <= request.time;
+    }
+
+    function isValidVpnConfig(data) {
+      return data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+             data.protocol is string && (data.protocol == 'vless' || data.protocol == 'vmess' || data.protocol == 'trojan' || data.protocol == 'shadowsocks') &&
+             data.server is string && data.server.size() > 0 && data.server.size() <= 256 &&
+             data.port is int && data.port >= 1 && data.port <= 65535 &&
+             data.uuidOrPassword is string && data.uuidOrPassword.size() > 0 && data.uuidOrPassword.size() <= 512 &&
+             (!('transport' in data) || (data.transport is string && data.transport.size() <= 32)) &&
+             (!('security' in data) || (data.security is string && data.security.size() <= 32)) &&
+             (!('sni' in data) || (data.sni is string && data.sni.size() <= 256)) &&
+             (!('pathOrServiceName' in data) || (data.pathOrServiceName is string && data.pathOrServiceName.size() <= 256)) &&
+             data.rawConfig is string && data.rawConfig.size() > 0 && data.rawConfig.size() <= 4096 &&
+             (!('pingMs' in data) || (data.pingMs is int)) &&
+             (!('status' in data) || (data.status is string && (data.status == 'online' || data.status == 'offline' || data.status == 'untested'))) &&
+             (!('isFavorite' in data) || (data.isFavorite is bool)) &&
+             isValidTimestamp(data.updatedAt);
+    }
+
+    function isValidVpnServer(data) {
+      return data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+             data.country is string && data.country.size() > 0 && data.country.size() <= 100 &&
+             data.countryCode is string && data.countryCode.size() >= 2 && data.countryCode.size() <= 8 &&
+             data.host is string && data.host.size() > 0 && data.host.size() <= 256 &&
+             data.port is int && data.port >= 1 && data.port <= 65535 &&
+             data.protocol is string && data.protocol.size() > 0 && data.protocol.size() <= 32 &&
+             data.status is string && (data.status == 'online' || data.status == 'offline' || data.status == 'maintenance') &&
+             (!('latencyMs' in data) || (data.latencyMs is int)) &&
+             (!('uptimePercentage' in data) || (data.uptimePercentage is number)) &&
+             (!('bandwidthUsageGb' in data) || (data.bandwidthUsageGb is number)) &&
+             (!('bandwidthLimitGb' in data) || (data.bandwidthLimitGb is number)) &&
+             (!('activeUsers' in data) || (data.activeUsers is int)) &&
+             (!('stabilityScore' in data) || (data.stabilityScore is int && data.stabilityScore >= 0 && data.stabilityScore <= 100)) &&
+             isValidTimestamp(data.updatedAt);
+    }
+
+    function isValidFailoverPolicy(data) {
+      return data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+             data.primaryServerId is string && data.primaryServerId.size() > 0 && data.primaryServerId.size() <= 128 &&
+             data.backupServerId is string && data.backupServerId.size() > 0 && data.backupServerId.size() <= 128 &&
+             data.latencyThresholdMs is int && data.latencyThresholdMs >= 50 && data.latencyThresholdMs <= 5000 &&
+             data.autoSwitchEnabled is bool &&
+             isValidTimestamp(data.updatedAt);
+    }
+
+    function isValidUserProfile(data) {
+      return data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             data.displayName is string && data.displayName.size() > 0 && data.displayName.size() <= 100 &&
+             data.email is string && data.email.size() > 0 && data.email.size() <= 256 &&
+             data.role is string && (
+               data.role == 'SUPER_ADMIN' ||
+               data.role == 'SERVER_MANAGER' ||
+               data.role == 'USER_ADMIN' ||
+               data.role == 'AUDITOR' ||
+               data.role == 'admin' ||
+               data.role == 'operator' ||
+               data.role == 'user'
+             ) &&
+             data.subscriptionStatus is string && (data.subscriptionStatus == 'active' || data.subscriptionStatus == 'expired' || data.subscriptionStatus == 'trial') &&
+             (!('deviceCount' in data) || (data.deviceCount is int)) &&
+             (!('maxDevices' in data) || (data.maxDevices is int)) &&
+             (!('dataUsageBytes' in data) || (data.dataUsageBytes is number)) &&
+             (!('dataLimitBytes' in data) || (data.dataLimitBytes is number)) &&
+             isValidTimestamp(data.updatedAt);
+    }
+
+    function isValidAuthAuditLog(data) {
+      return data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             data.action is string && data.action.size() > 0 && data.action.size() <= 128 &&
+             data.role is string && data.role.size() > 0 && data.role.size() <= 64 &&
+             data.module is string && data.module.size() > 0 && data.module.size() <= 64 &&
+             data.status is string && (data.status == 'SUCCESS' || data.status == 'FAILED' || data.status == 'LOCKED_OUT') &&
+             (!('ipOrDevice' in data) || (data.ipOrDevice is string && data.ipOrDevice.size() <= 256)) &&
+             (!('details' in data) || (data.details is string && data.details.size() <= 1024)) &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && request.auth.uid == userId && isValidId(userId);
+      allow list: if false;
+
+      allow create: if isSignedIn() &&
+                       request.auth.uid == userId &&
+                       incoming().userId == userId &&
+                       incoming().createdAt is timestamp &&
+                       isValidTimestamp(incoming().createdAt) &&
+                       isValidUserProfile(incoming());
+
+      allow update: if isSignedIn() &&
+                       request.auth.uid == userId &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       isValidUserProfile(incoming());
+
+      allow delete: if isSignedIn() && request.auth.uid == userId;
+
+      match /vpn_configs/{configId} {
+        allow get: if isSignedIn() && request.auth.uid == userId && isValidId(configId);
+        allow list: if isSignedIn() && request.auth.uid == userId;
+
+        allow create: if isSignedIn() &&
+                         request.auth.uid == userId &&
+                         incoming().userId == userId &&
+                         incoming().createdAt is timestamp &&
+                         isValidTimestamp(incoming().createdAt) &&
+                         isValidVpnConfig(incoming());
+
+        allow update: if isSignedIn() &&
+                         request.auth.uid == userId &&
+                         incoming().userId == existing().userId &&
+                         incoming().createdAt == existing().createdAt &&
+                         isValidVpnConfig(incoming());
+
+        allow delete: if isSignedIn() && request.auth.uid == userId && isValidId(configId);
+      }
+
+      match /vpn_servers/{serverId} {
+        allow get: if isSignedIn() && request.auth.uid == userId && isValidId(serverId);
+        allow list: if isSignedIn() && request.auth.uid == userId;
+
+        allow create: if isSignedIn() &&
+                         request.auth.uid == userId &&
+                         incoming().userId == userId &&
+                         incoming().createdAt is timestamp &&
+                         isValidTimestamp(incoming().createdAt) &&
+                         isValidVpnServer(incoming());
+
+        allow update: if isSignedIn() &&
+                         request.auth.uid == userId &&
+                         incoming().userId == existing().userId &&
+                         incoming().createdAt == existing().createdAt &&
+                         isValidVpnServer(incoming());
+
+        allow delete: if isSignedIn() && request.auth.uid == userId && isValidId(serverId);
+      }
+
+      match /failover_policies/{policyId} {
+        allow get: if isSignedIn() && request.auth.uid == userId && isValidId(policyId);
+        allow list: if isSignedIn() && request.auth.uid == userId;
+
+        allow create: if isSignedIn() &&
+                         request.auth.uid == userId &&
+                         incoming().userId == userId &&
+                         incoming().createdAt is timestamp &&
+                         isValidTimestamp(incoming().createdAt) &&
+                         isValidFailoverPolicy(incoming());
+
+        allow update: if isSignedIn() &&
+                         request.auth.uid == userId &&
+                         incoming().userId == existing().userId &&
+                         incoming().createdAt == existing().createdAt &&
+                         isValidFailoverPolicy(incoming());
+
+        allow delete: if isSignedIn() && request.auth.uid == userId && isValidId(policyId);
+      }
+
+      match /audit_logs/{logId} {
+        allow get: if isSignedIn() && request.auth.uid == userId && isValidId(logId);
+        allow list: if isSignedIn() && request.auth.uid == userId;
+
+        allow create: if isSignedIn() &&
+                         request.auth.uid == userId &&
+                         incoming().userId == userId &&
+                         incoming().createdAt is timestamp &&
+                         isValidTimestamp(incoming().createdAt) &&
+                         isValidAuthAuditLog(incoming());
+
+        // Audit logs are append-only to prevent tampering
+        allow update, delete: if false;
+      }
+    }
+  }
+}

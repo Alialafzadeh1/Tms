@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<resources>
+    <string name="firestore_database_id" translatable="false">ai-studio-android-tmsvpn-f4c920d0-5850-4fc7-93d2-dff7792f4179</string>
+    <string name="recaptcha_site_key" translatable="false">6LcHCxkuAAAAAKwIvLFcEXB3-2G3Q5MJUdiFOJsz</string>
+</resources>

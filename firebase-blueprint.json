@@ -1,0 +1,125 @@
+{
+  "entities": {
+    "VpnConfig": {
+      "title": "VPN Configuration",
+      "description": "A VPN client configuration profile (VLESS, VMess, Trojan, Shadowsocks)",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Owner user ID" },
+        "name": { "type": "string", "description": "Config display label" },
+        "protocol": { "type": "string", "description": "Protocol: vless, vmess, trojan, or shadowsocks" },
+        "server": { "type": "string", "description": "Server address or hostname" },
+        "port": { "type": "integer", "description": "Port number" },
+        "uuidOrPassword": { "type": "string", "description": "Authentication UUID or password" },
+        "transport": { "type": "string", "description": "Transport protocol: tcp, ws, grpc, h2" },
+        "security": { "type": "string", "description": "Security layer: tls, reality, none" },
+        "sni": { "type": "string", "description": "Server Name Indication" },
+        "pathOrServiceName": { "type": "string", "description": "WebSocket path or gRPC service name" },
+        "rawConfig": { "type": "string", "description": "Raw URI or encrypted config" },
+        "pingMs": { "type": "integer", "description": "Last tested latency in milliseconds (-1 for offline)" },
+        "status": { "type": "string", "description": "Status: online, offline, untested" },
+        "isFavorite": { "type": "boolean", "description": "Flag for favorite config" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp via serverTimestamp" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last update timestamp via serverTimestamp" }
+      },
+      "required": ["userId", "name", "protocol", "server", "port", "uuidOrPassword", "rawConfig", "createdAt", "updatedAt"]
+    },
+    "VpnServer": {
+      "title": "VPN Node Server",
+      "description": "A VPN server infrastructure node monitored for health and latency",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Owner user ID" },
+        "name": { "type": "string", "description": "Server name" },
+        "country": { "type": "string", "description": "Country name" },
+        "countryCode": { "type": "string", "description": "Country code (e.g. DE, FI, US)" },
+        "host": { "type": "string", "description": "Server IP address or hostname" },
+        "port": { "type": "integer", "description": "Port number" },
+        "protocol": { "type": "string", "description": "Primary protocol supported" },
+        "status": { "type": "string", "description": "Status: online, offline, maintenance" },
+        "latencyMs": { "type": "integer", "description": "Last latency check result in milliseconds" },
+        "uptimePercentage": { "type": "number", "description": "Uptime percentage (0.0 to 100.0)" },
+        "bandwidthUsageGb": { "type": "number", "description": "Bandwidth usage in Gigabytes" },
+        "bandwidthLimitGb": { "type": "number", "description": "Bandwidth limit in Gigabytes" },
+        "activeUsers": { "type": "integer", "description": "Number of connected users" },
+        "stabilityScore": { "type": "integer", "description": "Calculated stability score (0-100)" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp via serverTimestamp" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last update timestamp via serverTimestamp" }
+      },
+      "required": ["userId", "name", "country", "countryCode", "host", "port", "protocol", "status", "createdAt", "updatedAt"]
+    },
+    "FailoverPolicy": {
+      "title": "Failover Policy",
+      "description": "Automated server failover and intelligent routing configuration",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Owner user ID" },
+        "name": { "type": "string", "description": "Policy title" },
+        "primaryServerId": { "type": "string", "description": "Primary server ID" },
+        "backupServerId": { "type": "string", "description": "Backup server ID" },
+        "latencyThresholdMs": { "type": "integer", "description": "Threshold latency in ms before failover" },
+        "autoSwitchEnabled": { "type": "boolean", "description": "Whether automated failover is active" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Update timestamp" }
+      },
+      "required": ["userId", "name", "primaryServerId", "backupServerId", "latencyThresholdMs", "autoSwitchEnabled", "createdAt", "updatedAt"]
+    },
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "User account status, RBAC role, and quota details",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "User identifier matching auth.uid" },
+        "displayName": { "type": "string", "description": "User display name" },
+        "email": { "type": "string", "description": "User email address" },
+        "role": { "type": "string", "description": "RBAC Role: SUPER_ADMIN, SERVER_MANAGER, USER_ADMIN, AUDITOR" },
+        "deviceCount": { "type": "integer", "description": "Currently active registered devices" },
+        "maxDevices": { "type": "integer", "description": "Maximum device limit" },
+        "dataUsageBytes": { "type": "number", "description": "Bandwidth consumed in bytes" },
+        "dataLimitBytes": { "type": "number", "description": "Bandwidth quota in bytes" },
+        "subscriptionStatus": { "type": "string", "description": "Subscription status: active, expired, trial" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Profile creation timestamp" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Profile update timestamp" }
+      },
+      "required": ["userId", "displayName", "email", "role", "subscriptionStatus", "createdAt", "updatedAt"]
+    },
+    "AuthAuditLog": {
+      "title": "Authentication & RBAC Audit Log",
+      "description": "Audit entry recording admin authentication attempts, session events, and RBAC actions",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Admin UID" },
+        "action": { "type": "string", "description": "Event action name" },
+        "role": { "type": "string", "description": "Active role" },
+        "module": { "type": "string", "description": "Target module" },
+        "status": { "type": "string", "description": "SUCCESS, FAILED, or LOCKED_OUT" },
+        "ipOrDevice": { "type": "string", "description": "Client IP address or device identifier" },
+        "details": { "type": "string", "description": "Audit details or error reason" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Server timestamp of event" }
+      },
+      "required": ["userId", "action", "role", "module", "status", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/vpn_configs/{configId}": {
+      "schema": "VpnConfig",
+      "description": "VPN configurations owned by the user"
+    },
+    "/users/{userId}/vpn_servers/{serverId}": {
+      "schema": "VpnServer",
+      "description": "VPN servers monitored and managed by the user"
+    },
+    "/users/{userId}/failover_policies/{policyId}": {
+      "schema": "FailoverPolicy",
+      "description": "Failover routing policies owned by the user"
+    },
+    "/users/{userId}/audit_logs/{logId}": {
+      "schema": "AuthAuditLog",
+      "description": "Security and RBAC audit logs for administrator operations"
+    },
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profile and subscription metadata"
+    }
+  }
+}
