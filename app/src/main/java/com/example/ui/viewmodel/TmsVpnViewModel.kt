@@ -21,6 +21,8 @@ import com.example.data.repository.VpnRepository
 import com.example.data.security.AdminSecurityManager
 import com.example.data.security.AuthAttemptResult
 import com.example.data.security.SessionToken
+import com.example.data.local.LocalVpnConfigEntity
+import com.example.data.local.LocalVpnConfigRepository
 import com.example.data.validation.InputValidator
 import com.example.data.validation.ValidationResult
 import com.google.firebase.Firebase
@@ -36,6 +38,11 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
+import android.content.Context
+import com.example.data.model.VpnConnectionState
+import com.example.data.model.VpnSessionStats
+import com.example.vpn.VpnController
+
 private const val TAG = "TmsVpnViewModel"
 
 sealed interface UiMessage {
@@ -46,8 +53,16 @@ sealed interface UiMessage {
 class TmsVpnViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = VpnRepository(application)
+    private val localConfigRepository = LocalVpnConfigRepository(application)
     private val aiEngine = VpnAiEngine()
     private val securityManager = AdminSecurityManager(application)
+
+    // --- REAL VPN ENGINE INTEGRATION ---
+    val vpnConnectionState: StateFlow<VpnConnectionState> = VpnController.connectionState
+    val vpnSessionStats: StateFlow<VpnSessionStats> = VpnController.sessionStats
+
+    private val _selectedVpnConfig = MutableStateFlow<VpnConfig?>(null)
+    val selectedVpnConfig: StateFlow<VpnConfig?> = _selectedVpnConfig.asStateFlow()
 
     private val _uiMessage = MutableStateFlow<UiMessage?>(null)
     val uiMessage: StateFlow<UiMessage?> = _uiMessage.asStateFlow()
@@ -78,16 +93,43 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     // Explicit role override (allows switching between Super Admin, Server Manager, User Admin, and Auditor in the UI)
     private val _selectedRole = MutableStateFlow<AdminRole?>(null)
 
-    val configs: StateFlow<List<VpnConfig>> = repository.observeConfigs()
-        .catch { error ->
-            Log.e(TAG, "Error observing configs", error)
-            emit(emptyList())
-        }
+    // Room local configurations StateFlow for offline persistence and inspection
+    val localConfigs: StateFlow<List<LocalVpnConfigEntity>> = localConfigRepository.allEntities
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5000L),
             initialValue = emptyList()
         )
+
+    init {
+        // Automatically synchronize remote Firestore configurations into Room local database
+        viewModelScope.launch {
+            try {
+                repository.observeConfigs().catch { }.collect { remoteConfigs ->
+                    if (remoteConfigs.isNotEmpty()) {
+                        localConfigRepository.saveAllConfigs(remoteConfigs)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Sync to local Room database: ${e.message}")
+            }
+        }
+    }
+
+    // Unified configurations: remote Firestore with seamless local Room database fallback
+    val configs: StateFlow<List<VpnConfig>> = combine(
+        repository.observeConfigs().catch { error ->
+            Log.d(TAG, "Firestore observeConfigs caught, using local fallback: ${error.message}")
+            emit(emptyList())
+        },
+        localConfigRepository.allConfigs
+    ) { remoteList, localList ->
+        if (remoteList.isNotEmpty()) remoteList else localList
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
 
     val servers: StateFlow<List<VpnServer>> = repository.observeServers()
         .catch { error ->
@@ -435,7 +477,156 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    // --- REAL VPN CONNECTION CONTROL ---
+
+    fun selectConfigForVpn(config: VpnConfig) {
+        _selectedVpnConfig.value = config
+    }
+
+    fun connectVpn(context: Context, configToUse: VpnConfig? = null) {
+        val target = configToUse ?: _selectedVpnConfig.value ?: configs.value.firstOrNull()
+        if (target == null) {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) "هیچ کانفیگی برای برقراری تونل انتخاب نشده است / No config selected"
+                else "No VPN configuration selected"
+            )
+            return
+        }
+
+        _selectedVpnConfig.value = target
+        VpnController.startVpn(context, target)
+
+        viewModelScope.launch {
+            try {
+                val user = Firebase.auth.currentUser
+                if (user != null) {
+                    repository.addAuditLog(
+                        AuthAuditLog(
+                            userId = user.uid,
+                            action = "VPN_TUNNEL_CONNECTED",
+                            role = currentRole.value.id,
+                            module = "VpnService",
+                            status = "SUCCESS",
+                            ipOrDevice = getDeviceInfo(),
+                            details = "اتصال تونل VPN به سرور ${target.name} (${target.server}:${target.port})"
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed audit log on vpn connect", e)
+            }
+        }
+    }
+
+    fun disconnectVpn(context: Context) {
+        VpnController.stopVpn(context)
+
+        viewModelScope.launch {
+            try {
+                val user = Firebase.auth.currentUser
+                if (user != null) {
+                    repository.addAuditLog(
+                        AuthAuditLog(
+                            userId = user.uid,
+                            action = "VPN_TUNNEL_DISCONNECTED",
+                            role = currentRole.value.id,
+                            module = "VpnService",
+                            status = "SUCCESS",
+                            ipOrDevice = getDeviceInfo(),
+                            details = "قطع ایمن تونل VPN توسط کاربر"
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed audit log on vpn disconnect", e)
+            }
+        }
+    }
+
+    fun autoSelectBestConfig(): VpnConfig? {
+        val available = configs.value
+        if (available.isEmpty()) return null
+
+        val onlineWithLatency = available.filter { it.status == "online" && it.pingMs > 0 }
+            .sortedBy { it.pingMs }
+        val best = onlineWithLatency.firstOrNull() ?: available.firstOrNull()
+
+        if (best != null) {
+            _selectedVpnConfig.value = best
+            _uiMessage.value = UiMessage.Success(
+                if (isPersianLanguage.value) "بهترین نود انتخابی بر اساس کمترین تاخیر: ${best.name} (${if (best.pingMs > 0) "${best.pingMs}ms" else "تست نشده"})"
+                else "Best node selected: ${best.name}"
+            )
+        }
+        return best
+    }
+
     // --- CONFIG MANAGEMENT ---
+
+    fun importBatchConfigs(rawBatchText: String) {
+        if (!checkPermission(AdminPermission.MANAGE_CONFIGS, "واردسازی گروهی کانفیگ‌های VPN")) return
+
+        val user = Firebase.auth.currentUser ?: return
+        val parseResults = VpnConfigParser.parseMultiple(rawBatchText, user.uid)
+
+        var addedCount = 0
+        var duplicateCount = 0
+        var invalidCount = 0
+
+        viewModelScope.launch {
+            for (res in parseResults) {
+                if (!res.isSuccess || res.config == null) {
+                    invalidCount++
+                    continue
+                }
+                val cfg = res.config
+                val validation = InputValidator.validateVpnConfig(
+                    protocol = cfg.protocol,
+                    server = cfg.server,
+                    port = cfg.port,
+                    uuidOrPassword = cfg.uuidOrPassword,
+                    security = cfg.security,
+                    transport = cfg.transport,
+                    rawConfig = cfg.rawConfig
+                )
+                if (validation is ValidationResult.Invalid) {
+                    invalidCount++
+                    continue
+                }
+                if (VpnConfigParser.isDuplicate(cfg, configs.value)) {
+                    duplicateCount++
+                    continue
+                }
+                try {
+                    repository.addConfig(cfg)
+                    localConfigRepository.saveConfig(cfg)
+                    addedCount++
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error adding batch item to Firestore, saving locally", e)
+                    try {
+                        localConfigRepository.saveConfig(cfg)
+                        addedCount++
+                    } catch (_: Exception) {}
+                }
+            }
+
+            val msgFa = "$addedCount کانفیگ با موفقیت ثبت شد ($duplicateCount تکراری، $invalidCount نامعتبر)"
+            val msgEn = "Imported $addedCount configs ($duplicateCount duplicates, $invalidCount invalid)"
+            _uiMessage.value = UiMessage.Success(if (isPersianLanguage.value) msgFa else msgEn)
+
+            repository.addAuditLog(
+                AuthAuditLog(
+                    userId = user.uid,
+                    action = "BATCH_CONFIG_IMPORT",
+                    role = currentRole.value.id,
+                    module = "ConfigurationManagement",
+                    status = "SUCCESS",
+                    ipOrDevice = getDeviceInfo(),
+                    details = "واردسازی گروهی: $addedCount موفق، $duplicateCount تکراری، $invalidCount نامعتبر"
+                )
+            )
+        }
+    }
 
     fun importConfig(rawUri: String) {
         if (!checkPermission(AdminPermission.MANAGE_CONFIGS, "افزودن و واردسازی کانفیگ VPN")) return
@@ -479,6 +670,11 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             try {
                 repository.addConfig(newConfig)
+            } catch (e: Exception) {
+                Log.w(TAG, "Firestore sync failed, saving locally: ${e.message}")
+            }
+            try {
+                localConfigRepository.saveConfig(newConfig)
                 repository.addAuditLog(
                     AuthAuditLog(
                         userId = user.uid,
@@ -496,7 +692,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to add config", e)
+                Log.e(TAG, "Failed to save config", e)
                 _uiMessage.value = UiMessage.Error(e.localizedMessage ?: "خطا در ذخیره کانفیگ")
             }
         }
@@ -508,6 +704,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             val result = RealPingEngine.ping(config.server, config.port, 3000)
             val newStatus = if (result.isReachable) "online" else "offline"
             try {
+                localConfigRepository.updatePingStatus(config.id, result.latencyMs, newStatus)
                 repository.updateConfigPing(config.id, result.latencyMs, newStatus)
                 if (result.isReachable) {
                     _uiMessage.value = UiMessage.Success("سرور آنلاین است - تاخیر واقعی: ${result.latencyMs}ms")
@@ -530,6 +727,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         val user = Firebase.auth.currentUser ?: return
         viewModelScope.launch {
             try {
+                localConfigRepository.deleteById(configId)
                 repository.deleteConfig(configId)
                 repository.addAuditLog(
                     AuthAuditLog(
@@ -554,6 +752,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     fun toggleFavorite(config: VpnConfig) {
         viewModelScope.launch {
             try {
+                localConfigRepository.updateFavorite(config.id, !config.isFavorite)
                 repository.updateConfig(config.copy(isFavorite = !config.isFavorite))
             } catch (e: CancellationException) {
                 throw e

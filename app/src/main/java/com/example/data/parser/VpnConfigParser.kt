@@ -15,6 +15,25 @@ data class ParseResult(
 
 object VpnConfigParser {
 
+    fun parseMultiple(rawText: String, userId: String): List<ParseResult> {
+        val lines = rawText.lines()
+            .map { it.trim() }
+            .filter { line ->
+                line.isNotBlank() && (
+                    line.startsWith("vless://", ignoreCase = true) ||
+                    line.startsWith("vmess://", ignoreCase = true) ||
+                    line.startsWith("trojan://", ignoreCase = true) ||
+                    line.startsWith("ss://", ignoreCase = true)
+                )
+            }
+
+        if (lines.isEmpty()) {
+            return listOf(ParseResult(false, null, "هیچ لینک معتبری در متن یا فایل یافت نشد / No valid VPN links found in input"))
+        }
+
+        return lines.map { parse(it, userId) }
+    }
+
     fun parse(rawUri: String, userId: String): ParseResult {
         val trimmed = rawUri.trim()
         if (trimmed.isBlank()) {

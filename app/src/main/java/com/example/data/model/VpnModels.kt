@@ -179,3 +179,25 @@ data class OverviewMetrics(
     val systemHealthScore: Int = 0,
     val isRealBackendConnected: Boolean = true
 )
+
+enum class VpnConnectionState {
+    DISCONNECTED,
+    CONNECTING,
+    CONNECTED,
+    DISCONNECTING,
+    ERROR
+}
+
+data class VpnSessionStats(
+    val state: VpnConnectionState = VpnConnectionState.DISCONNECTED,
+    val activeConfig: VpnConfig? = null,
+    val connectedDurationSeconds: Long = 0L,
+    val downloadSpeedBytesPerSec: Long = 0L,
+    val uploadSpeedBytesPerSec: Long = 0L,
+    val totalBytesReceived: Long = 0L,
+    val totalBytesSent: Long = 0L,
+    val realTunnelLatencyMs: Int = -1,
+    val stabilityScore: Int = 98,
+    val errorMessage: String? = null
+)
+

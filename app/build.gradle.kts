@@ -147,4 +147,6 @@ tasks.withType<Test> {
   testLogging {
     events("passed", "failed", "skipped")
   }
+  systemProperty("robolectric.dependency.repo.url", "file:///home/appuser/.m2/repository")
+  systemProperty("robolectric.dependency.repo.id", "local")
 }

@@ -76,6 +76,9 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.model.AdminRole
+import androidx.activity.compose.BackHandler
+import androidx.compose.material.icons.filled.Radar
+import com.example.ui.screens.AntiFilterRadarScreen
 import com.example.ui.screens.ConfigManagementScreen
 import com.example.ui.screens.IntelligentEngineScreen
 import com.example.ui.screens.OverviewScreen
@@ -98,6 +101,7 @@ import com.example.ui.theme.TextGraySecondary
 import com.example.ui.theme.TextWhitePrimary
 import com.example.ui.viewmodel.TmsVpnViewModel
 import com.example.ui.viewmodel.UiMessage
+import com.example.vpn.VpnController
 
 enum class TmsDestination(
     val titleFa: String,
@@ -105,6 +109,7 @@ enum class TmsDestination(
     val icon: ImageVector
 ) {
     OVERVIEW("نمای کلی", "Overview", Icons.Default.Dashboard),
+    RADAR("رادار ضد فیلتر", "Radar", Icons.Default.Radar),
     CONFIGS("کانفیگ‌ها", "Configs", Icons.Default.VpnKey),
     SERVERS("سرورها", "Servers", Icons.Default.Dns),
     INTELLIGENCE("موتور هوشمند", "Intelligence", Icons.Default.Psychology),
@@ -117,8 +122,10 @@ enum class TmsDestination(
 fun TmsVpnApp(
     currentUserId: String,
     onSignOut: () -> Unit,
+    onRequestVpnPermission: ((() -> Unit)) -> Unit = { it() },
     viewModel: TmsVpnViewModel = viewModel()
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     val isPersian by viewModel.isPersianLanguage.collectAsStateWithLifecycle()
     val uiMessage by viewModel.uiMessage.collectAsStateWithLifecycle()
     val isPinging by viewModel.isPinging.collectAsStateWithLifecycle()
@@ -130,6 +137,11 @@ fun TmsVpnApp(
     val policies by viewModel.failoverPolicies.collectAsStateWithLifecycle()
     val userProfile by viewModel.userProfile.collectAsStateWithLifecycle()
     val metrics by viewModel.overviewMetrics.collectAsStateWithLifecycle()
+
+    // Real VPN Tunnel State
+    val vpnConnectionState by viewModel.vpnConnectionState.collectAsStateWithLifecycle()
+    val vpnSessionStats by viewModel.vpnSessionStats.collectAsStateWithLifecycle()
+    val selectedVpnConfig by viewModel.selectedVpnConfig.collectAsStateWithLifecycle()
 
     // RBAC & Security state
     val currentRole by viewModel.currentRole.collectAsStateWithLifecycle()
@@ -373,22 +385,60 @@ fun TmsVpnApp(
 
                     // Content Pane
                     Box(modifier = Modifier.fillMaxSize().weight(1f)) {
+                        BackHandler(enabled = currentScreen != TmsDestination.OVERVIEW) {
+                            currentScreen = TmsDestination.OVERVIEW
+                        }
+
                         when (currentScreen) {
                             TmsDestination.OVERVIEW -> {
                                 OverviewScreen(
                                     metrics = metrics,
                                     configs = configs,
                                     servers = servers,
-                                    isPersian = isPersian
+                                    vpnState = vpnConnectionState,
+                                    vpnStats = vpnSessionStats,
+                                    selectedConfig = selectedVpnConfig,
+                                    isPersian = isPersian,
+                                    onConnectVpn = {
+                                        onRequestVpnPermission {
+                                            viewModel.connectVpn(context)
+                                        }
+                                    },
+                                    onDisconnectVpn = {
+                                        viewModel.disconnectVpn(context)
+                                    },
+                                    onAutoSelectBest = {
+                                        viewModel.autoSelectBestConfig()
+                                    }
+                                )
+                            }
+                            TmsDestination.RADAR -> {
+                                AntiFilterRadarScreen(
+                                    vpnState = vpnConnectionState,
+                                    sessionStats = vpnSessionStats,
+                                    configs = configs,
+                                    isPersian = isPersian,
+                                    onConnectVpn = { cfg, antiFilter ->
+                                        onRequestVpnPermission {
+                                            viewModel.selectConfigForVpn(cfg)
+                                            VpnController.startVpn(context, cfg, antiFilter)
+                                        }
+                                    },
+                                    onDisconnectVpn = {
+                                        viewModel.disconnectVpn(context)
+                                    }
                                 )
                             }
                             TmsDestination.CONFIGS -> {
                                 ConfigManagementScreen(
                                     configs = configs,
                                     currentRole = currentRole,
+                                    selectedConfigId = selectedVpnConfig?.id,
                                     isPersian = isPersian,
                                     isPinging = isPinging,
                                     onImportConfig = { viewModel.importConfig(it) },
+                                    onImportBatch = { viewModel.importBatchConfigs(it) },
+                                    onSelectForVpn = { viewModel.selectConfigForVpn(it) },
                                     onPingConfig = { viewModel.pingConfig(it) },
                                     onDeleteConfig = { viewModel.deleteConfig(it) },
                                     onToggleFavorite = { viewModel.toggleFavorite(it) },
