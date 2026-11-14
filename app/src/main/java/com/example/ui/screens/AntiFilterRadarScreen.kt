@@ -68,6 +68,8 @@ import com.example.data.model.VpnConnectionState
 import com.example.data.model.VpnSessionStats
 import com.example.data.network.AntiFilterRadarEngine
 import com.example.data.network.ServiceTarget
+import com.example.data.ai.VpnAiEngine
+import com.example.vpn.engine.DynamicIpDnsRotator
 import com.example.ui.theme.BorderGoldHighlight
 import com.example.ui.theme.BorderGoldMuted
 import com.example.ui.theme.CardSurfaceDark
@@ -93,6 +95,9 @@ fun AntiFilterRadarScreen(
     var isTestingAll by remember { mutableStateOf(false) }
     var antiDpiFragmentation by remember { mutableStateOf(true) }
     var bypassIranianBanking by remember { mutableStateOf(true) }
+    val aiEngine = remember { VpnAiEngine() }
+    var isAiAnalyzing by remember { mutableStateOf(false) }
+    var aiAnalysisText by remember { mutableStateOf<String?>(null) }
 
     fun runRadarScan() {
         coroutineScope.launch {
@@ -328,6 +333,146 @@ fun AntiFilterRadarScreen(
                                 checkedTrackColor = EmeraldGreen
                             )
                         )
+                    }
+                }
+            }
+        }
+
+        // 🤖 AI SMART NETWORK ADAPTATION CARD (هوش مصنوعی تطبیق شبکه و دورزدن فیلترینگ)
+        item {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(
+                        BorderStroke(1.2.dp, if (aiAnalysisText != null) EmeraldGreen else BorderGoldHighlight),
+                        RoundedCornerShape(18.dp)
+                    ),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF141924)),
+                shape = RoundedCornerShape(18.dp)
+            ) {
+                Column(modifier = Modifier.padding(18.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF1B2332))
+                                    .border(BorderStroke(1.dp, EmeraldGreen), CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.AutoAwesome,
+                                    contentDescription = "AI Adaptation",
+                                    tint = EmeraldGreen,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column {
+                                Text(
+                                    text = if (isPersian) "هوش مصنوعی تطبیق شبکه و رفع فیلتر" else "AI Anti-Censorship Adaptation",
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = EmeraldGreen
+                                )
+                                Text(
+                                    text = "تحلیل پایش زنده تلگرام و اینستاگرام و بهینه‌سازی پارامترها",
+                                    fontSize = 11.sp,
+                                    color = TextGraySecondary
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Button(
+                        onClick = {
+                            coroutineScope.launch {
+                                isAiAnalyzing = true
+                                val report = AntiFilterRadarEngine.buildRadarReport(targets)
+                                val currentConfig = configs.firstOrNull { it.status == "online" }?.name ?: "VLESS Ultra Reality"
+                                val result = aiEngine.analyzeRadarAndAdaptNetwork(
+                                    radarResultsSummary = report,
+                                    activeConfig = currentConfig
+                                )
+                                when (result) {
+                                    is com.example.data.ai.AiResult.Success -> {
+                                        aiAnalysisText = result.responseText
+                                    }
+                                    is com.example.data.ai.AiResult.Error -> {
+                                        aiAnalysisText = result.message
+                                    }
+                                }
+                                isAiAnalyzing = false
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF1E2838),
+                            contentColor = MetallicGold
+                        ),
+                        border = BorderStroke(1.dp, MetallicGold.copy(alpha = 0.6f)),
+                        shape = RoundedCornerShape(10.dp),
+                        enabled = !isAiAnalyzing
+                    ) {
+                        if (isAiAnalyzing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                color = MetallicGold,
+                                strokeWidth = 2.dp
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(text = "هوش مصنوعی در حال تحلیل شبکه...", fontSize = 11.sp)
+                        } else {
+                            Icon(imageVector = Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(text = "⚡ تحلیل هوشمند وضعیت و تطبیق با هوش مصنوعی", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    if (aiAnalysisText != null) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color(0xFF0F141E))
+                                .border(BorderStroke(0.8.dp, EmeraldGreen.copy(alpha = 0.4f)), RoundedCornerShape(12.dp))
+                                .padding(12.dp)
+                        ) {
+                            Column {
+                                Text(
+                                    text = aiAnalysisText ?: "",
+                                    color = TextWhitePrimary,
+                                    fontSize = 12.sp,
+                                    lineHeight = 19.sp
+                                )
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Button(
+                                    onClick = {
+                                        DynamicIpDnsRotator.forceHopNow()
+                                        antiDpiFragmentation = true
+                                        runRadarScan()
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = EmeraldGreen,
+                                        contentColor = Color(0xFF0C140E)
+                                    ),
+                                    shape = RoundedCornerShape(8.dp)
+                                ) {
+                                    Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(text = "اعمال خودکار بهینه‌سازی هوش مصنوعی و جهش IP", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
                     }
                 }
             }

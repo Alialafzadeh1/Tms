@@ -15,29 +15,33 @@ data class ParseResult(
 
 object VpnConfigParser {
 
-    fun parseMultiple(rawText: String, userId: String): List<ParseResult> {
-        val lines = rawText.lines()
-            .map { it.trim() }
-            .filter { line ->
-                line.isNotBlank() && (
-                    line.startsWith("vless://", ignoreCase = true) ||
-                    line.startsWith("vmess://", ignoreCase = true) ||
-                    line.startsWith("trojan://", ignoreCase = true) ||
-                    line.startsWith("ss://", ignoreCase = true)
-                )
-            }
+    private val linkRegex = Regex("""(?i)(vless://|vmess://|trojan://|ss://)[^\s"'<>]+""")
 
-        if (lines.isEmpty()) {
-            return listOf(ParseResult(false, null, "هیچ لینک معتبری در متن یا فایل یافت نشد / No valid VPN links found in input"))
+    fun parseMultiple(rawText: String, userId: String): List<ParseResult> {
+        val matches = linkRegex.findAll(rawText).map { it.value.trim() }.toList()
+
+        if (matches.isEmpty()) {
+            val lines = rawText.lines().map { it.trim() }.filter { it.isNotBlank() }
+            if (lines.isNotEmpty()) {
+                val results = lines.map { parse(it, userId) }
+                if (results.any { it.isSuccess }) return results
+            }
+            return listOf(ParseResult(false, null, "هیچ لینک یا کانفیگ معتبری در متن یافت نشد / No valid VPN links found in input"))
         }
 
-        return lines.map { parse(it, userId) }
+        return matches.map { parse(it, userId) }
     }
 
     fun parse(rawUri: String, userId: String): ParseResult {
-        val trimmed = rawUri.trim()
+        var trimmed = rawUri.trim()
         if (trimmed.isBlank()) {
             return ParseResult(false, null, "پیکربندی خالی است / Configuration cannot be empty")
+        }
+
+        // If embedded in quotes or text, extract link
+        val match = linkRegex.find(trimmed)
+        if (match != null) {
+            trimmed = match.value
         }
 
         return try {
@@ -46,15 +50,45 @@ object VpnConfigParser {
                 trimmed.startsWith("vmess://", ignoreCase = true) -> parseVmess(trimmed, userId)
                 trimmed.startsWith("trojan://", ignoreCase = true) -> parseTrojan(trimmed, userId)
                 trimmed.startsWith("ss://", ignoreCase = true) -> parseShadowsocks(trimmed, userId)
+                trimmed.startsWith("{") && trimmed.endsWith("}") -> parseJsonConfig(trimmed, userId)
                 else -> ParseResult(
                     false,
                     null,
-                    "پروتکل نامعتبر یا پشتیبانی نشده است (پشتیبانی از VLESS, VMess, Trojan, Shadowsocks) / Unsupported protocol"
+                    "فرمت کانفیگ ناشناخته است. لطفاً لینک vless://, vmess://, trojan:// یا ss:// وارد نمایید"
                 )
             }
         } catch (e: Exception) {
             ParseResult(false, null, "خطا در تجزیه پیکربندی: ${e.localizedMessage ?: "فرمت نامعتبر"} / Parse error")
         }
+    }
+
+    private fun parseJsonConfig(jsonStr: String, userId: String): ParseResult {
+        val json = JSONObject(jsonStr)
+        val server = json.optString("server", json.optString("server_address", json.optString("host", "")))
+        val port = json.optInt("port", json.optInt("server_port", 443))
+        val protocol = json.optString("protocol", json.optString("type", "vless")).lowercase()
+        val name = json.optString("name", json.optString("tag", "$protocol-$server:$port"))
+        val uuid = json.optString("uuid", json.optString("password", json.optString("id", "secret-uuid")))
+
+        if (server.isBlank()) {
+            return ParseResult(false, null, "فیلد server در ساختار JSON یافت نشد")
+        }
+
+        val config = VpnConfig(
+            userId = userId,
+            name = name,
+            protocol = protocol,
+            server = server,
+            port = port,
+            uuidOrPassword = uuid,
+            transport = json.optString("transport", "tcp"),
+            security = json.optString("security", "tls"),
+            sni = json.optString("sni", server),
+            rawConfig = jsonStr,
+            status = "untested",
+            pingMs = -1
+        )
+        return ParseResult(true, config)
     }
 
     private fun parseVless(uriStr: String, userId: String): ParseResult {

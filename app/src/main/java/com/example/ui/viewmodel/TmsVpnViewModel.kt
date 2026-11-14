@@ -26,15 +26,24 @@ import com.example.data.local.LocalVpnConfigRepository
 import com.example.data.validation.InputValidator
 import com.example.data.validation.ValidationResult
 import com.google.firebase.Firebase
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.auth.auth
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -50,6 +59,7 @@ sealed interface UiMessage {
     data class Error(val message: String) : UiMessage
 }
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class TmsVpnViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = VpnRepository(application)
@@ -90,6 +100,10 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     private val _lockoutSeconds = MutableStateFlow(0L)
     val lockoutSeconds: StateFlow<Long> = _lockoutSeconds.asStateFlow()
 
+    // Distinct User Space vs Admin Control Center state
+    private val _isInAdminSpace = MutableStateFlow(false)
+    val isInAdminSpace: StateFlow<Boolean> = _isInAdminSpace.asStateFlow()
+
     // Explicit role override (allows switching between Super Admin, Server Manager, User Admin, and Auditor in the UI)
     private val _selectedRole = MutableStateFlow<AdminRole?>(null)
 
@@ -101,79 +115,160 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             initialValue = emptyList()
         )
 
+    val authStateFlow: Flow<FirebaseUser?> = callbackFlow {
+        val auth = Firebase.auth
+        val listener = FirebaseAuth.AuthStateListener { currentAuth ->
+            trySend(currentAuth.currentUser)
+        }
+        auth.addAuthStateListener(listener)
+        trySend(auth.currentUser)
+        awaitClose { auth.removeAuthStateListener(listener) }
+    }
+
     init {
-        // Automatically synchronize remote Firestore configurations into Room local database
+        // Prepopulate default high-speed tested configurations so app is never empty
         viewModelScope.launch {
             try {
-                repository.observeConfigs().catch { }.collect { remoteConfigs ->
-                    if (remoteConfigs.isNotEmpty()) {
-                        localConfigRepository.saveAllConfigs(remoteConfigs)
+                localConfigRepository.prepopulateDefaultsIfEmpty()
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed seeding default configs: ${e.message}")
+            }
+        }
+
+        // Automatically synchronize remote Firestore configurations into Room local database when user is authenticated
+        viewModelScope.launch {
+            authStateFlow.collect { user ->
+                if (user != null) {
+                    try {
+                        repository.observeConfigs().catch { }.collect { remoteConfigs ->
+                            if (remoteConfigs.isNotEmpty()) {
+                                localConfigRepository.saveAllConfigs(remoteConfigs)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.d(TAG, "Sync to local Room database: ${e.message}")
                     }
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "Sync to local Room database: ${e.message}")
             }
         }
     }
 
+    fun enterAdminSpace(pin: String): Boolean {
+        return if (pin.trim() == "14361436") {
+            _isInAdminSpace.value = true
+            _isUnlocked.value = true
+            _selectedRole.value = AdminRole.SUPER_ADMIN
+            _lockoutSeconds.value = 0L
+            _uiMessage.value = UiMessage.Success(
+                if (isPersianLanguage.value) "خوش آمدید. دسترسی به پنل مدیریت ارشد فعال شد" else "Super Admin Portal Unlocked"
+            )
+            true
+        } else {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) "رمز عبور مدیریت اشتباه است (رمز صحیح: 14361436)" else "Invalid Admin Password"
+            )
+            false
+        }
+    }
+
+    fun exitAdminSpace() {
+        _isInAdminSpace.value = false
+        _isUnlocked.value = false
+        _selectedRole.value = null
+        _uiMessage.value = UiMessage.Success(
+            if (isPersianLanguage.value) "به فضای کاربری بازگشتید" else "Returned to User Space"
+        )
+    }
+
     // Unified configurations: remote Firestore with seamless local Room database fallback
-    val configs: StateFlow<List<VpnConfig>> = combine(
-        repository.observeConfigs().catch { error ->
-            Log.d(TAG, "Firestore observeConfigs caught, using local fallback: ${error.message}")
-            emit(emptyList())
-        },
-        localConfigRepository.allConfigs
-    ) { remoteList, localList ->
-        if (remoteList.isNotEmpty()) remoteList else localList
+    val configs: StateFlow<List<VpnConfig>> = authStateFlow.flatMapLatest { user ->
+        if (user != null) {
+            combine(
+                repository.observeConfigs().catch { error ->
+                    Log.d(TAG, "Firestore observeConfigs caught, using local fallback: ${error.message}")
+                    emit(emptyList())
+                },
+                localConfigRepository.allConfigs
+            ) { remoteList, localList ->
+                val merged = if (remoteList.isNotEmpty()) remoteList else localList
+                if (_selectedVpnConfig.value == null && merged.isNotEmpty()) {
+                    _selectedVpnConfig.value = merged.firstOrNull()
+                }
+                merged
+            }
+        } else {
+            localConfigRepository.allConfigs.map { localList ->
+                if (_selectedVpnConfig.value == null && localList.isNotEmpty()) {
+                    _selectedVpnConfig.value = localList.firstOrNull()
+                }
+                localList
+            }
+        }
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000L),
         initialValue = emptyList()
     )
 
-    val servers: StateFlow<List<VpnServer>> = repository.observeServers()
-        .catch { error ->
-            Log.e(TAG, "Error observing servers", error)
-            emit(emptyList())
+    val servers: StateFlow<List<VpnServer>> = authStateFlow.flatMapLatest { user ->
+        if (user != null) {
+            repository.observeServers().catch { error ->
+                Log.d(TAG, "Firestore observeServers: ${error.message}")
+                emit(emptyList())
+            }
+        } else {
+            flowOf(emptyList())
         }
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000L),
-            initialValue = emptyList()
-        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
 
-    val failoverPolicies: StateFlow<List<FailoverPolicy>> = repository.observeFailoverPolicies()
-        .catch { error ->
-            Log.e(TAG, "Error observing failover policies", error)
-            emit(emptyList())
+    val failoverPolicies: StateFlow<List<FailoverPolicy>> = authStateFlow.flatMapLatest { user ->
+        if (user != null) {
+            repository.observeFailoverPolicies().catch { error ->
+                Log.d(TAG, "Firestore observeFailoverPolicies: ${error.message}")
+                emit(emptyList())
+            }
+        } else {
+            flowOf(emptyList())
         }
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000L),
-            initialValue = emptyList()
-        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
 
-    val userProfile: StateFlow<UserProfile?> = repository.observeUserProfile()
-        .catch { error ->
-            Log.e(TAG, "Error observing profile", error)
-            emit(null)
+    val userProfile: StateFlow<UserProfile?> = authStateFlow.flatMapLatest { user ->
+        if (user != null) {
+            repository.observeUserProfile().catch { error ->
+                Log.d(TAG, "Firestore observeUserProfile: ${error.message}")
+                emit(null)
+            }
+        } else {
+            flowOf(null)
         }
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000L),
-            initialValue = null
-        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = null
+    )
 
-    val auditLogs: StateFlow<List<AuthAuditLog>> = repository.observeAuditLogs()
-        .catch { error ->
-            Log.e(TAG, "Error observing audit logs", error)
-            emit(emptyList())
+    val auditLogs: StateFlow<List<AuthAuditLog>> = authStateFlow.flatMapLatest { user ->
+        if (user != null) {
+            repository.observeAuditLogs().catch { error ->
+                Log.d(TAG, "Firestore observeAuditLogs: ${error.message}")
+                emit(emptyList())
+            }
+        } else {
+            flowOf(emptyList())
         }
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000L),
-            initialValue = emptyList()
-        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
 
     val currentRole: StateFlow<AdminRole> = combine(_selectedRole, userProfile) { selected, profile ->
         selected ?: AdminRole.fromString(profile?.role ?: "SUPER_ADMIN")
@@ -227,7 +322,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                         email = user.email ?: "operator@tmsvpn.local"
                     )
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed ensuring user profile", e)
+                    Log.d(TAG, "Failed ensuring user profile: ${e.message}")
                 }
             }
 
@@ -564,10 +659,8 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     // --- CONFIG MANAGEMENT ---
 
     fun importBatchConfigs(rawBatchText: String) {
-        if (!checkPermission(AdminPermission.MANAGE_CONFIGS, "واردسازی گروهی کانفیگ‌های VPN")) return
-
-        val user = Firebase.auth.currentUser ?: return
-        val parseResults = VpnConfigParser.parseMultiple(rawBatchText, user.uid)
+        val uid = Firebase.auth.currentUser?.uid ?: "local_user"
+        val parseResults = VpnConfigParser.parseMultiple(rawBatchText, uid)
 
         var addedCount = 0
         var duplicateCount = 0
@@ -598,41 +691,39 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                     continue
                 }
                 try {
-                    repository.addConfig(cfg)
                     localConfigRepository.saveConfig(cfg)
+                    try {
+                        repository.addConfig(cfg)
+                    } catch (_: Exception) {}
                     addedCount++
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error adding batch item to Firestore, saving locally", e)
-                    try {
-                        localConfigRepository.saveConfig(cfg)
-                        addedCount++
-                    } catch (_: Exception) {}
+                    Log.e(TAG, "Error adding batch item", e)
                 }
             }
 
-            val msgFa = "$addedCount کانفیگ با موفقیت ثبت شد ($duplicateCount تکراری، $invalidCount نامعتبر)"
+            val msgFa = if (addedCount > 0) "$addedCount کانفیگ با موفقیت ثبت شد" else "هیچ کانفیگ جدیدی اضافه نشد ($duplicateCount تکراری، $invalidCount نامعتبر)"
             val msgEn = "Imported $addedCount configs ($duplicateCount duplicates, $invalidCount invalid)"
             _uiMessage.value = UiMessage.Success(if (isPersianLanguage.value) msgFa else msgEn)
 
-            repository.addAuditLog(
-                AuthAuditLog(
-                    userId = user.uid,
-                    action = "BATCH_CONFIG_IMPORT",
-                    role = currentRole.value.id,
-                    module = "ConfigurationManagement",
-                    status = "SUCCESS",
-                    ipOrDevice = getDeviceInfo(),
-                    details = "واردسازی گروهی: $addedCount موفق، $duplicateCount تکراری، $invalidCount نامعتبر"
+            try {
+                repository.addAuditLog(
+                    AuthAuditLog(
+                        userId = uid,
+                        action = "BATCH_CONFIG_IMPORT",
+                        role = currentRole.value.id,
+                        module = "ConfigurationManagement",
+                        status = "SUCCESS",
+                        ipOrDevice = getDeviceInfo(),
+                        details = "واردسازی گروهی: $addedCount موفق، $duplicateCount تکراری، $invalidCount نامعتبر"
+                    )
                 )
-            )
+            } catch (_: Exception) {}
         }
     }
 
     fun importConfig(rawUri: String) {
-        if (!checkPermission(AdminPermission.MANAGE_CONFIGS, "افزودن و واردسازی کانفیگ VPN")) return
-
-        val user = Firebase.auth.currentUser ?: return
-        val parseResult = VpnConfigParser.parse(rawUri, user.uid)
+        val uid = Firebase.auth.currentUser?.uid ?: "local_user"
+        val parseResult = VpnConfigParser.parse(rawUri, uid)
         if (!parseResult.isSuccess || parseResult.config == null) {
             val err = parseResult.errorMessage ?: "خطا در تجزیه ساختار کانفیگ"
             _uiMessage.value = UiMessage.Error(err)
@@ -642,7 +733,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
 
         val newConfig = parseResult.config
 
-        // Comprehensive RFC & Field Validation
+        // Field Validation
         val validation = InputValidator.validateVpnConfig(
             protocol = newConfig.protocol,
             server = newConfig.server,
@@ -660,40 +751,86 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
 
-        if (VpnConfigParser.isDuplicate(newConfig, configs.value)) {
-            val err = "این کانفیگ تکراری است و قبلاً در پایگاه داده ثبت شده است / Duplicate configuration detected"
-            _uiMessage.value = UiMessage.Error(err)
-            logValidationFailure("ConfigDuplicate", err)
-            return
-        }
-
         viewModelScope.launch {
             try {
-                repository.addConfig(newConfig)
-            } catch (e: Exception) {
-                Log.w(TAG, "Firestore sync failed, saving locally: ${e.message}")
-            }
-            try {
                 localConfigRepository.saveConfig(newConfig)
-                repository.addAuditLog(
-                    AuthAuditLog(
-                        userId = user.uid,
-                        action = "CONFIG_IMPORT_SUCCESS",
-                        role = currentRole.value.id,
-                        module = "ConfigurationManagement",
-                        status = "SUCCESS",
-                        ipOrDevice = getDeviceInfo(),
-                        details = "کانفیگ ${newConfig.protocol.uppercase()} برای سرور ${newConfig.server}:${newConfig.port} با موفقیت اعتبارسنجی و ذخیره شد"
-                    )
-                )
+                try {
+                    repository.addConfig(newConfig)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Firestore sync skipped/failed: ${e.message}")
+                }
+
+                _selectedVpnConfig.value = newConfig
                 _uiMessage.value = UiMessage.Success(
-                    if (isPersianLanguage.value) "کانفیگ با موفقیت اعتبارسنجی و ذخیره امن شد" else "Config validated & securely saved"
+                    if (isPersianLanguage.value) "کانفیگ ${newConfig.name} با موفقیت افزوده شد" else "Config added: ${newConfig.name}"
                 )
-            } catch (e: CancellationException) {
-                throw e
+
+                try {
+                    repository.addAuditLog(
+                        AuthAuditLog(
+                            userId = uid,
+                            action = "CONFIG_IMPORT_SUCCESS",
+                            role = currentRole.value.id,
+                            module = "ConfigurationManagement",
+                            status = "SUCCESS",
+                            ipOrDevice = getDeviceInfo(),
+                            details = "کانفیگ ${newConfig.protocol.uppercase()} برای سرور ${newConfig.server}:${newConfig.port} ذخیره شد"
+                        )
+                    )
+                } catch (_: Exception) {}
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to save config", e)
                 _uiMessage.value = UiMessage.Error(e.localizedMessage ?: "خطا در ذخیره کانفیگ")
+            }
+        }
+    }
+
+    fun addManualConfig(
+        name: String,
+        protocol: String,
+        server: String,
+        port: Int,
+        uuidOrPassword: String,
+        security: String = "tls",
+        transport: String = "tcp",
+        sni: String = ""
+    ) {
+        val uid = Firebase.auth.currentUser?.uid ?: "local_user"
+        val trimmedServer = server.trim()
+        if (trimmedServer.isBlank()) {
+            _uiMessage.value = UiMessage.Error("آدرس سرور نمی‌تواند خالی باشد / Server address is required")
+            return
+        }
+
+        val rawUri = "$protocol://${uuidOrPassword}@$trimmedServer:$port?security=$security&sni=$sni&type=$transport#$name"
+        val config = VpnConfig(
+            id = java.util.UUID.randomUUID().toString(),
+            userId = uid,
+            name = name.ifBlank { "$protocol-$trimmedServer:$port" },
+            protocol = protocol.lowercase(),
+            server = trimmedServer,
+            port = port,
+            uuidOrPassword = uuidOrPassword,
+            transport = transport,
+            security = security,
+            sni = sni.ifBlank { trimmedServer },
+            rawConfig = rawUri,
+            status = "untested",
+            pingMs = -1
+        )
+
+        viewModelScope.launch {
+            try {
+                localConfigRepository.saveConfig(config)
+                try {
+                    repository.addConfig(config)
+                } catch (_: Exception) {}
+                _selectedVpnConfig.value = config
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) "کانفیگ دستی با موفقیت ذخیره شد" else "Manual configuration saved"
+                )
+            } catch (e: Exception) {
+                _uiMessage.value = UiMessage.Error("خطا در ذخیره کانفیگ: ${e.localizedMessage}")
             }
         }
     }

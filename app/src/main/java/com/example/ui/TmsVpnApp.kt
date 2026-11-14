@@ -103,6 +103,10 @@ import com.example.ui.viewmodel.TmsVpnViewModel
 import com.example.ui.viewmodel.UiMessage
 import com.example.vpn.VpnController
 
+import com.example.ui.screens.UserDashboardScreen
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.ExitToApp
+
 enum class TmsDestination(
     val titleFa: String,
     val titleEn: String,
@@ -149,6 +153,10 @@ fun TmsVpnApp(
     val lockoutSeconds by viewModel.lockoutSeconds.collectAsStateWithLifecycle()
     val auditLogs by viewModel.auditLogs.collectAsStateWithLifecycle()
 
+    // User Space vs Admin Space separation
+    val isInAdminSpace by viewModel.isInAdminSpace.collectAsStateWithLifecycle()
+    var showRadarInUserMode by remember { mutableStateOf(false) }
+
     var currentScreen by remember { mutableStateOf(TmsDestination.OVERVIEW) }
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -172,126 +180,223 @@ fun TmsVpnApp(
         BoxWithConstraints(modifier = Modifier.fillMaxSize().background(DeepBlackBackground)) {
             val isWideScreen = maxWidth >= 760.dp
 
-            Scaffold(
-                topBar = {
-                    CenterAlignedTopAppBar(
-                        title = {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(32.dp)
-                                        .background(GoldContainer, CircleShape)
-                                        .border(BorderStroke(1.dp, MetallicGold), CircleShape),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Shield,
-                                        contentDescription = null,
-                                        tint = MetallicGold,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                }
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "TMS VPN",
-                                    fontSize = 18.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MetallicGold,
-                                    letterSpacing = 1.sp
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                // Live Emerald indicator
-                                Box(
-                                    modifier = Modifier
-                                        .size(7.dp)
-                                        .background(EmeraldGreen, CircleShape)
-                                )
-                            }
-                        },
-                        navigationIcon = {
-                            // Active RBAC Role badge button
-                            Row(
-                                modifier = Modifier
-                                    .padding(start = 12.dp)
-                                    .background(Color(0xFF141722), RoundedCornerShape(8.dp))
-                                    .border(BorderStroke(0.8.dp, BorderGoldMuted), RoundedCornerShape(8.dp))
-                                    .clickable { showQuickRoleSwitcher = true }
-                                    .padding(horizontal = 8.dp, vertical = 5.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.AdminPanelSettings,
-                                    contentDescription = null,
-                                    tint = MetallicGold,
-                                    modifier = Modifier.size(14.dp)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(
-                                    text = currentRole.id.replace("_", " "),
-                                    color = MetallicGold,
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                        },
-                        actions = {
-                            // Session Lock / Unlock quick button
-                            IconButton(
-                                onClick = {
-                                    if (isUnlocked) {
-                                        viewModel.lockAdminSession()
-                                    } else {
-                                        showPinDialog = true
-                                    }
-                                }
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(32.dp)
-                                        .background(
-                                            if (isUnlocked) EmeraldContainer else Color(0xFF281114),
-                                            CircleShape
-                                        )
-                                        .border(
-                                            BorderStroke(
-                                                1.dp,
-                                                if (isUnlocked) EmeraldGreen else StatusWarningAmber
-                                            ),
-                                            CircleShape
-                                        ),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = if (isUnlocked) Icons.Default.Shield else Icons.Default.Lock,
-                                        contentDescription = "Session Security",
-                                        tint = if (isUnlocked) EmeraldGreen else StatusWarningAmber,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                }
-                            }
-
-                            // Language switcher toggle
-                            IconButton(onClick = { viewModel.toggleLanguage() }) {
-                                Box(
-                                    modifier = Modifier
-                                        .background(Color(0xFF141722), RoundedCornerShape(8.dp))
-                                        .border(BorderStroke(0.8.dp, BorderGoldMuted), RoundedCornerShape(8.dp))
-                                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                                ) {
+            if (!isInAdminSpace) {
+                // ==========================================
+                // 💎 USER SPACE: LUXURY 3D NEON GLASS UI
+                // ==========================================
+                if (showRadarInUserMode) {
+                    BackHandler { showRadarInUserMode = false }
+                    Scaffold(
+                        topBar = {
+                            CenterAlignedTopAppBar(
+                                title = {
                                     Text(
-                                        text = if (isPersian) "EN" else "فا",
+                                        text = if (isPersian) "رادار ضد فیلتر و بایپس هوشمند" else "Anti-Censorship Radar",
+                                        fontSize = 16.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MetallicGold
+                                    )
+                                },
+                                navigationIcon = {
+                                    IconButton(onClick = { showRadarInUserMode = false }) {
+                                        Icon(
+                                            imageVector = Icons.Default.ArrowBack,
+                                            contentDescription = "Back",
+                                            tint = MetallicGold
+                                        )
+                                    }
+                                },
+                                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
+                                    containerColor = ObsidianSurface
+                                )
+                            )
+                        },
+                        snackbarHost = {
+                            SnackbarHost(hostState = snackbarHostState)
+                        }
+                    ) { innerPadding ->
+                        Box(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
+                            AntiFilterRadarScreen(
+                                vpnState = vpnConnectionState,
+                                sessionStats = vpnSessionStats,
+                                configs = configs,
+                                isPersian = isPersian,
+                                onConnectVpn = { cfg, antiFilter ->
+                                    onRequestVpnPermission {
+                                        viewModel.selectConfigForVpn(cfg)
+                                        VpnController.startVpn(context, cfg, antiFilter)
+                                    }
+                                },
+                                onDisconnectVpn = {
+                                    viewModel.disconnectVpn(context)
+                                }
+                            )
+                        }
+                    }
+                } else {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        UserDashboardScreen(
+                            vpnState = vpnConnectionState,
+                            sessionStats = vpnSessionStats,
+                            configs = configs,
+                            selectedConfig = selectedVpnConfig,
+                            isPersian = isPersian,
+                            onConnectVpn = {
+                                onRequestVpnPermission {
+                                    viewModel.connectVpn(context)
+                                }
+                            },
+                            onDisconnectVpn = {
+                                viewModel.disconnectVpn(context)
+                            },
+                            onSelectConfig = { config ->
+                                viewModel.selectConfigForVpn(config)
+                            },
+                            onImportConfig = { text ->
+                                viewModel.importConfig(text)
+                            },
+                            onImportBatch = { batchText ->
+                                viewModel.importBatchConfigs(batchText)
+                            },
+                            onAddManual = { name, proto, address, port, json ->
+                                viewModel.addManualConfig(name, proto, address, port, json)
+                            },
+                            onOpenRadar = {
+                                showRadarInUserMode = true
+                            },
+                            onRequestAdminSpace = {
+                                pinModalInput = ""
+                                showPinDialog = true
+                            },
+                            onToggleLanguage = {
+                                viewModel.toggleLanguage()
+                            }
+                        )
+
+                        // Floating Snackbar for user space
+                        SnackbarHost(
+                            hostState = snackbarHostState,
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(16.dp)
+                        )
+                    }
+                }
+            } else {
+                // ==========================================
+                // 🛡️ ADMIN SPACE: ENTERPRISE CONTROL CENTER
+                // ==========================================
+                Scaffold(
+                    topBar = {
+                        CenterAlignedTopAppBar(
+                            title = {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(32.dp)
+                                            .background(GoldContainer, CircleShape)
+                                            .border(BorderStroke(1.dp, MetallicGold), CircleShape),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Shield,
+                                            contentDescription = null,
+                                            tint = MetallicGold,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = if (isPersian) "مدیریت TMS VPN" else "TMS Admin",
+                                        fontSize = 17.sp,
+                                        fontWeight = FontWeight.Bold,
                                         color = MetallicGold,
-                                        fontSize = 12.sp,
+                                        letterSpacing = 1.sp
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    // Live Emerald indicator
+                                    Box(
+                                        modifier = Modifier
+                                            .size(7.dp)
+                                            .background(EmeraldGreen, CircleShape)
+                                    )
+                                }
+                            },
+                            navigationIcon = {
+                                // Exit Admin space button
+                                Row(
+                                    modifier = Modifier
+                                        .padding(start = 8.dp)
+                                        .background(Color(0xFF201214), RoundedCornerShape(8.dp))
+                                        .border(BorderStroke(0.8.dp, StatusOfflineRed.copy(alpha = 0.5f)), RoundedCornerShape(8.dp))
+                                        .clickable { viewModel.exitAdminSpace() }
+                                        .padding(horizontal = 8.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.ExitToApp,
+                                        contentDescription = "Exit to User Mode",
+                                        tint = StatusOfflineRed,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = if (isPersian) "خروج" else "Exit",
+                                        color = StatusOfflineRed,
+                                        fontSize = 10.sp,
                                         fontWeight = FontWeight.Bold
                                     )
                                 }
-                            }
-                        },
-                        colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
-                            containerColor = ObsidianSurface
+                            },
+                            actions = {
+                                // Active RBAC Role badge button
+                                Row(
+                                    modifier = Modifier
+                                        .background(Color(0xFF141722), RoundedCornerShape(8.dp))
+                                        .border(BorderStroke(0.8.dp, BorderGoldMuted), RoundedCornerShape(8.dp))
+                                        .clickable { showQuickRoleSwitcher = true }
+                                        .padding(horizontal = 7.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.AdminPanelSettings,
+                                        contentDescription = null,
+                                        tint = MetallicGold,
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(3.dp))
+                                    Text(
+                                        text = currentRole.id.replace("_", " "),
+                                        color = MetallicGold,
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.width(4.dp))
+
+                                // Language switcher toggle
+                                IconButton(onClick = { viewModel.toggleLanguage() }) {
+                                    Box(
+                                        modifier = Modifier
+                                            .background(Color(0xFF141722), RoundedCornerShape(8.dp))
+                                            .border(BorderStroke(0.8.dp, BorderGoldMuted), RoundedCornerShape(8.dp))
+                                            .padding(horizontal = 7.dp, vertical = 4.dp)
+                                    ) {
+                                        Text(
+                                            text = if (isPersian) "EN" else "فا",
+                                            color = MetallicGold,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+                            },
+                            colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
+                                containerColor = ObsidianSurface
+                            )
                         )
-                    )
-                },
+                    },
                 bottomBar = {
                     if (!isWideScreen) {
                         NavigationBar(
@@ -592,26 +697,35 @@ fun TmsVpnApp(
             )
         }
 
-        // Quick PIN Unlock Modal
+        // Admin Space Access & PIN Unlock Modal
         if (showPinDialog) {
             AlertDialog(
                 onDismissRequest = { showPinDialog = false },
                 containerColor = CardSurfaceDark,
                 title = {
-                    Text(
-                        text = if (isPersian) "احراز هویت پین امنیتی مدیر" else "Verify Master Security PIN",
-                        fontSize = 17.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MetallicGold
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.AdminPanelSettings,
+                            contentDescription = null,
+                            tint = MetallicGold,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = if (isPersian) "ورود به پنل مدیریت ارشد" else "Enter Admin Control Center",
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MetallicGold
+                        )
+                    }
                 },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Text(
                             text = if (isPersian)
-                                "پین ۶ رقمی مدیر سامانه را وارد کنید (پیش‌فرض: 123456):"
+                                "رمز عبور مدیریت را وارد کنید (رمز مدیر: 14361436):"
                             else
-                                "Enter 6-digit master security PIN (default: 123456):",
+                                "Enter administrator password (Admin PIN: 14361436):",
                             fontSize = 12.sp,
                             color = TextWhitePrimary
                         )
@@ -619,7 +733,7 @@ fun TmsVpnApp(
                         OutlinedTextField(
                             value = pinModalInput,
                             onValueChange = { pinModalInput = it },
-                            label = { Text("پین امنیتی") },
+                            label = { Text(if (isPersian) "رمز عبور مدیر" else "Admin PIN") },
                             modifier = Modifier.fillMaxWidth(),
                             visualTransformation = PasswordVisualTransformation(),
                             colors = OutlinedTextFieldDefaults.colors(
@@ -635,7 +749,7 @@ fun TmsVpnApp(
                 confirmButton = {
                     Button(
                         onClick = {
-                            val ok = viewModel.verifyAdminPin(pinModalInput)
+                            val ok = viewModel.enterAdminSpace(pinModalInput)
                             if (ok) {
                                 showPinDialog = false
                                 pinModalInput = ""
@@ -644,7 +758,7 @@ fun TmsVpnApp(
                         colors = ButtonDefaults.buttonColors(containerColor = MetallicGold, contentColor = Color(0xFF1E1700)),
                         shape = RoundedCornerShape(8.dp)
                     ) {
-                        Text(text = if (isPersian) "تایید و ورود" else "Verify", fontWeight = FontWeight.Bold)
+                        Text(text = if (isPersian) "تایید و ورود به مدیریت" else "Authorize & Enter", fontWeight = FontWeight.Bold)
                     }
                 },
                 dismissButton = {
@@ -655,4 +769,5 @@ fun TmsVpnApp(
             )
         }
     }
+}
 }

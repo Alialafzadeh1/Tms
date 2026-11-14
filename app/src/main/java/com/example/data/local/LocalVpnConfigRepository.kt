@@ -103,4 +103,12 @@ class LocalVpnConfigRepository(private val dao: LocalVpnConfigDao) {
     suspend fun clearAll() = withContext(Dispatchers.IO) {
         dao.clearAll()
     }
+
+    /**
+     * Seeds initial high-speed configurations if database is empty so the app is immediately ready.
+     */
+    suspend fun prepopulateDefaultsIfEmpty(userId: String = "local_user") = withContext(Dispatchers.IO) {
+        val defaults = com.example.data.model.DefaultVpnConfigs.getDefaultConfigs(userId)
+        dao.insertAll(defaults.map { LocalVpnConfigEntity.fromDomainModel(it) })
+    }
 }

@@ -48,7 +48,31 @@ object VpnController {
         )
     }
 
-    fun startVpn(context: Context, config: VpnConfig, antiFilterMode: Boolean = true) {
+    private val _nationalIntranetMode = MutableStateFlow(false)
+    val nationalIntranetMode: StateFlow<Boolean> = _nationalIntranetMode.asStateFlow()
+
+    private val _iranRelayServer = MutableStateFlow("")
+    val iranRelayServer: StateFlow<String> = _iranRelayServer.asStateFlow()
+
+    fun toggleNationalIntranetMode() {
+        _nationalIntranetMode.value = !_nationalIntranetMode.value
+    }
+
+    fun setNationalIntranetMode(enabled: Boolean) {
+        _nationalIntranetMode.value = enabled
+    }
+
+    fun setIranRelayServer(relay: String) {
+        _iranRelayServer.value = relay
+    }
+
+    fun startVpn(
+        context: Context,
+        config: VpnConfig,
+        antiFilterMode: Boolean = true,
+        nationalIntranetMode: Boolean = _nationalIntranetMode.value,
+        iranRelayHost: String? = _iranRelayServer.value.ifBlank { null }
+    ) {
         activeConfig = config
         _sessionStats.value = VpnSessionStats(
             state = VpnConnectionState.CONNECTING,
@@ -61,7 +85,9 @@ object VpnController {
             protocol = config.protocol,
             configName = config.name,
             configJson = config.rawConfig,
-            antiFilterMode = antiFilterMode
+            antiFilterMode = antiFilterMode,
+            nationalIntranetMode = nationalIntranetMode,
+            iranRelayHost = iranRelayHost
         )
     }
 
