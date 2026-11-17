@@ -226,18 +226,22 @@ fun AntiFilterRadarScreen(
                             }
                         }
 
-                        if (vpnState == VpnConnectionState.CONNECTED) {
+                        if (vpnState == VpnConnectionState.CONNECTED || vpnState == VpnConnectionState.CONNECTING) {
                             Button(
                                 onClick = onDisconnectVpn,
                                 modifier = Modifier
                                     .weight(1f)
-                                    .height(46.dp),
+                                    .height(48.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = StatusOfflineRed),
                                 shape = RoundedCornerShape(12.dp)
                             ) {
                                 Icon(imageVector = Icons.Default.PowerSettingsNew, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text("قطع اتصال", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                Text(
+                                    text = if (vpnState == VpnConnectionState.CONNECTING) "در حال اتصال..." else "قطع اتصال",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
                         } else {
                             val activeCandidate = configs.firstOrNull { it.status == "online" } ?: configs.firstOrNull()
@@ -249,17 +253,21 @@ fun AntiFilterRadarScreen(
                                 },
                                 modifier = Modifier
                                     .weight(1f)
-                                    .height(46.dp),
+                                    .height(48.dp),
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = MetallicGold,
                                     contentColor = Color(0xFF12141A)
                                 ),
                                 shape = RoundedCornerShape(12.dp),
-                                enabled = activeCandidate != null
+                                enabled = activeCandidate != null && vpnState != VpnConnectionState.DISCONNECTING
                             ) {
                                 Icon(imageVector = Icons.Default.VpnKey, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text("اتصال سریع به بهترین نود", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                Text(
+                                    text = if (vpnState == VpnConnectionState.DISCONNECTING) "در حال قطع اتصال..." else "اتصال امن سریع",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
                         }
                     }

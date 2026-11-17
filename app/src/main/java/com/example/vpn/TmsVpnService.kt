@@ -14,6 +14,8 @@ import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
 import com.example.data.model.VpnConnectionState
+import com.example.vpn.engine.PacketBufferPool
+import com.example.vpn.engine.XrayCoreEngine
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -61,6 +63,7 @@ class TmsVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        XrayCoreEngine.preloadNativeAssetsAsync(this, serviceScope)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -144,33 +147,35 @@ class TmsVpnService : VpnService() {
                 val socketOut = socket.getOutputStream()
                 val socketIn = socket.getInputStream()
 
-                // Tunnel Tx coroutine: TUN -> Socket
+                // Tunnel Tx coroutine: TUN -> Socket (zero-allocation pooled buffer)
                 val txJob = launch {
-                    val buffer = ByteArray(32768)
-                    try {
-                        while (isActive && socket.isConnected && !socket.isClosed) {
-                            val read = tunIn.read(buffer)
-                            if (read > 0) {
-                                socketOut.write(buffer, 0, read)
-                                bytesTxTotal += read
+                    PacketBufferPool.useBuffer(PacketBufferPool.LARGE_CAPACITY) { buffer ->
+                        try {
+                            while (isActive && socket.isConnected && !socket.isClosed) {
+                                val read = tunIn.read(buffer)
+                                if (read > 0) {
+                                    socketOut.write(buffer, 0, read)
+                                    bytesTxTotal += read
+                                }
                             }
+                        } catch (_: IOException) {
                         }
-                    } catch (_: IOException) {
                     }
                 }
 
-                // Tunnel Rx coroutine: Socket -> TUN
+                // Tunnel Rx coroutine: Socket -> TUN (zero-allocation pooled buffer)
                 val rxJob = launch {
-                    val buffer = ByteArray(32768)
-                    try {
-                        while (isActive && socket.isConnected && !socket.isClosed) {
-                            val read = socketIn.read(buffer)
-                            if (read > 0) {
-                                tunOut.write(buffer, 0, read)
-                                bytesRxTotal += read
+                    PacketBufferPool.useBuffer(PacketBufferPool.LARGE_CAPACITY) { buffer ->
+                        try {
+                            while (isActive && socket.isConnected && !socket.isClosed) {
+                                val read = socketIn.read(buffer)
+                                if (read > 0) {
+                                    tunOut.write(buffer, 0, read)
+                                    bytesRxTotal += read
+                                }
                             }
+                        } catch (_: IOException) {
                         }
-                    } catch (_: IOException) {
                     }
                 }
 

@@ -198,6 +198,8 @@ data class VpnSessionStats(
     val totalBytesSent: Long = 0L,
     val realTunnelLatencyMs: Int = -1,
     val stabilityScore: Int = 98,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val engineMode: String = "Kotlin TUN Router",
+    val xrayVersion: String = ""
 )
 

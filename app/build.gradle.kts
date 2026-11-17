@@ -151,3 +151,46 @@ tasks.withType<Test> {
   systemProperty("robolectric.dependency.repo.url", "file:///home/appuser/.m2/repository")
   systemProperty("robolectric.dependency.repo.id", "local")
 }
+
+private class KspEdtUncaughtExceptionHandler(
+  private val delegate: Thread.UncaughtExceptionHandler?
+) : Thread.UncaughtExceptionHandler {
+  override fun uncaughtException(thread: Thread, throwable: Throwable) {
+    val msg = throwable.message.orEmpty()
+    val isStaleKspAppNpe =
+      throwable is NullPointerException &&
+        msg.contains("ksp.com.intellij.openapi.application.ApplicationManager.getApplication()\" is null") &&
+        throwable.stackTrace.any { it.className.startsWith("ksp.com.intellij.") }
+    if (isStaleKspAppNpe) {
+      return
+    }
+    if (delegate != null) {
+      delegate.uncaughtException(thread, throwable)
+    } else {
+      thread.threadGroup?.uncaughtException(thread, throwable)
+    }
+  }
+}
+
+private class KspAwtGuardAction : org.gradle.api.Action<Task> {
+  override fun execute(task: Task) {
+    val attach: () -> Unit = {
+      val edt = Thread.currentThread()
+      val current = edt.uncaughtExceptionHandler
+      val alreadyInstalled =
+        current?.javaClass?.name?.endsWith("KspEdtUncaughtExceptionHandler") == true
+      if (!alreadyInstalled) {
+        edt.uncaughtExceptionHandler = KspEdtUncaughtExceptionHandler(current)
+      }
+    }
+    if (javax.swing.SwingUtilities.isEventDispatchThread()) {
+      attach()
+    } else {
+      runCatching { javax.swing.SwingUtilities.invokeAndWait(attach) }
+    }
+  }
+}
+
+tasks.withType(com.google.devtools.ksp.gradle.KspAATask::class.java).configureEach {
+  doFirst(KspAwtGuardAction())
+}

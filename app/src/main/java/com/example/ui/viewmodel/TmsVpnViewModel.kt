@@ -15,11 +15,15 @@ import com.example.data.model.OverviewMetrics
 import com.example.data.model.UserProfile
 import com.example.data.model.VpnConfig
 import com.example.data.model.VpnServer
+import com.example.data.network.NodeControlApiClient
 import com.example.data.network.RealPingEngine
+import com.example.data.network.SubscriptionImporter
+import com.example.data.network.UbuntuNodeHealthResult
 import com.example.data.parser.VpnConfigParser
 import com.example.data.repository.VpnRepository
 import com.example.data.security.AdminSecurityManager
 import com.example.data.security.AuthAttemptResult
+import com.example.data.security.LocalUserAuthManager
 import com.example.data.security.SessionToken
 import com.example.data.local.LocalVpnConfigEntity
 import com.example.data.local.LocalVpnConfigRepository
@@ -50,7 +54,14 @@ import kotlinx.coroutines.launch
 import android.content.Context
 import com.example.data.model.VpnConnectionState
 import com.example.data.model.VpnSessionStats
+import com.example.vpn.SplitTunnelManager
 import com.example.vpn.VpnController
+import com.example.vpn.engine.IspAutoTuner
+import com.example.vpn.engine.IspTuningReport
+import com.example.vpn.engine.LeakCheckReport
+import com.example.vpn.engine.RacingSummary
+import com.example.vpn.engine.SmartRacingSelector
+import com.example.vpn.engine.TunnelHealthReport
 
 private const val TAG = "TmsVpnViewModel"
 
@@ -70,8 +81,22 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     // --- REAL VPN ENGINE INTEGRATION ---
     val vpnConnectionState: StateFlow<VpnConnectionState> = VpnController.connectionState
     val vpnSessionStats: StateFlow<VpnSessionStats> = VpnController.sessionStats
+    val healthReport: StateFlow<TunnelHealthReport?> = VpnController.healthReport
+    val healthCheckInProgress: StateFlow<Boolean> = VpnController.healthCheckInProgress
+    val leakCheckReport: StateFlow<LeakCheckReport?> = VpnController.leakCheckReport
+    val leakCheckInProgress: StateFlow<Boolean> = VpnController.leakCheckInProgress
+    val ispTuningReport: StateFlow<IspTuningReport?> = IspAutoTuner.latestReport
 
-    private val _selectedVpnConfig = MutableStateFlow<VpnConfig?>(null)
+    private val _isTuningIsp = MutableStateFlow(false)
+    val isTuningIsp: StateFlow<Boolean> = _isTuningIsp.asStateFlow()
+
+    private val _isRacingConnect = MutableStateFlow(false)
+    val isRacingConnect: StateFlow<Boolean> = _isRacingConnect.asStateFlow()
+
+    private val _racingSummary = MutableStateFlow<RacingSummary?>(null)
+    val racingSummary: StateFlow<RacingSummary?> = _racingSummary.asStateFlow()
+
+    private val _selectedVpnConfig = MutableStateFlow<VpnConfig?>(VpnController.activeConfig)
     val selectedVpnConfig: StateFlow<VpnConfig?> = _selectedVpnConfig.asStateFlow()
 
     private val _uiMessage = MutableStateFlow<UiMessage?>(null)
@@ -79,6 +104,15 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _isPinging = MutableStateFlow(false)
     val isPinging: StateFlow<Boolean> = _isPinging.asStateFlow()
+
+    private val _isSubscriptionImporting = MutableStateFlow(false)
+    val isSubscriptionImporting: StateFlow<Boolean> = _isSubscriptionImporting.asStateFlow()
+
+    private val _nodeControlLoading = MutableStateFlow(false)
+    val nodeControlLoading: StateFlow<Boolean> = _nodeControlLoading.asStateFlow()
+
+    private val _ubuntuNodeHealth = MutableStateFlow<UbuntuNodeHealthResult?>(null)
+    val ubuntuNodeHealth: StateFlow<UbuntuNodeHealthResult?> = _ubuntuNodeHealth.asStateFlow()
 
     private val _aiLoading = MutableStateFlow(false)
     val aiLoading: StateFlow<Boolean> = _aiLoading.asStateFlow()
@@ -94,18 +128,24 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     private val _activeSession = MutableStateFlow<SessionToken?>(null)
     val activeSession: StateFlow<SessionToken?> = _activeSession.asStateFlow()
 
-    private val _isUnlocked = MutableStateFlow(false)
+    private val initialAdminSnapshot: Boolean = LocalUserAuthManager.isAdminEmail(
+        Firebase.auth.currentUser?.email ?: LocalUserAuthManager.offlineUserFlow.value?.email
+    )
+
+    private val _isUnlocked = MutableStateFlow(initialAdminSnapshot)
     val isUnlocked: StateFlow<Boolean> = _isUnlocked.asStateFlow()
 
     private val _lockoutSeconds = MutableStateFlow(0L)
     val lockoutSeconds: StateFlow<Long> = _lockoutSeconds.asStateFlow()
 
-    // Distinct User Space vs Admin Control Center state
-    private val _isInAdminSpace = MutableStateFlow(false)
+    // Distinct User Space vs Admin Control Center state (opens automatically only for ADMIN_EMAIL)
+    private val _isInAdminSpace = MutableStateFlow(initialAdminSnapshot)
     val isInAdminSpace: StateFlow<Boolean> = _isInAdminSpace.asStateFlow()
 
     // Explicit role override (allows switching between Super Admin, Server Manager, User Admin, and Auditor in the UI)
-    private val _selectedRole = MutableStateFlow<AdminRole?>(null)
+    private val _selectedRole = MutableStateFlow<AdminRole?>(
+        if (initialAdminSnapshot) AdminRole.SUPER_ADMIN else null
+    )
 
     // Room local configurations StateFlow for offline persistence and inspection
     val localConfigs: StateFlow<List<LocalVpnConfigEntity>> = localConfigRepository.allEntities
@@ -126,6 +166,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     init {
+        VpnController.syncWithService(application)
         // Prepopulate default high-speed tested configurations so app is never empty
         viewModelScope.launch {
             try {
@@ -151,22 +192,45 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                 }
             }
         }
+
+        // Automatically open full Admin Control Center exclusively when signed in as alafzadehali@gmail.com
+        viewModelScope.launch {
+            combine(
+                authStateFlow,
+                LocalUserAuthManager.offlineUserFlow
+            ) { fbUser, offUser ->
+                fbUser?.email ?: offUser?.email
+            }.collect { activeEmail ->
+                val isAdmin = LocalUserAuthManager.isAdminEmail(activeEmail)
+                if (isAdmin) {
+                    _isInAdminSpace.value = true
+                    _isUnlocked.value = true
+                    _selectedRole.value = AdminRole.SUPER_ADMIN
+                    _lockoutSeconds.value = 0L
+                } else {
+                    _isInAdminSpace.value = false
+                    _isUnlocked.value = false
+                    _selectedRole.value = null
+                }
+            }
+        }
+    }
+
+    fun isCurrentUserAdmin(): Boolean {
+        val activeEmail = Firebase.auth.currentUser?.email ?: LocalUserAuthManager.offlineUserFlow.value?.email
+        return LocalUserAuthManager.isAdminEmail(activeEmail)
     }
 
     fun enterAdminSpace(pin: String): Boolean {
-        return if (pin.trim() == "14361436") {
+        return if (isCurrentUserAdmin()) {
             _isInAdminSpace.value = true
             _isUnlocked.value = true
             _selectedRole.value = AdminRole.SUPER_ADMIN
             _lockoutSeconds.value = 0L
-            _uiMessage.value = UiMessage.Success(
-                if (isPersianLanguage.value) "خوش آمدید. دسترسی به پنل مدیریت ارشد فعال شد" else "Super Admin Portal Unlocked"
-            )
             true
         } else {
-            _uiMessage.value = UiMessage.Error(
-                if (isPersianLanguage.value) "رمز عبور مدیریت اشتباه است (رمز صحیح: 14361436)" else "Invalid Admin Password"
-            )
+            _isInAdminSpace.value = false
+            _isUnlocked.value = false
             false
         }
     }
@@ -175,9 +239,6 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         _isInAdminSpace.value = false
         _isUnlocked.value = false
         _selectedRole.value = null
-        _uiMessage.value = UiMessage.Success(
-            if (isPersianLanguage.value) "به فضای کاربری بازگشتید" else "Returned to User Space"
-        )
     }
 
     // Unified configurations: remote Firestore with seamless local Room database fallback
@@ -578,18 +639,30 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         _selectedVpnConfig.value = config
     }
 
-    fun connectVpn(context: Context, configToUse: VpnConfig? = null) {
-        val target = configToUse ?: _selectedVpnConfig.value ?: configs.value.firstOrNull()
+    fun connectVpn(
+        context: Context,
+        configToUse: VpnConfig? = null,
+        antiFilterMode: Boolean = true
+    ) {
+        val target: VpnConfig? = configToUse
+            ?: _selectedVpnConfig.value
+            ?: VpnController.activeConfig
+            ?: configs.value.firstOrNull()
+            ?: localConfigs.value.firstOrNull()?.toDomainModel()
+            ?: com.example.data.model.DefaultVpnConfigs.getDefaultConfigs().firstOrNull()
         if (target == null) {
-            _uiMessage.value = UiMessage.Error(
-                if (isPersianLanguage.value) "هیچ کانفیگی برای برقراری تونل انتخاب نشده است / No config selected"
-                else "No VPN configuration selected"
-            )
+            val errMsg = if (isPersianLanguage.value) {
+                "هیچ کانفیگی برای برقراری تونل انتخاب نشده است"
+            } else {
+                "No VPN configuration selected"
+            }
+            VpnController.updateState(VpnConnectionState.ERROR, errMsg)
+            _uiMessage.value = UiMessage.Error(errMsg)
             return
         }
 
         _selectedVpnConfig.value = target
-        VpnController.startVpn(context, target)
+        VpnController.startVpn(context, target, antiFilterMode)
 
         viewModelScope.launch {
             try {
@@ -656,10 +729,274 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         return best
     }
 
+    fun runTunnelHealthCheck() {
+        VpnController.runTunnelHealthCheck { report ->
+            if (!report.isHealthy && SplitTunnelManager.isAutoReconnectEnabled(getApplication())) {
+                _uiMessage.value = UiMessage.Error(
+                    if (isPersianLanguage.value) "تونل فعلی پاسخ نمی‌دهد؛ می‌توانید به نود بعدی سوییچ کنید"
+                    else "Current tunnel probe failed; ready to fail over to next node"
+                )
+            }
+        }
+    }
+
+    fun failoverToNextHealthyConfig(context: Context) {
+        val list = configs.value.ifEmpty {
+            localConfigs.value.map { it.toDomainModel() }
+        }
+        val currentId = _selectedVpnConfig.value?.id ?: VpnController.activeConfig?.id
+        val candidate = list
+            .filter { it.id != currentId }
+            .sortedWith(
+                compareByDescending<VpnConfig> { it.status == "online" }
+                    .thenBy { if (it.pingMs > 0) it.pingMs else Int.MAX_VALUE }
+            )
+            .firstOrNull()
+
+        if (candidate == null) {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) "کانفیگ جایگزین دیگری در لیست وجود ندارد"
+                else "No backup VPN configuration available for failover"
+            )
+            return
+        }
+
+        _selectedVpnConfig.value = candidate
+        VpnController.startVpn(context, candidate, antiFilterMode = true)
+        _uiMessage.value = UiMessage.Success(
+            if (isPersianLanguage.value) "سوییچ خودکار به نود پشتیبان: ${candidate.name}"
+            else "Switched to backup node: ${candidate.name}"
+        )
+    }
+
+    fun racingConnect(context: Context, connectOnWin: Boolean = true) {
+        if (_isRacingConnect.value) return
+        val candidates = configs.value.ifEmpty {
+            localConfigs.value.map { it.toDomainModel() }
+        }.ifEmpty {
+            com.example.data.model.DefaultVpnConfigs.getDefaultConfigs()
+        }
+        if (candidates.isEmpty()) {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) "هیچ سروری برای تست مسابقه‌ای وجود ندارد"
+                else "No servers available for racing connect"
+            )
+            return
+        }
+
+        viewModelScope.launch {
+            _isRacingConnect.value = true
+            try {
+                val summary = SmartRacingSelector.raceConfigs(context, candidates)
+                _racingSummary.value = summary
+
+                summary.results.forEach { res ->
+                    val status = if (res.delayMs > 0) "online" else "offline"
+                    try {
+                        localConfigRepository.updatePingStatus(res.config.id, res.delayMs, status)
+                    } catch (_: Exception) {}
+                    if (Firebase.auth.currentUser != null) {
+                        try {
+                            repository.updateConfigPing(res.config.id, res.delayMs, status)
+                        } catch (_: Exception) {}
+                    }
+                }
+
+                val winner = summary.winner
+                if (winner != null) {
+                    val updatedWinner = winner.copy(pingMs = summary.winnerDelayMs, status = "online")
+                    _selectedVpnConfig.value = updatedWinner
+                    if (connectOnWin) {
+                        VpnController.startVpn(context, updatedWinner, antiFilterMode = true)
+                        _uiMessage.value = UiMessage.Success(
+                            if (isPersianLanguage.value) {
+                                "اتصال مسابقه‌ای به سریع‌ترین نود: ${updatedWinner.name} (${summary.winnerDelayMs}ms)"
+                            } else {
+                                "Racing Connect: ${updatedWinner.name} (${summary.winnerDelayMs}ms)"
+                            }
+                        )
+                    } else {
+                        _uiMessage.value = UiMessage.Success(
+                            if (isPersianLanguage.value) {
+                                "سریع‌ترین نود کشف شد: ${updatedWinner.name} (${summary.winnerDelayMs}ms)"
+                            } else {
+                                "Fastest node: ${updatedWinner.name} (${summary.winnerDelayMs}ms)"
+                            }
+                        )
+                    }
+                } else {
+                    _uiMessage.value = UiMessage.Error(
+                        if (isPersianLanguage.value) {
+                            "از ${summary.testedCount} نود تست‌شده، هیچ سروری پاسخ نداد؛ اینترنت یا فیلترشکن پایه را بررسی کنید"
+                        } else {
+                            "No reachable nodes found across ${summary.testedCount} tested servers"
+                        }
+                    )
+                }
+            } finally {
+                _isRacingConnect.value = false
+            }
+        }
+    }
+
+    fun runIspAutoTune(context: Context) {
+        if (_isTuningIsp.value) return
+        viewModelScope.launch {
+            _isTuningIsp.value = true
+            try {
+                val report = IspAutoTuner.benchmarkAndTuneForCurrentIsp(context)
+                if (report.bestCleanIp.isNotBlank() && report.bestCleanIpLatencyMs > 0) {
+                    _uiMessage.value = UiMessage.Success(
+                        if (isPersianLanguage.value) {
+                            "بهینه‌سازی ${report.transportLabel}: Clean IP ${report.bestCleanIp} (${report.bestCleanIpLatencyMs}ms) • فرگمنت ${report.fragmentProfile.length}"
+                        } else {
+                            "ISP Tuned (${report.networkType.labelEn}): ${report.bestCleanIp} (${report.bestCleanIpLatencyMs}ms)"
+                        }
+                    )
+                } else {
+                    _uiMessage.value = UiMessage.Error(
+                        if (isPersianLanguage.value) {
+                            "پروفایل فرگمنت برای ${report.transportLabel} تنظیم شد، اما Clean IP در دسترس یافت نشد"
+                        } else {
+                            "Fragment profile updated for ${report.networkType.labelEn}, no Clean IP reachable"
+                        }
+                    )
+                }
+            } finally {
+                _isTuningIsp.value = false
+            }
+        }
+    }
+
+    fun runLeakGuardCheck() {
+        VpnController.runLeakGuardCheck { report ->
+            if (!report.errorMessage.isNullOrBlank()) {
+                _uiMessage.value = UiMessage.Error(report.errorMessage)
+            } else {
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) {
+                        "IP خروجی: ${report.exitIp} (${report.countryCode.ifBlank { "--" }}) • ${report.dnsStatusLabel}"
+                    } else {
+                        "Exit IP: ${report.exitIp} (${report.countryCode.ifBlank { "--" }}) • ${report.dnsStatusLabel}"
+                    }
+                )
+            }
+        }
+    }
+
+    fun importSubscriptionUrl(url: String) {
+        if (_isSubscriptionImporting.value) return
+        val uid = Firebase.auth.currentUser?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
+        viewModelScope.launch {
+            _isSubscriptionImporting.value = true
+            try {
+                val res = SubscriptionImporter.fetchSubscription(url, uid)
+                if (!res.isSuccess) {
+                    _uiMessage.value = UiMessage.Error(res.errorMessage ?: "خطا در دریافت سابسکریپشن")
+                    return@launch
+                }
+
+                var added = 0
+                var duplicates = 0
+                for (cfg in res.configs) {
+                    val validation = InputValidator.validateVpnConfig(
+                        protocol = cfg.protocol,
+                        server = cfg.server,
+                        port = cfg.port,
+                        uuidOrPassword = cfg.uuidOrPassword,
+                        security = cfg.security,
+                        transport = cfg.transport,
+                        rawConfig = cfg.rawConfig
+                    )
+                    if (validation is ValidationResult.Invalid) continue
+                    if (VpnConfigParser.isDuplicate(cfg, configs.value)) {
+                        duplicates++
+                        continue
+                    }
+                    localConfigRepository.saveConfig(cfg)
+                    if (Firebase.auth.currentUser != null) {
+                        try {
+                            repository.addConfig(cfg)
+                        } catch (_: Exception) {}
+                    }
+                    if (_selectedVpnConfig.value == null) {
+                        _selectedVpnConfig.value = cfg
+                    }
+                    added++
+                }
+
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) {
+                        if (added > 0) "$added کانفیگ از لینک سابسکریپشن اضافه شد"
+                        else "همه کانفیگ‌های سابسکریپشن از قبل موجود بودند ($duplicates مورد)"
+                    } else {
+                        "Imported $added configs from subscription ($duplicates duplicates)"
+                    }
+                )
+            } finally {
+                _isSubscriptionImporting.value = false
+            }
+        }
+    }
+
+    fun checkUbuntuNodeHealth(baseUrl: String, apiToken: String) {
+        if (_nodeControlLoading.value) return
+        viewModelScope.launch {
+            _nodeControlLoading.value = true
+            try {
+                val result = NodeControlApiClient.checkNodeHealth(baseUrl, apiToken)
+                _ubuntuNodeHealth.value = result
+                _uiMessage.value = if (result.isReachable) {
+                    UiMessage.Success(
+                        if (isPersianLanguage.value) {
+                            "نود Ubuntu آنلاین است • Xray: ${if (result.xrayRunning) "فعال" else "متوقف"} • کاربران: ${result.activeUsers}"
+                        } else {
+                            "Ubuntu node online • Xray=${result.xrayRunning} • Users=${result.activeUsers}"
+                        }
+                    )
+                } else {
+                    UiMessage.Error(result.errorMessage ?: "خطا در اتصال به نود Ubuntu")
+                }
+            } finally {
+                _nodeControlLoading.value = false
+            }
+        }
+    }
+
+    fun provisionFromUbuntuNode(baseUrl: String, apiToken: String, quotaGb: Int = 100) {
+        if (!checkPermission(AdminPermission.MANAGE_SERVERS, "تولید کانفیگ اختصاصی از نود Ubuntu")) return
+        if (_nodeControlLoading.value) return
+        val user = Firebase.auth.currentUser
+        val uid = user?.uid ?: "local_user"
+        val email = user?.email ?: "$uid@tmsvpn.local"
+
+        viewModelScope.launch {
+            _nodeControlLoading.value = true
+            try {
+                val provisioned = NodeControlApiClient.provisionPrivateVlessUser(
+                    baseUrl = baseUrl,
+                    apiToken = apiToken,
+                    userId = uid,
+                    userEmail = email,
+                    quotaGb = quotaGb
+                )
+                if (provisioned.isSuccess && provisioned.vlessUri.isNotBlank()) {
+                    importConfig(provisioned.vlessUri)
+                } else {
+                    _uiMessage.value = UiMessage.Error(
+                        provisioned.errorMessage ?: "خطا در ساخت اکانت اختصاصی Xray"
+                    )
+                }
+            } finally {
+                _nodeControlLoading.value = false
+            }
+        }
+    }
+
     // --- CONFIG MANAGEMENT ---
 
     fun importBatchConfigs(rawBatchText: String) {
-        val uid = Firebase.auth.currentUser?.uid ?: "local_user"
+        val uid = Firebase.auth.currentUser?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
         val parseResults = VpnConfigParser.parseMultiple(rawBatchText, uid)
 
         var addedCount = 0
@@ -692,9 +1029,11 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 try {
                     localConfigRepository.saveConfig(cfg)
-                    try {
-                        repository.addConfig(cfg)
-                    } catch (_: Exception) {}
+                    if (Firebase.auth.currentUser != null) {
+                        try {
+                            repository.addConfig(cfg)
+                        } catch (_: Exception) {}
+                    }
                     addedCount++
                 } catch (e: Exception) {
                     Log.e(TAG, "Error adding batch item", e)
@@ -705,24 +1044,26 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             val msgEn = "Imported $addedCount configs ($duplicateCount duplicates, $invalidCount invalid)"
             _uiMessage.value = UiMessage.Success(if (isPersianLanguage.value) msgFa else msgEn)
 
-            try {
-                repository.addAuditLog(
-                    AuthAuditLog(
-                        userId = uid,
-                        action = "BATCH_CONFIG_IMPORT",
-                        role = currentRole.value.id,
-                        module = "ConfigurationManagement",
-                        status = "SUCCESS",
-                        ipOrDevice = getDeviceInfo(),
-                        details = "واردسازی گروهی: $addedCount موفق، $duplicateCount تکراری، $invalidCount نامعتبر"
+            if (Firebase.auth.currentUser != null) {
+                try {
+                    repository.addAuditLog(
+                        AuthAuditLog(
+                            userId = uid,
+                            action = "BATCH_CONFIG_IMPORT",
+                            role = currentRole.value.id,
+                            module = "ConfigurationManagement",
+                            status = "SUCCESS",
+                            ipOrDevice = getDeviceInfo(),
+                            details = "واردسازی گروهی: $addedCount موفق، $duplicateCount تکراری، $invalidCount نامعتبر"
+                        )
                     )
-                )
-            } catch (_: Exception) {}
+                } catch (_: Exception) {}
+            }
         }
     }
 
     fun importConfig(rawUri: String) {
-        val uid = Firebase.auth.currentUser?.uid ?: "local_user"
+        val uid = Firebase.auth.currentUser?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
         val parseResult = VpnConfigParser.parse(rawUri, uid)
         if (!parseResult.isSuccess || parseResult.config == null) {
             val err = parseResult.errorMessage ?: "خطا در تجزیه ساختار کانفیگ"
@@ -754,10 +1095,12 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             try {
                 localConfigRepository.saveConfig(newConfig)
-                try {
-                    repository.addConfig(newConfig)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Firestore sync skipped/failed: ${e.message}")
+                if (Firebase.auth.currentUser != null) {
+                    try {
+                        repository.addConfig(newConfig)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Firestore sync skipped/failed: ${e.message}")
+                    }
                 }
 
                 _selectedVpnConfig.value = newConfig
@@ -765,19 +1108,21 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                     if (isPersianLanguage.value) "کانفیگ ${newConfig.name} با موفقیت افزوده شد" else "Config added: ${newConfig.name}"
                 )
 
-                try {
-                    repository.addAuditLog(
-                        AuthAuditLog(
-                            userId = uid,
-                            action = "CONFIG_IMPORT_SUCCESS",
-                            role = currentRole.value.id,
-                            module = "ConfigurationManagement",
-                            status = "SUCCESS",
-                            ipOrDevice = getDeviceInfo(),
-                            details = "کانفیگ ${newConfig.protocol.uppercase()} برای سرور ${newConfig.server}:${newConfig.port} ذخیره شد"
+                if (Firebase.auth.currentUser != null) {
+                    try {
+                        repository.addAuditLog(
+                            AuthAuditLog(
+                                userId = uid,
+                                action = "CONFIG_IMPORT_SUCCESS",
+                                role = currentRole.value.id,
+                                module = "ConfigurationManagement",
+                                status = "SUCCESS",
+                                ipOrDevice = getDeviceInfo(),
+                                details = "کانفیگ ${newConfig.protocol.uppercase()} برای سرور ${newConfig.server}:${newConfig.port} ذخیره شد"
+                            )
                         )
-                    )
-                } catch (_: Exception) {}
+                    } catch (_: Exception) {}
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to save config", e)
                 _uiMessage.value = UiMessage.Error(e.localizedMessage ?: "خطا در ذخیره کانفیگ")
@@ -795,7 +1140,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         transport: String = "tcp",
         sni: String = ""
     ) {
-        val uid = Firebase.auth.currentUser?.uid ?: "local_user"
+        val uid = Firebase.auth.currentUser?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
         val trimmedServer = server.trim()
         if (trimmedServer.isBlank()) {
             _uiMessage.value = UiMessage.Error("آدرس سرور نمی‌تواند خالی باشد / Server address is required")
@@ -822,9 +1167,11 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             try {
                 localConfigRepository.saveConfig(config)
-                try {
-                    repository.addConfig(config)
-                } catch (_: Exception) {}
+                if (Firebase.auth.currentUser != null) {
+                    try {
+                        repository.addConfig(config)
+                    } catch (_: Exception) {}
+                }
                 _selectedVpnConfig.value = config
                 _uiMessage.value = UiMessage.Success(
                     if (isPersianLanguage.value) "کانفیگ دستی با موفقیت ذخیره شد" else "Manual configuration saved"
@@ -842,7 +1189,9 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             val newStatus = if (result.isReachable) "online" else "offline"
             try {
                 localConfigRepository.updatePingStatus(config.id, result.latencyMs, newStatus)
-                repository.updateConfigPing(config.id, result.latencyMs, newStatus)
+                if (Firebase.auth.currentUser != null) {
+                    repository.updateConfigPing(config.id, result.latencyMs, newStatus)
+                }
                 if (result.isReachable) {
                     _uiMessage.value = UiMessage.Success("سرور آنلاین است - تاخیر واقعی: ${result.latencyMs}ms")
                 } else {
@@ -890,7 +1239,9 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             try {
                 localConfigRepository.updateFavorite(config.id, !config.isFavorite)
-                repository.updateConfig(config.copy(isFavorite = !config.isFavorite))
+                if (Firebase.auth.currentUser != null) {
+                    repository.updateConfig(config.copy(isFavorite = !config.isFavorite))
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {

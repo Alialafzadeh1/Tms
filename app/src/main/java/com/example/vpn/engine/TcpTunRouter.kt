@@ -41,6 +41,11 @@ class TcpTunRouter(
 
     private val activeSessions = ConcurrentHashMap<String, TcpSession>()
 
+    private class PooledPayload(
+        val data: ByteArray,
+        val length: Int
+    )
+
     private class TcpSession(
         val key: String,
         val clientIp: ByteArray,
@@ -52,7 +57,7 @@ class TcpTunRouter(
         var socket: Socket? = null,
         var outputStream: OutputStream? = null,
         var socketJob: Job? = null,
-        val pendingPayloads: ConcurrentLinkedQueue<ByteArray> = ConcurrentLinkedQueue(),
+        val pendingPayloads: ConcurrentLinkedQueue<PooledPayload> = ConcurrentLinkedQueue(),
         val isReady: AtomicBoolean = AtomicBoolean(false)
     )
 
@@ -147,7 +152,7 @@ class TcpTunRouter(
             }
 
             // Failover to Direct Anti-DPI Piercing if proxy fails or wasn't configured
-            if (!proxySuccess && scope.isActive && !session.socket?.isClosed!!) {
+            if (!proxySuccess && scope.isActive && session.socket?.isClosed != true) {
                 Log.i(TAG, "Proxy route unavailable for ${session.key}. Activating Direct Anti-DPI Piercing to $targetHost:$targetPort")
                 tryDirectAntiDpiConnection(session, targetHost, targetPort)
             }
@@ -286,14 +291,16 @@ class TcpTunRouter(
             try {
                 ProxyHandshakeHelper.writeWithAntiDpiFragmentation(
                     outputStream = outStream,
-                    buffer = payload,
+                    buffer = payload.data,
                     offset = 0,
-                    length = payload.size,
+                    length = payload.length,
                     antiFilterMode = antiFilterMode
                 )
             } catch (e: Exception) {
                 Log.d(TAG, "Failed flushing pending payload: ${e.message}")
                 break
+            } finally {
+                PacketBufferPool.release(payload.data)
             }
         }
     }
@@ -303,33 +310,34 @@ class TcpTunRouter(
         socket: Socket,
         inStream: InputStream
     ) {
-        val buffer = ByteArray(16384)
-        while (scope.isActive && socket.isConnected && !socket.isClosed) {
-            val bytesRead = inStream.read(buffer)
-            if (bytesRead == -1) break
+        PacketBufferPool.useBuffer(PacketBufferPool.MEDIUM_CAPACITY) { buffer ->
+            while (scope.isActive && socket.isConnected && !socket.isClosed) {
+                val bytesRead = inStream.read(buffer)
+                if (bytesRead == -1) break
 
-            if (bytesRead > 0) {
-                totalRxBytes.addAndGet(bytesRead.toLong())
+                if (bytesRead > 0) {
+                    totalRxBytes.addAndGet(bytesRead.toLong())
 
-                var offset = 0
-                while (offset < bytesRead) {
-                    val chunkSize = (bytesRead - offset).coerceAtMost(MAX_PAYLOAD_CHUNK)
-                    val dataPacket = TcpHeader.buildIpv4TcpPacket(
-                        srcIp = session.serverIp,
-                        dstIp = session.clientIp,
-                        srcPort = session.serverPort,
-                        dstPort = session.clientPort,
-                        seqNum = session.serverSeqNum,
-                        ackNum = session.clientSeqNum,
-                        flags = TcpHeader.FLAG_PSH or TcpHeader.FLAG_ACK,
-                        windowSize = 65535,
-                        payload = buffer,
-                        payloadOffset = offset,
-                        payloadLength = chunkSize
-                    )
-                    sendToTun(dataPacket)
-                    session.serverSeqNum = (session.serverSeqNum + chunkSize) and 0xFFFFFFFFL
-                    offset += chunkSize
+                    var offset = 0
+                    while (offset < bytesRead) {
+                        val chunkSize = (bytesRead - offset).coerceAtMost(MAX_PAYLOAD_CHUNK)
+                        val dataPacket = TcpHeader.buildIpv4TcpPacket(
+                            srcIp = session.serverIp,
+                            dstIp = session.clientIp,
+                            srcPort = session.serverPort,
+                            dstPort = session.clientPort,
+                            seqNum = session.serverSeqNum,
+                            ackNum = session.clientSeqNum,
+                            flags = TcpHeader.FLAG_PSH or TcpHeader.FLAG_ACK,
+                            windowSize = 65535,
+                            payload = buffer,
+                            payloadOffset = offset,
+                            payloadLength = chunkSize
+                        )
+                        sendToTun(dataPacket)
+                        session.serverSeqNum = (session.serverSeqNum + chunkSize) and 0xFFFFFFFFL
+                        offset += chunkSize
+                    }
                 }
             }
         }
@@ -359,29 +367,32 @@ class TcpTunRouter(
         )
         sendToTun(ackPacket)
 
-        // Make an immutable defensive copy of the payload to prevent buffer corruption across async tasks
-        val payloadCopy = buffer.copyOfRange(payloadOffset, payloadOffset + payloadLength)
+        // Acquire a pooled byte array to copy payload off the shared TUN read buffer with minimal GC overhead
+        val pooledBuffer = PacketBufferPool.acquire(payloadLength)
+        System.arraycopy(buffer, payloadOffset, pooledBuffer, 0, payloadLength)
 
         if (!session.isReady.get() || session.outputStream == null) {
-            // Queue payload until the outbound socket handshake completes
-            session.pendingPayloads.add(payloadCopy)
+            // Queue pooled payload until the outbound socket handshake completes
+            session.pendingPayloads.add(PooledPayload(pooledBuffer, payloadLength))
         } else {
             scope.launch(Dispatchers.IO) {
-                val out = session.outputStream
-                val socket = session.socket
-                if (out != null && socket != null && socket.isConnected && !socket.isClosed) {
-                    try {
+                try {
+                    val out = session.outputStream
+                    val socket = session.socket
+                    if (out != null && socket != null && socket.isConnected && !socket.isClosed) {
                         ProxyHandshakeHelper.writeWithAntiDpiFragmentation(
                             outputStream = out,
-                            buffer = payloadCopy,
+                            buffer = pooledBuffer,
                             offset = 0,
-                            length = payloadCopy.size,
+                            length = payloadLength,
                             antiFilterMode = antiFilterMode
                         )
-                    } catch (e: Exception) {
-                        Log.d(TAG, "Write error on ${session.key}: ${e.message}")
-                        closeSession(session)
                     }
+                } catch (e: Exception) {
+                    Log.d(TAG, "Write error on ${session.key}: ${e.message}")
+                    closeSession(session)
+                } finally {
+                    PacketBufferPool.release(pooledBuffer)
                 }
             }
         }
@@ -439,6 +450,9 @@ class TcpTunRouter(
 
     private fun closeSession(session: TcpSession) {
         activeSessions.remove(session.key)
+        while (!session.pendingPayloads.isEmpty()) {
+            session.pendingPayloads.poll()?.let { PacketBufferPool.release(it.data) }
+        }
         try { session.socket?.close() } catch (_: Exception) {}
         session.socketJob?.cancel()
     }

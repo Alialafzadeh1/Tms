@@ -43,56 +43,62 @@ class DnsPacketHandler(
         queryOffset: Int,
         queryLength: Int
     ) {
-        val queryData = dnsQueryBytes.copyOfRange(queryOffset, queryOffset + queryLength)
+        val queryBuffer = PacketBufferPool.acquire(queryLength.coerceAtLeast(PacketBufferPool.SMALL_CAPACITY))
+        System.arraycopy(dnsQueryBytes, queryOffset, queryBuffer, 0, queryLength)
 
         scope.launch(Dispatchers.IO) {
-            for (dnsServer in upstreamDnsList) {
-                var socket: DatagramSocket? = null
-                try {
-                    socket = DatagramSocket()
-                    vpnService.protect(socket)
-                    socket.soTimeout = 2500
-
-                    val sendPacket = DatagramPacket(queryData, queryData.size, dnsServer, 53)
-                    socket.send(sendPacket)
-
-                    val responseBuffer = ByteArray(2048)
-                    val receivePacket = DatagramPacket(responseBuffer, responseBuffer.size)
-                    socket.receive(receivePacket)
-
-                    val responseLength = receivePacket.length
-                    if (responseLength <= 12) continue
-
-                    // Check if response contains poisoned IP
-                    if (isPoisonedResponse(responseBuffer, responseLength)) {
-                        Log.w(TAG, "Detected and dropped poisoned DNS packet from $dnsServer")
-                        continue
-                    }
-
-                    val responseBytes = receivePacket.data.copyOfRange(0, responseLength)
-
-                    // Synthesize the reply IPv4 + UDP packet to TUN
-                    val replyPacket = TcpHeader.buildIpv4UdpPacket(
-                        srcIp = ipHeader.dstIpBytes, // Original destination requested by app
-                        dstIp = ipHeader.srcIpBytes, // Device TUN IP (10.8.0.2)
-                        srcPort = udpHeader.dstPort, // 53
-                        dstPort = udpHeader.srcPort, // Client app's source port
-                        payload = responseBytes
-                    )
-
-                    synchronized(tunOutput) {
-                        tunOutput.write(replyPacket)
-                        tunOutput.flush()
-                    }
-                    // Successfully resolved and delivered, no need to query other upstreams
-                    return@launch
-                } catch (_: Exception) {
-                    // Try next upstream server
-                } finally {
+            try {
+                for (dnsServer in upstreamDnsList) {
+                    var socket: DatagramSocket? = null
+                    val responseBuffer = PacketBufferPool.acquire(PacketBufferPool.SMALL_CAPACITY)
                     try {
-                        socket?.close()
-                    } catch (_: Exception) {}
+                        socket = DatagramSocket()
+                        vpnService.protect(socket)
+                        socket.soTimeout = 2500
+
+                        val sendPacket = DatagramPacket(queryBuffer, queryLength, dnsServer, 53)
+                        socket.send(sendPacket)
+
+                        val receivePacket = DatagramPacket(responseBuffer, responseBuffer.size)
+                        socket.receive(receivePacket)
+
+                        val responseLength = receivePacket.length
+                        if (responseLength <= 12) continue
+
+                        // Check if response contains poisoned IP
+                        if (isPoisonedResponse(responseBuffer, responseLength)) {
+                            Log.w(TAG, "Detected and dropped poisoned DNS packet from $dnsServer")
+                            continue
+                        }
+
+                        val responseBytes = receivePacket.data.copyOfRange(0, responseLength)
+
+                        // Synthesize the reply IPv4 + UDP packet to TUN
+                        val replyPacket = TcpHeader.buildIpv4UdpPacket(
+                            srcIp = ipHeader.dstIpBytes, // Original destination requested by app
+                            dstIp = ipHeader.srcIpBytes, // Device TUN IP (10.8.0.2)
+                            srcPort = udpHeader.dstPort, // 53
+                            dstPort = udpHeader.srcPort, // Client app's source port
+                            payload = responseBytes
+                        )
+
+                        synchronized(tunOutput) {
+                            tunOutput.write(replyPacket)
+                            tunOutput.flush()
+                        }
+                        // Successfully resolved and delivered, no need to query other upstreams
+                        return@launch
+                    } catch (_: Exception) {
+                        // Try next upstream server
+                    } finally {
+                        PacketBufferPool.release(responseBuffer)
+                        try {
+                            socket?.close()
+                        } catch (_: Exception) {}
+                    }
                 }
+            } finally {
+                PacketBufferPool.release(queryBuffer)
             }
         }
     }

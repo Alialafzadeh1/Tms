@@ -21,9 +21,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.credentials.ClearCredentialStateRequest
+import androidx.credentials.CredentialManager
+import com.example.data.security.LocalUserAuthManager
 import com.example.ui.TmsVpnApp
 import com.example.ui.screens.AuthScreen
 import com.example.ui.theme.DeepBlackBackground
@@ -32,8 +36,10 @@ import com.example.util.configureAppCheck
 import com.google.firebase.Firebase
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.auth
-
-import com.example.data.security.LocalUserAuthManager
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -60,8 +66,10 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun AppContent() {
     val context = LocalContext.current
-    val authManager = remember { LocalUserAuthManager(context) }
-    var currentSessionUser by remember { mutableStateOf(authManager.getActiveSessionUser()) }
+    val coroutineScope = rememberCoroutineScope()
+    val credentialManager = remember(context) { CredentialManager.create(context) }
+    var currentUser by remember { mutableStateOf(Firebase.auth.currentUser) }
+    val offlineUser by LocalUserAuthManager.offlineUserFlow.collectAsStateWithLifecycle()
     var pendingVpnAction by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
@@ -69,26 +77,44 @@ fun AppContent() {
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             pendingVpnAction?.invoke()
-            pendingVpnAction = null
+        } else {
+            com.example.vpn.VpnController.updateState(
+                com.example.data.model.VpnConnectionState.ERROR,
+                "مجوز ایجاد تونل VPN تایید نشد / VPN permission denied"
+            )
         }
+        pendingVpnAction = null
     }
 
     val notificationLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { _ -> }
 
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+
     LaunchedEffect(Unit) {
+        LocalUserAuthManager.restoreOfflineSession(context)
+        com.example.vpn.VpnController.syncWithService(context)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
-    DisposableEffect(Unit) {
-        val listener = FirebaseAuth.AuthStateListener {
-            val activeUser = authManager.getActiveSessionUser()
-            if (activeUser != null) {
-                currentSessionUser = activeUser
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                com.example.vpn.VpnController.syncWithService(context)
             }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    DisposableEffect(Unit) {
+        val listener = FirebaseAuth.AuthStateListener { auth ->
+            currentUser = auth.currentUser
         }
         Firebase.auth.addAuthStateListener(listener)
         onDispose {
@@ -96,28 +122,46 @@ fun AppContent() {
         }
     }
 
-    if (currentSessionUser == null) {
+    val activeUid = currentUser?.uid ?: offlineUser?.uid
+    if (activeUid == null) {
         AuthScreen(
             onAuthSuccess = {
-                currentSessionUser = authManager.getActiveSessionUser()
+                currentUser = Firebase.auth.currentUser
             }
         )
     } else {
-        val uid = currentSessionUser!!.uid
-        key(uid) {
+        key(activeUid) {
             TmsVpnApp(
-                currentUserId = uid,
+                currentUserId = activeUid,
                 onSignOut = {
-                    authManager.logout()
-                    currentSessionUser = null
+                    coroutineScope.launch {
+                        withContext(NonCancellable) {
+                            LocalUserAuthManager.clearOfflineSession(context)
+                            try {
+                                credentialManager.clearCredentialState(ClearCredentialStateRequest())
+                            } catch (_: Exception) {
+                            } finally {
+                                Firebase.auth.signOut()
+                                currentUser = null
+                            }
+                        }
+                    }
                 },
                 onRequestVpnPermission = { onGranted ->
-                    val intent = VpnService.prepare(context)
-                    if (intent != null) {
-                        pendingVpnAction = onGranted
-                        vpnPermissionLauncher.launch(intent)
-                    } else {
-                        onGranted()
+                    try {
+                        val intent = VpnService.prepare(context)
+                        if (intent != null) {
+                            pendingVpnAction = onGranted
+                            vpnPermissionLauncher.launch(intent)
+                        } else {
+                            onGranted()
+                        }
+                    } catch (e: Exception) {
+                        pendingVpnAction = null
+                        com.example.vpn.VpnController.updateState(
+                            com.example.data.model.VpnConnectionState.ERROR,
+                            "خطا در درخواست مجوز VPN: ${e.localizedMessage ?: "امکان آماده‌سازی سرویس وجود ندارد"}"
+                        )
                     }
                 }
             )

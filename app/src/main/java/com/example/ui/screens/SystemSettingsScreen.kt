@@ -67,6 +67,7 @@ import androidx.credentials.CredentialManager
 import com.example.R
 import com.example.data.model.AdminPermission
 import com.example.data.model.AdminRole
+import com.example.data.security.LocalUserAuthManager
 import com.example.ui.theme.BorderGoldHighlight
 import com.example.ui.theme.BorderGoldMuted
 import com.example.ui.theme.CardSurfaceDark
@@ -594,6 +595,7 @@ fun SystemSettingsScreen(
                 onClick = {
                     coroutineScope.launch {
                         withContext(NonCancellable) {
+                            LocalUserAuthManager.clearOfflineSession(context)
                             try {
                                 credentialManager.clearCredentialState(ClearCredentialStateRequest())
                             } catch (e: Exception) {

@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.PowerOff
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Shield
@@ -270,7 +271,7 @@ fun OverviewScreen(
                                 ),
                                 CircleShape
                             )
-                            .clickable {
+                            .clickable(enabled = !isDisconnecting) {
                                 if (isConnected || isConnecting) {
                                     onDisconnectVpn()
                                 } else {
@@ -288,7 +289,7 @@ fun OverviewScreen(
                                 )
                             } else {
                                 Icon(
-                                    imageVector = if (isConnected) Icons.Default.Shield else Icons.Default.PowerSettingsNew,
+                                    imageVector = if (isConnected) Icons.Default.PowerOff else Icons.Default.PowerSettingsNew,
                                     contentDescription = "VPN Power Switch",
                                     tint = buttonBorderColor,
                                     modifier = Modifier.size(46.dp)
@@ -298,8 +299,8 @@ fun OverviewScreen(
                             Text(
                                 text = when (vpnState) {
                                     VpnConnectionState.CONNECTED -> if (isPersian) "قطع اتصال" else "DISCONNECT"
-                                    VpnConnectionState.CONNECTING -> if (isPersian) "در حال اتصال" else "CONNECTING"
-                                    VpnConnectionState.DISCONNECTING -> if (isPersian) "قطع تونل..." else "STOPPING..."
+                                    VpnConnectionState.CONNECTING -> if (isPersian) "در حال اتصال..." else "CONNECTING..."
+                                    VpnConnectionState.DISCONNECTING -> if (isPersian) "در حال قطع اتصال..." else "DISCONNECTING..."
                                     else -> if (isPersian) "اتصال امن" else "CONNECT"
                                 },
                                 fontSize = 12.sp,

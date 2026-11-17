@@ -51,6 +51,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import com.example.data.network.UbuntuNodeHealthResult
 import com.example.data.model.AdminPermission
 import com.example.data.model.AdminRole
 import com.example.data.model.VpnServer
@@ -76,9 +84,17 @@ fun ServerManagementScreen(
     isPinging: Boolean,
     onAddServer: (name: String, country: String, code: String, host: String, port: Int, protocol: String) -> Unit,
     onPingServer: (VpnServer) -> Unit,
-    onDeleteServer: (String) -> Unit
+    onDeleteServer: (String) -> Unit,
+    nodeControlLoading: Boolean = false,
+    ubuntuNodeHealth: UbuntuNodeHealthResult? = null,
+    onCheckUbuntuNode: (baseUrl: String, token: String) -> Unit = { _, _ -> },
+    onProvisionUbuntuUser: (baseUrl: String, token: String) -> Unit = { _, _ -> }
 ) {
+    val context = LocalContext.current
     var showAddDialog by remember { mutableStateOf(false) }
+    var showUbuntuControlDialog by remember { mutableStateOf(false) }
+    var ubuntuApiUrl by remember { mutableStateOf("") }
+    var ubuntuApiToken by remember { mutableStateOf("") }
 
     var serverName by remember { mutableStateOf("") }
     var serverCountry by remember { mutableStateOf("") }
@@ -130,6 +146,68 @@ fun ServerManagementScreen(
                             Icon(imageVector = Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(4.dp))
                             Text(text = if (isPersian) "افزودن سرور" else "Add Node", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+
+            // Ubuntu 24.04 Xray Node API Provisioning Card
+            if (canManageServers) {
+                item {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(BorderStroke(1.dp, BorderGoldHighlight), RoundedCornerShape(14.dp)),
+                        colors = CardDefaults.cardColors(containerColor = CardSurfaceDark),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = if (isPersian) "اتصال به نود Ubuntu 24.04 و کنترل API" else "Ubuntu 24.04 Xray Node API",
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MetallicGold
+                                    )
+                                    Text(
+                                        text = if (isPersian) "تست سلامت سرویس Xray و صدور لینک VLESS Reality اختصاصی برای کاربر"
+                                        else "Probe Xray daemon health & provision private VLESS Reality UUIDs",
+                                        fontSize = 11.sp,
+                                        color = TextGraySecondary
+                                    )
+                                }
+                                OutlinedButton(
+                                    onClick = { showUbuntuControlDialog = true },
+                                    modifier = Modifier
+                                        .height(48.dp)
+                                        .testTag("server_ubuntu_api_button"),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = EmeraldGreen),
+                                    border = BorderStroke(1.dp, EmeraldGreen.copy(alpha = 0.7f)),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text(
+                                        text = if (isPersian) "پنل نود" else "Manage",
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 12.sp
+                                    )
+                                }
+                            }
+                            if (ubuntuNodeHealth != null) {
+                                Text(
+                                    text = if (ubuntuNodeHealth.isReachable) {
+                                        "Node=${ubuntuNodeHealth.publicHost.ifBlank { "OK" }} • Xray=${if (ubuntuNodeHealth.xrayRunning) "Active" else "Stopped"} • Users=${ubuntuNodeHealth.activeUsers}"
+                                    } else {
+                                        ubuntuNodeHealth.errorMessage ?: "Offline"
+                                    },
+                                    fontSize = 11.sp,
+                                    color = if (ubuntuNodeHealth.isReachable) EmeraldGreen else StatusOfflineRed
+                                )
+                            }
                         }
                     }
                 }
@@ -376,6 +454,108 @@ fun ServerManagementScreen(
             dismissButton = {
                 TextButton(onClick = { showAddDialog = false }) {
                     Text(text = if (isPersian) "انصراف" else "Cancel", color = TextGraySecondary)
+                }
+            }
+        )
+    }
+
+    if (showUbuntuControlDialog) {
+        AlertDialog(
+            onDismissRequest = { showUbuntuControlDialog = false },
+            containerColor = CardSurfaceDark,
+            title = {
+                Text(
+                    text = if (isPersian) "مدیریت نود Ubuntu 24.04" else "Ubuntu 24.04 Xray Node API",
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MetallicGold
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(
+                        value = ubuntuApiUrl,
+                        onValueChange = { ubuntuApiUrl = it },
+                        label = { Text(if (isPersian) "آدرس API نود (مثلاً https://node:8443)" else "Node API Base URL") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MetallicGold,
+                            unfocusedBorderColor = BorderGoldMuted,
+                            focusedTextColor = TextWhitePrimary,
+                            unfocusedTextColor = TextWhitePrimary
+                        )
+                    )
+                    OutlinedTextField(
+                        value = ubuntuApiToken,
+                        onValueChange = { ubuntuApiToken = it },
+                        label = { Text(if (isPersian) "توکن احراز هویت (Bearer Token)" else "Admin API Token") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MetallicGold,
+                            unfocusedBorderColor = BorderGoldMuted,
+                            focusedTextColor = TextWhitePrimary,
+                            unfocusedTextColor = TextWhitePrimary
+                        )
+                    )
+                    OutlinedButton(
+                        onClick = {
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(
+                                ClipData.newPlainText("Ubuntu Setup", "sudo bash deploy/ubuntu24_tms_xray_setup.sh")
+                            )
+                            Toast.makeText(
+                                context,
+                                if (isPersian) "دستور نصب Ubuntu 24.04 کپی شد" else "Setup command copied",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp),
+                        border = BorderStroke(1.dp, BorderGoldMuted)
+                    ) {
+                        Text(
+                            text = if (isPersian) "کپی دستور راه‌اندازی Ubuntu 24.04" else "Copy Ubuntu 24.04 Setup Command",
+                            color = TextGoldMuted,
+                            fontSize = 11.sp
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { onCheckUbuntuNode(ubuntuApiUrl, ubuntuApiToken) },
+                            enabled = !nodeControlLoading && ubuntuApiUrl.isNotBlank(),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp),
+                            border = BorderStroke(1.dp, EmeraldGreen)
+                        ) {
+                            Text(if (isPersian) "تست سلامت" else "Health", color = EmeraldGreen, fontSize = 12.sp)
+                        }
+                        Button(
+                            onClick = {
+                                onProvisionUbuntuUser(ubuntuApiUrl, ubuntuApiToken)
+                                showUbuntuControlDialog = false
+                            },
+                            enabled = !nodeControlLoading && ubuntuApiUrl.isNotBlank(),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = MetallicGold, contentColor = Color(0xFF1E1700))
+                        ) {
+                            Text(if (isPersian) "ساخت VLESS" else "Provision", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showUbuntuControlDialog = false }) {
+                    Text(if (isPersian) "بستن" else "Close", color = TextGraySecondary)
                 }
             }
         )

@@ -21,7 +21,8 @@ private const val TAG = "DynamicRotator"
  */
 object DynamicIpDnsRotator {
 
-    private val ipPool = ConfigAutoHealer.CLEAN_ANYCAST_IPS
+    @Volatile
+    private var ipPool: List<String> = ConfigAutoHealer.CLEAN_ANYCAST_IPS
     private val dnsPool = listOf("1.1.1.1", "8.8.8.8", "1.0.0.1", "9.9.9.9", "77.88.8.8")
 
     private var currentIpIndex = 0
@@ -93,6 +94,15 @@ object DynamicIpDnsRotator {
         _currentDns.value = dnsPool[currentDnsIndex]
         _countdownSeconds.value = 10
         _rotationCount.value += 1
+    }
+
+    fun promoteCleanIp(cleanIp: String) {
+        val trimmed = cleanIp.trim()
+        if (trimmed.isBlank()) return
+        val updated = (listOf(trimmed) + ipPool.filterNot { it == trimmed }).distinct()
+        ipPool = updated
+        currentIpIndex = 0
+        _currentCleanIp.value = trimmed
     }
 
     fun getActiveOutboundIp(targetHost: String): String {

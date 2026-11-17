@@ -25,9 +25,7 @@ class VpnRepository(private val db: FirebaseFirestore) {
 
     constructor(context: Context) : this(
         FirebaseFirestore.getInstance(
-            context.applicationContext.getString(
-                context.resources.getIdentifier("firestore_database_id", "string", context.packageName)
-            )
+            context.applicationContext.getString(com.example.R.string.firestore_database_id)
         )
     )
 
