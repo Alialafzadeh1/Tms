@@ -176,6 +176,11 @@ fun TmsVpnApp(
     val isTuningIsp by viewModel.isTuningIsp.collectAsStateWithLifecycle()
     val isRacingConnect by viewModel.isRacingConnect.collectAsStateWithLifecycle()
     val racingSummary by viewModel.racingSummary.collectAsStateWithLifecycle()
+    val liveLatencies by viewModel.liveLatenciesMs.collectAsStateWithLifecycle()
+    val isRefreshingLatencies by viewModel.isRefreshingLatencies.collectAsStateWithLifecycle()
+    val latencyScanProgress by viewModel.latencyScanProgress.collectAsStateWithLifecycle()
+    val selectedLatencyTier by viewModel.selectedLatencyTier.collectAsStateWithLifecycle()
+    val sortLocationsByLatency by viewModel.sortLocationsByLatency.collectAsStateWithLifecycle()
     val isSubscriptionImporting by viewModel.isSubscriptionImporting.collectAsStateWithLifecycle()
     val nodeControlLoading by viewModel.nodeControlLoading.collectAsStateWithLifecycle()
     val ubuntuNodeHealth by viewModel.ubuntuNodeHealth.collectAsStateWithLifecycle()
@@ -202,6 +207,12 @@ fun TmsVpnApp(
                 is UiMessage.Error -> snackbarHostState.showSnackbar(msg.message)
             }
             viewModel.clearUiMessage()
+        }
+    }
+
+    LaunchedEffect(currentUserTab, configs.size) {
+        if (currentUserTab == UserTabDestination.SERVERS && configs.isNotEmpty() && liveLatencies.isEmpty()) {
+            viewModel.refreshAllServerLatencies(context, force = false)
         }
     }
 
@@ -428,7 +439,15 @@ fun TmsVpnApp(
                                                             viewModel.racingConnect(context, connectOnWin = true)
                                                             currentUserTab = UserTabDestination.HOME
                                                         }
-                                                    }
+                                                    },
+                                                    liveLatencies = liveLatencies,
+                                                    isRefreshingLatencies = isRefreshingLatencies,
+                                                    latencyScanProgress = latencyScanProgress,
+                                                    selectedLatencyTier = selectedLatencyTier,
+                                                    sortByLatency = sortLocationsByLatency,
+                                                    onRefreshLatencies = { viewModel.refreshAllServerLatencies(context, force = true) },
+                                                    onLatencyTierSelected = { viewModel.setLatencyFilterTier(it) },
+                                                    onToggleSortByLatency = { viewModel.toggleSortLocationsByLatency() }
                                                 )
                                             }
                                             UserTabDestination.STATISTICS -> {

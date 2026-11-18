@@ -34,8 +34,13 @@ import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.auth.auth
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -49,7 +54,10 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 
 import android.content.Context
 import com.example.data.model.VpnConnectionState
@@ -58,6 +66,7 @@ import com.example.vpn.SplitTunnelManager
 import com.example.vpn.VpnController
 import com.example.vpn.engine.IspAutoTuner
 import com.example.vpn.engine.IspTuningReport
+import com.example.vpn.engine.LatencyFilterTier
 import com.example.vpn.engine.LeakCheckReport
 import com.example.vpn.engine.RacingSummary
 import com.example.vpn.engine.SmartRacingSelector
@@ -104,6 +113,24 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _isPinging = MutableStateFlow(false)
     val isPinging: StateFlow<Boolean> = _isPinging.asStateFlow()
+
+    // --- BACKGROUND COROUTINE SERVER LOCATION LATENCY & FILTER STATE ---
+    private val _liveLatenciesMs = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val liveLatenciesMs: StateFlow<Map<String, Int>> = _liveLatenciesMs.asStateFlow()
+
+    private val _isRefreshingLatencies = MutableStateFlow(false)
+    val isRefreshingLatencies: StateFlow<Boolean> = _isRefreshingLatencies.asStateFlow()
+
+    private val _latencyScanProgress = MutableStateFlow(0 to 0)
+    val latencyScanProgress: StateFlow<Pair<Int, Int>> = _latencyScanProgress.asStateFlow()
+
+    private val _selectedLatencyTier = MutableStateFlow(LatencyFilterTier.ALL)
+    val selectedLatencyTier: StateFlow<LatencyFilterTier> = _selectedLatencyTier.asStateFlow()
+
+    private val _sortLocationsByLatency = MutableStateFlow(true)
+    val sortLocationsByLatency: StateFlow<Boolean> = _sortLocationsByLatency.asStateFlow()
+
+    private var latencyScanJob: Job? = null
 
     private val _isSubscriptionImporting = MutableStateFlow(false)
     val isSubscriptionImporting: StateFlow<Boolean> = _isSubscriptionImporting.asStateFlow()
@@ -790,7 +817,9 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                 val summary = SmartRacingSelector.raceConfigs(context, candidates)
                 _racingSummary.value = summary
 
+                val latencyUpdates = mutableMapOf<String, Int>()
                 summary.results.forEach { res ->
+                    latencyUpdates[res.config.id] = res.delayMs
                     val status = if (res.delayMs > 0) "online" else "offline"
                     try {
                         localConfigRepository.updatePingStatus(res.config.id, res.delayMs, status)
@@ -801,6 +830,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                         } catch (_: Exception) {}
                     }
                 }
+                _liveLatenciesMs.update { it + latencyUpdates }
 
                 val winner = summary.winner
                 if (winner != null) {
@@ -1182,11 +1212,103 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun setLatencyFilterTier(tier: LatencyFilterTier) {
+        _selectedLatencyTier.value = tier
+    }
+
+    fun toggleSortLocationsByLatency() {
+        _sortLocationsByLatency.value = !_sortLocationsByLatency.value
+    }
+
+    /**
+     * Fetches real-time latency for all available VPN server locations in parallel using
+     * bounded background coroutines on [Dispatchers.IO] without interrupting active connections
+     * or blocking the main thread.
+     */
+    fun refreshAllServerLatencies(
+        context: Context,
+        force: Boolean = true,
+        maxParallel: Int = 5,
+        customPingProbe: (suspend (VpnConfig) -> Int)? = null
+    ) {
+        if (!force && _isRefreshingLatencies.value) return
+        if (force) {
+            latencyScanJob?.cancel()
+        }
+
+        val candidates = configs.value.ifEmpty {
+            localConfigs.value.map { it.toDomainModel() }
+        }.ifEmpty {
+            com.example.data.model.DefaultVpnConfigs.getDefaultConfigs()
+        }
+
+        if (candidates.isEmpty()) {
+            _latencyScanProgress.value = 0 to 0
+            return
+        }
+
+        latencyScanJob = viewModelScope.launch(Dispatchers.IO) {
+            _isRefreshingLatencies.value = true
+            _latencyScanProgress.value = 0 to candidates.size
+            val completedCounter = java.util.concurrent.atomic.AtomicInteger(0)
+            val semaphore = Semaphore(maxParallel.coerceIn(1, 10))
+            val appContext = context.applicationContext
+
+            try {
+                coroutineScope {
+                    candidates.map { cfg ->
+                        async {
+                            semaphore.withPermit {
+                                val delayResult = SmartRacingSelector.measureConfigRealDelay(
+                                    context = appContext,
+                                    config = cfg,
+                                    timeoutSec = 3,
+                                    customPingProbe = customPingProbe
+                                )
+                                val measuredMs = delayResult.delayMs
+                                val status = if (measuredMs > 0) "online" else "offline"
+
+                                _liveLatenciesMs.update { current ->
+                                    current + (cfg.id to measuredMs)
+                                }
+                                if (_selectedVpnConfig.value?.id == cfg.id) {
+                                    _selectedVpnConfig.update { sel ->
+                                        sel?.copy(pingMs = measuredMs, status = status)
+                                    }
+                                }
+
+                                try {
+                                    localConfigRepository.updatePingStatus(cfg.id, measuredMs, status)
+                                    if (Firebase.auth.currentUser != null) {
+                                        repository.updateConfigPing(cfg.id, measuredMs, status)
+                                    }
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (_: Exception) {
+                                }
+
+                                val done = completedCounter.incrementAndGet()
+                                _latencyScanProgress.value = done to candidates.size
+                            }
+                        }
+                    }.awaitAll()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Background latency scan failed: ${e.message}")
+            } finally {
+                _isRefreshingLatencies.value = false
+            }
+        }
+    }
+
     fun pingConfig(config: VpnConfig) {
         viewModelScope.launch {
             _isPinging.value = true
             val result = RealPingEngine.ping(config.server, config.port, 3000)
             val newStatus = if (result.isReachable) "online" else "offline"
+            _liveLatenciesMs.update { it + (config.id to result.latencyMs) }
             try {
                 localConfigRepository.updatePingStatus(config.id, result.latencyMs, newStatus)
                 if (Firebase.auth.currentUser != null) {
