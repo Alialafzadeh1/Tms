@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.RssFeed
 import androidx.compose.material.icons.filled.Search
@@ -106,7 +107,8 @@ fun UserProfileSettingsScreen(
     onToggleLanguage: () -> Unit,
     onOpenRadar: () -> Unit,
     onSignOut: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onOpenNexusAssistant: () -> Unit = {}
 ) {
     val context = LocalContext.current
     LaunchedEffect(Unit) {
@@ -226,7 +228,7 @@ fun UserProfileSettingsScreen(
                         if (isPersian) "تعداد دستگاه فعال: ${userProfile.deviceCount} از ${userProfile.maxDevices}"
                         else "Active Device Slots: ${userProfile.deviceCount} / ${userProfile.maxDevices}"
                     } else {
-                        if (isPersian) "حالت محلی / همگام‌سازی خودکار پس از اتصال" else "Local Device Active"
+                        if (isPersian) "دستگاه فعال • سهمیه ۵۰۰ گیگابایت (۱۰ دستگاه)" else "Active Device • 500 GB / 10 Devices"
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = PremiumTeal
@@ -472,6 +474,26 @@ fun UserProfileSettingsScreen(
                             fontSize = 12.sp
                         )
                     }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+                OutlinedButton(
+                    onClick = onOpenNexusAssistant,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("profile_open_nexus_support_button"),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.75f))
+                ) {
+                    Icon(imageVector = Icons.Filled.Psychology, contentDescription = null, tint = ElectricCyan, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = if (isPersian) "پشتیبانی آنلاین و دستیار TMS NEXUS AI" else "Online Support & TMS NEXUS AI",
+                        color = ElectricCyan,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp
+                    )
                 }
             }
 

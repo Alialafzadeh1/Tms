@@ -3,9 +3,15 @@ package com.example.vpn
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import com.example.data.local.CleanIpHealthStatus
+import com.example.data.local.LocalVpnConfigRepository
+import com.example.data.model.DefaultVpnConfigs
 import com.example.data.model.VpnConfig
 import com.example.data.model.VpnConnectionState
 import com.example.data.model.VpnSessionStats
+import com.example.vpn.engine.AntiDpiComboEngine
+import com.example.vpn.engine.AntiDpiFailureReason
+import com.example.vpn.engine.IspAutoTuner
 import com.example.vpn.engine.LeakCheckEngine
 import com.example.vpn.engine.LeakCheckReport
 import com.example.vpn.engine.TunnelHealthChecker
@@ -13,10 +19,15 @@ import com.example.vpn.engine.TunnelHealthReport
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 object VpnController {
@@ -43,9 +54,92 @@ object VpnController {
     private val _leakCheckInProgress = MutableStateFlow(false)
     val leakCheckInProgress: StateFlow<Boolean> = _leakCheckInProgress.asStateFlow()
 
+    private val _trafficCommittedFlow = MutableSharedFlow<Pair<String, Long>>(extraBufferCapacity = 32)
+    val trafficCommittedFlow: SharedFlow<Pair<String, Long>> = _trafficCommittedFlow.asSharedFlow()
+
+    @Volatile
+    private var activeAccountId: String? = null
+
+    private val failoverInFlight = AtomicBoolean(false)
+
     @Volatile
     var activeConfig: VpnConfig? = null
         private set
+
+    fun setActiveAccountId(userId: String?) {
+        activeAccountId = userId?.trim()?.takeIf { it.isNotBlank() }
+    }
+
+    fun getActiveAccountId(): String? = activeAccountId
+
+    fun reportSessionTrafficDelta(context: Context, deltaBytes: Long) {
+        if (deltaBytes <= 0L) return
+        val uid = activeAccountId ?: return
+        val appCtx = context.applicationContext
+        controllerScope.launch {
+            runCatching {
+                LocalVpnConfigRepository(appCtx).recordTrafficUsageDelta(
+                    userId = uid,
+                    deltaBytes = deltaBytes
+                )
+                _trafficCommittedFlow.tryEmit(uid to deltaBytes)
+            }
+        }
+    }
+
+    fun triggerAutoFailoverDeTr(
+        context: Context,
+        failedConfigId: String?,
+        attemptIndex: Int = 1
+    ) {
+        if (!failoverInFlight.compareAndSet(false, true)) return
+        val appCtx = context.applicationContext
+        controllerScope.launch {
+            try {
+                IspAutoTuner.rotateFragmentAndFingerprintForRetry(appCtx, attemptIndex)
+                val repo = LocalVpnConfigRepository(appCtx)
+                val stored = repo.allConfigs.firstOrNull().orEmpty()
+                val defaults = DefaultVpnConfigs.getDefaultConfigs(activeAccountId ?: "local_user")
+                val combined = (stored + defaults).distinctBy { it.id }
+                val deTrCandidates = combined.filter { DefaultVpnConfigs.isDeOrTrNode(it) }
+                val candidatePool = deTrCandidates.ifEmpty { combined }
+                val nextConfig = candidatePool.firstOrNull { it.id != failedConfigId }
+                    ?: candidatePool.firstOrNull()
+                    ?: return@launch
+
+                val healthyCleanIps = repo.getCleanIpPoolOnce()
+                    .filter { it.healthStatus == CleanIpHealthStatus.HEALTHY.name && it.host.isNotBlank() }
+                    .sortedBy { if (it.latencyMs > 0) it.latencyMs else Int.MAX_VALUE }
+                val cleanIpOverride = healthyCleanIps
+                    .getOrNull((attemptIndex - 1).coerceAtLeast(0) % healthyCleanIps.size.coerceAtLeast(1))
+                    ?.host
+                    ?: IspAutoTuner.getCachedCleanIp(appCtx)
+
+                val useCombo = _comboShieldEnabled.value
+                if (useCombo) {
+                    val (netType, _) = IspAutoTuner.detectCurrentNetwork(appCtx)
+                    val adapted = AntiDpiComboEngine.recommendPresetForNetwork(
+                        networkType = netType,
+                        attemptIndex = attemptIndex,
+                        lastFailure = AntiDpiFailureReason.TIMEOUT
+                    )
+                    AntiDpiComboEngine.setActivePresetIndex(appCtx, adapted.index)
+                    _activeComboSummary.value = adapted.shortSummary(true)
+                }
+
+                startVpn(
+                    context = appCtx,
+                    config = nextConfig,
+                    antiFilterMode = true,
+                    cleanIpOverride = cleanIpOverride,
+                    forceRestart = true,
+                    comboMode = useCombo
+                )
+            } finally {
+                failoverInFlight.set(false)
+            }
+        }
+    }
 
     fun currentGenerationId(): Long = sessionGeneration.get()
 
@@ -224,6 +318,44 @@ object VpnController {
     private val _iranRelayServer = MutableStateFlow("")
     val iranRelayServer: StateFlow<String> = _iranRelayServer.asStateFlow()
 
+    private val _comboShieldEnabled = MutableStateFlow(false)
+    val comboShieldEnabled: StateFlow<Boolean> = _comboShieldEnabled.asStateFlow()
+
+    private val _activeComboSummary = MutableStateFlow("")
+    val activeComboSummary: StateFlow<String> = _activeComboSummary.asStateFlow()
+
+    fun initComboShieldState(context: Context, isEntitled: Boolean) {
+        val persisted = AntiDpiComboEngine.isComboShieldEnabled(context)
+        val effective = persisted && isEntitled
+        _comboShieldEnabled.value = effective
+        if (effective) {
+            _activeComboSummary.value = AntiDpiComboEngine.getActivePreset(context).shortSummary(true)
+        } else {
+            _activeComboSummary.value = ""
+        }
+    }
+
+    fun setComboShieldEnabled(context: Context, enabled: Boolean, isEntitled: Boolean): Boolean {
+        if (enabled && !isEntitled) {
+            _comboShieldEnabled.value = false
+            AntiDpiComboEngine.setComboShieldEnabled(context, false)
+            _activeComboSummary.value = ""
+            return false
+        }
+        _comboShieldEnabled.value = enabled
+        AntiDpiComboEngine.setComboShieldEnabled(context, enabled)
+        _activeComboSummary.value = if (enabled) {
+            AntiDpiComboEngine.getActivePreset(context).shortSummary(true)
+        } else {
+            ""
+        }
+        return true
+    }
+
+    fun updateActiveComboSummary(summary: String) {
+        _activeComboSummary.value = summary
+    }
+
     fun toggleNationalIntranetMode() {
         _nationalIntranetMode.value = !_nationalIntranetMode.value
     }
@@ -241,14 +373,18 @@ object VpnController {
         config: VpnConfig,
         antiFilterMode: Boolean = true,
         nationalIntranetMode: Boolean = _nationalIntranetMode.value,
-        iranRelayHost: String? = _iranRelayServer.value.ifBlank { null }
+        iranRelayHost: String? = _iranRelayServer.value.ifBlank { null },
+        cleanIpOverride: String? = null,
+        forceRestart: Boolean = false,
+        comboMode: Boolean = _comboShieldEnabled.value
     ) {
         val genId: Long
         synchronized(stateLock) {
             val currentState = _connectionState.value
             val currentActive = activeConfig
             // Prevent starting duplicate tunnel if already connecting/connected to the exact same node and live
-            if ((currentState == VpnConnectionState.CONNECTING || currentState == VpnConnectionState.CONNECTED) &&
+            if (!forceRestart &&
+                (currentState == VpnConnectionState.CONNECTING || currentState == VpnConnectionState.CONNECTED) &&
                 currentActive?.id == config.id &&
                 VpnTunnelService.isTunnelOperational()
             ) {
@@ -284,7 +420,9 @@ object VpnController {
                 configJson = config.rawConfig,
                 antiFilterMode = antiFilterMode,
                 nationalIntranetMode = nationalIntranetMode,
-                iranRelayHost = iranRelayHost
+                iranRelayHost = iranRelayHost,
+                cleanIpOverride = cleanIpOverride,
+                comboMode = comboMode
             )
         } catch (e: Exception) {
             markError(

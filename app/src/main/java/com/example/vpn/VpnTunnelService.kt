@@ -24,6 +24,7 @@ import com.example.R
 import com.example.data.model.VpnConfig
 import com.example.data.model.VpnConnectionState
 import com.example.data.model.VpnSessionStats
+import com.example.vpn.engine.AntiDpiComboEngine
 import com.example.vpn.engine.DnsPacketHandler
 import com.example.vpn.engine.DynamicIpDnsRotator
 import com.example.vpn.engine.Ipv4Header
@@ -85,6 +86,8 @@ class VpnTunnelService : VpnService() {
         const val EXTRA_ANTI_FILTER_MODE = "extra_anti_filter_mode"
         const val EXTRA_NATIONAL_INTRANET_MODE = "extra_national_intranet_mode"
         const val EXTRA_IRAN_RELAY_HOST = "extra_iran_relay_host"
+        const val EXTRA_CLEAN_IP_OVERRIDE = "extra_clean_ip_override"
+        const val EXTRA_COMBO_MODE = "extra_combo_mode"
 
         @Volatile
         var activeInstance: VpnTunnelService? = null
@@ -105,7 +108,9 @@ class VpnTunnelService : VpnService() {
             configJson: String = "",
             antiFilterMode: Boolean = true,
             nationalIntranetMode: Boolean = false,
-            iranRelayHost: String? = null
+            iranRelayHost: String? = null,
+            cleanIpOverride: String? = null,
+            comboMode: Boolean = false
         ) {
             val intent = Intent(context, VpnTunnelService::class.java).apply {
                 action = ACTION_CONNECT
@@ -119,6 +124,8 @@ class VpnTunnelService : VpnService() {
                 putExtra(EXTRA_ANTI_FILTER_MODE, antiFilterMode)
                 putExtra(EXTRA_NATIONAL_INTRANET_MODE, nationalIntranetMode)
                 putExtra(EXTRA_IRAN_RELAY_HOST, iranRelayHost)
+                putExtra(EXTRA_CLEAN_IP_OVERRIDE, cleanIpOverride)
+                putExtra(EXTRA_COMBO_MODE, comboMode)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
@@ -192,6 +199,9 @@ class VpnTunnelService : VpnService() {
     @Volatile
     private var lastTxBytes = 0L
 
+    private val uncommittedTrafficBytes = AtomicLong(0L)
+    private val failoverAttemptCounter = AtomicLong(0L)
+
     @Volatile
     private var latestSnapshot: VpnSessionStats = VpnSessionStats()
 
@@ -261,6 +271,8 @@ class VpnTunnelService : VpnService() {
                 val antiFilter = intent.getBooleanExtra(EXTRA_ANTI_FILTER_MODE, true)
                 val nationalIntranet = intent.getBooleanExtra(EXTRA_NATIONAL_INTRANET_MODE, false)
                 val iranRelay = intent.getStringExtra(EXTRA_IRAN_RELAY_HOST)
+                val cleanIpOverride = intent.getStringExtra(EXTRA_CLEAN_IP_OVERRIDE)
+                val comboMode = intent.getBooleanExtra(EXTRA_COMBO_MODE, false)
 
                 val existingCfg = VpnController.activeConfig
                 val configSnapshot = if (existingCfg != null &&
@@ -327,7 +339,9 @@ class VpnTunnelService : VpnService() {
                     configJson = configJson,
                     antiFilterMode = antiFilter,
                     nationalIntranetMode = nationalIntranet,
-                    iranRelayHost = iranRelay
+                    iranRelayHost = iranRelay,
+                    cleanIpOverride = cleanIpOverride,
+                    comboMode = comboMode
                 )
             }
             ACTION_DISCONNECT -> {
@@ -347,7 +361,9 @@ class VpnTunnelService : VpnService() {
         configJson: String,
         antiFilterMode: Boolean,
         nationalIntranetMode: Boolean = false,
-        iranRelayHost: String? = null
+        iranRelayHost: String? = null,
+        cleanIpOverride: String? = null,
+        comboMode: Boolean = false
     ) {
         currentRunId.set(runId)
         isConnecting.set(true)
@@ -437,19 +453,32 @@ class VpnTunnelService : VpnService() {
 
                 // 5. Launch native libXray Core asynchronously after overlapped asset loading with ISP-tuned Fragment & Clean IP
                 nativePreloadDeferred.await()
-                IspAutoTuner.getCachedCleanIp(this@VpnTunnelService)?.let { cachedIp ->
-                    DynamicIpDnsRotator.promoteCleanIp(cachedIp)
+                val supportsEdgeFronting = parsedConfig.transport.equals("ws", ignoreCase = true) ||
+                    parsedConfig.transport.equals("xhttp", ignoreCase = true) ||
+                    parsedConfig.transport.equals("splithttp", ignoreCase = true)
+                val effectiveCleanIp = cleanIpOverride?.trim()?.takeIf { it.isNotBlank() }
+                    ?: IspAutoTuner.getCachedCleanIp(this@VpnTunnelService)?.takeIf { supportsEdgeFronting }
+                if (effectiveCleanIp != null) {
+                    DynamicIpDnsRotator.promoteCleanIp(effectiveCleanIp, pinForTunnel = true)
+                } else {
+                    DynamicIpDnsRotator.clearPinnedCleanIp()
                 }
-                val activeFragmentProfile = IspAutoTuner.getActiveFragmentProfile(this@VpnTunnelService)
+                val comboPreset = if (comboMode) AntiDpiComboEngine.getActivePreset(this@VpnTunnelService) else null
+                val activeFragmentProfile = comboPreset?.toFragmentProfile()
+                    ?: IspAutoTuner.getActiveFragmentProfile(this@VpnTunnelService)
                 val xrayStart = XrayCoreEngine.startWithTunAsync(
                     context = this@VpnTunnelService,
                     vpnService = this@VpnTunnelService,
                     tunFd = localPfd.fd,
                     parsed = parsedConfig,
                     rawConfig = configSnapshot,
-                    enableFragment = antiFilterMode,
+                    enableFragment = antiFilterMode || comboMode,
                     fragmentProfile = activeFragmentProfile,
-                    preloadScope = serviceScope
+                    preloadScope = serviceScope,
+                    cleanIpOverride = effectiveCleanIp,
+                    enableDoH = comboPreset?.enableDoH == true,
+                    enableFakeDns = comboPreset?.enableFakeDns == true,
+                    alpnOverride = comboPreset?.alpn
                 )
                 activeEngineMode = xrayStart.mode
                 activeXrayVersion = xrayStart.xrayVersion
@@ -476,8 +505,9 @@ class VpnTunnelService : VpnService() {
                     return@launch
                 }
 
-                // 6. Measure real initial ping latency (-1 if unreachable; never fabricated)
-                val initialPing = measureRealPing(parsedConfig.server, parsedConfig.port)
+                // 6. Measure real initial ping latency against dialed host/Clean IP (-1 if unreachable; never fabricated)
+                val dialedHost = effectiveCleanIp ?: parsedConfig.server
+                val initialPing = measureRealPing(dialedHost, parsedConfig.port)
 
                 // 7. Register network loss monitor for active session
                 registerNetworkInterruptionCallback(runId)
@@ -519,7 +549,7 @@ class VpnTunnelService : VpnService() {
                 )
 
                 // 9. Start live telemetry loop, 10-second DNS/IP rotation, & initial tunnel health probe
-                startMetricsLoop(runId, configName, parsedConfig.server, parsedConfig.port, initialPing)
+                startMetricsLoop(runId, configName, dialedHost, parsedConfig.port, initialPing)
                 startBackgroundDnsRefreshAndIpRotationWorker()
                 serviceScope.launch {
                     delay(700L)
@@ -595,6 +625,7 @@ class VpnTunnelService : VpnService() {
                     rotationWorkerJob?.cancel()
                     networkLossGraceJob?.cancel()
                     unregisterNetworkCallback()
+                    DynamicIpDnsRotator.clearPinnedCleanIp()
                     try { XrayCoreEngine.stop() } catch (_: Exception) {}
                     try { localRouter?.closeAll() } catch (_: Exception) {}
                     try { localPfd?.close() } catch (_: Exception) {}
@@ -712,6 +743,8 @@ class VpnTunnelService : VpnService() {
         metricsJob = serviceScope.launch {
             var measuredLatency = initialPing
             var pingCheckCounter = 0
+            var consecutiveUnreachablePings = 0
+            var ticksSinceLastTrafficCommit = 0
             var lastTrafficRx = TrafficStats.getTotalRxBytes()
             var lastTrafficTx = TrafficStats.getTotalTxBytes()
             var nativeSessionRx = 0L
@@ -768,11 +801,43 @@ class VpnTunnelService : VpnService() {
                     effectiveUlSpeed = trafficDeltaOut
                 }
 
+                // Accumulate and flush per-user quota traffic periodically (every 15s or >= 256 KB)
+                val stepDelta = (effectiveDlSpeed + effectiveUlSpeed).coerceAtLeast(0L)
+                val pendingBytes = uncommittedTrafficBytes.addAndGet(stepDelta)
+                ticksSinceLastTrafficCommit++
+                if (pendingBytes >= 256L * 1024L || (ticksSinceLastTrafficCommit >= 15 && pendingBytes > 0L)) {
+                    val toCommit = uncommittedTrafficBytes.getAndSet(0L)
+                    if (toCommit > 0L) {
+                        VpnController.reportSessionTrafficDelta(applicationContext, toCommit)
+                    }
+                    ticksSinceLastTrafficCommit = 0
+                }
+
                 // Measure real TCP ping every 5 seconds (-1 if unreachable; never fabricated)
                 pingCheckCounter++
                 if (pingCheckCounter >= 5) {
                     pingCheckCounter = 0
                     measuredLatency = measureRealPing(host, port)
+                    if (measuredLatency <= 0L) {
+                        consecutiveUnreachablePings++
+                        if (consecutiveUnreachablePings >= 3 &&
+                            hasUnderlyingInternetNetwork() &&
+                            SplitTunnelManager.isAutoReconnectEnabled(this@VpnTunnelService) &&
+                            failoverAttemptCounter.get() < 3L
+                        ) {
+                            val nextAttempt = failoverAttemptCounter.incrementAndGet().toInt()
+                            consecutiveUnreachablePings = 0
+                            Log.w(TAG, "3 consecutive unreachable pings on $host; triggering DE/TR auto-failover #$nextAttempt")
+                            VpnController.triggerAutoFailoverDeTr(
+                                context = applicationContext,
+                                failedConfigId = serviceActiveConfig?.id,
+                                attemptIndex = nextAttempt
+                            )
+                        }
+                    } else {
+                        consecutiveUnreachablePings = 0
+                        failoverAttemptCounter.set(0L)
+                    }
                 }
 
                 val latencyInt = measuredLatency.toInt()
@@ -873,6 +938,7 @@ class VpnTunnelService : VpnService() {
         metricsJob?.cancel()
         rotationWorkerJob?.cancel()
         networkLossGraceJob?.cancel()
+        DynamicIpDnsRotator.clearPinnedCleanIp()
 
         try { XrayCoreEngine.stop() } catch (_: Exception) {}
         try { tcpRouter?.closeAll() } catch (_: Exception) {}
@@ -885,6 +951,10 @@ class VpnTunnelService : VpnService() {
         sessionStartTimeMs = 0L
         lastRxBytes = 0L
         lastTxBytes = 0L
+        val remainingTraffic = uncommittedTrafficBytes.getAndSet(0L)
+        if (remainingTraffic > 0L) {
+            VpnController.reportSessionTrafficDelta(applicationContext, remainingTraffic)
+        }
 
         if (!isUserInitiated && errorReason != null) {
             latestSnapshot = latestSnapshot.copy(

@@ -28,6 +28,7 @@ data class RacingSummary(
     val winnerDelayMs: Int,
     val results: List<NodeDelayResult>,
     val testedCount: Int,
+    val winnerCleanIp: String? = null,
     val completedAtMs: Long = System.currentTimeMillis()
 )
 
@@ -50,9 +51,15 @@ object SmartRacingSelector {
         context: Context,
         config: VpnConfig,
         timeoutSec: Int = 4,
+        cleanIpOverride: String? = null,
+        fragmentProfile: FragmentProfile = FragmentProfile(),
+        enableDoH: Boolean = false,
+        enableFakeDns: Boolean = false,
+        alpnOverride: List<String>? = null,
         customPingProbe: (suspend (VpnConfig) -> Int)? = null
     ): NodeDelayResult = withContext(Dispatchers.IO) {
-        if (config.server.isBlank() || config.port !in 1..65535) {
+        val effectiveHost = cleanIpOverride?.trim()?.takeIf { it.isNotBlank() } ?: config.server
+        if (effectiveHost.isBlank() || config.port !in 1..65535) {
             return@withContext NodeDelayResult(
                 config = config,
                 delayMs = -1,
@@ -72,7 +79,16 @@ object SmartRacingSelector {
         }
 
         // 1. Attempt native LibXray real-delay probe (HTTP 204 over proxy outbound)
-        val nativeDelay = tryNativeLibXrayPing(context, config, timeoutSec)
+        val nativeDelay = tryNativeLibXrayPing(
+            context = context,
+            config = config,
+            timeoutSec = timeoutSec,
+            cleanIpOverride = cleanIpOverride,
+            fragmentProfile = fragmentProfile,
+            enableDoH = enableDoH,
+            enableFakeDns = enableFakeDns,
+            alpnOverride = alpnOverride
+        )
         if (nativeDelay > 0) {
             return@withContext NodeDelayResult(
                 config = config,
@@ -82,9 +98,9 @@ object SmartRacingSelector {
             )
         }
 
-        // 2. Fallback to direct TCP handshake ping
+        // 2. Fallback to direct TCP handshake ping against dialed host
         val tcp = RealPingEngine.ping(
-            host = config.server,
+            host = effectiveHost,
             port = config.port,
             timeoutMs = (timeoutSec.coerceIn(1, 10) * 1000)
         )
@@ -99,8 +115,9 @@ object SmartRacingSelector {
     suspend fun raceConfigs(
         context: Context,
         configs: List<VpnConfig>,
-        maxParallel: Int = 5,
+        maxParallel: Int = 6,
         timeoutSec: Int = 4,
+        cleanIpOverride: String? = null,
         customPingProbe: (suspend (VpnConfig) -> Int)? = null
     ): RacingSummary = withContext(Dispatchers.IO) {
         if (configs.isEmpty()) {
@@ -121,6 +138,7 @@ object SmartRacingSelector {
                             context = context,
                             config = cfg,
                             timeoutSec = timeoutSec,
+                            cleanIpOverride = cleanIpOverride,
                             customPingProbe = customPingProbe
                         )
                     }
@@ -137,11 +155,98 @@ object SmartRacingSelector {
             winner = best?.config,
             winnerDelayMs = best?.delayMs ?: -1,
             results = sorted,
-            testedCount = configs.size
+            testedCount = configs.size,
+            winnerCleanIp = cleanIpOverride
         )
     }
 
-    private fun tryNativeLibXrayPing(context: Context, config: VpnConfig, timeoutSec: Int): Int {
+    /**
+     * Prioritizes Germany (DE) & Turkey (TR) nodes for automatic Iranian DPI/censorship bypass.
+     * Tests clean Anycast IP overrides if direct DE/TR servers are throttled, and falls back
+     * to other nodes if all DE/TR routes fail.
+     */
+    suspend fun raceAutoBypassDeTr(
+        context: Context,
+        configs: List<VpnConfig>,
+        cleanIpCandidates: List<String> = emptyList(),
+        maxParallel: Int = 6,
+        timeoutSec: Int = 3,
+        customPingProbe: (suspend (VpnConfig) -> Int)? = null
+    ): RacingSummary = withContext(Dispatchers.IO) {
+        val defaultDeTr = com.example.data.model.DefaultVpnConfigs.getDefaultConfigs()
+            .filter { com.example.data.model.DefaultVpnConfigs.isDeOrTrNode(it) }
+        val userDeTr = configs.filter { com.example.data.model.DefaultVpnConfigs.isDeOrTrNode(it) }
+        val deTrPool = (userDeTr + defaultDeTr).distinctBy { it.id }
+
+        // 1. Race direct DE/TR endpoints first
+        val directDeTr = raceConfigs(
+            context = context,
+            configs = deTrPool,
+            maxParallel = maxParallel,
+            timeoutSec = timeoutSec,
+            customPingProbe = customPingProbe
+        )
+        if (directDeTr.winner != null) {
+            return@withContext directDeTr
+        }
+
+        // 2. Retry DE/TR WS+TLS nodes fronted via verified Clean IP candidates
+        val wsDeTr = deTrPool.firstOrNull {
+            it.transport.equals("ws", ignoreCase = true) || it.transport.equals("xhttp", ignoreCase = true)
+        }
+        val probeCleanIps = cleanIpCandidates.distinct().take(8)
+        if (wsDeTr != null && probeCleanIps.isNotEmpty()) {
+            val semaphore = Semaphore(maxParallel.coerceIn(1, 8))
+            val ipResults = coroutineScope {
+                probeCleanIps.map { ip ->
+                    async {
+                        semaphore.withPermit {
+                            ip to measureConfigRealDelay(
+                                context = context,
+                                config = wsDeTr,
+                                timeoutSec = timeoutSec,
+                                cleanIpOverride = ip,
+                                customPingProbe = customPingProbe
+                            )
+                        }
+                    }
+                }.awaitAll()
+            }
+            val bestViaClean = ipResults
+                .filter { it.second.delayMs > 0 }
+                .minByOrNull { it.second.delayMs }
+            if (bestViaClean != null) {
+                return@withContext RacingSummary(
+                    winner = wsDeTr,
+                    winnerDelayMs = bestViaClean.second.delayMs,
+                    results = listOf(bestViaClean.second),
+                    testedCount = deTrPool.size + probeCleanIps.size,
+                    winnerCleanIp = bestViaClean.first
+                )
+            }
+        }
+
+        // 3. Fallback to non-DE/TR pool so user still gets working connection if available
+        val others = configs.filterNot { com.example.data.model.DefaultVpnConfigs.isDeOrTrNode(it) }
+        raceConfigs(
+            context = context,
+            configs = others.ifEmpty { configs },
+            maxParallel = maxParallel,
+            timeoutSec = timeoutSec,
+            customPingProbe = customPingProbe
+        )
+    }
+
+    private fun tryNativeLibXrayPing(
+        context: Context,
+        config: VpnConfig,
+        timeoutSec: Int,
+        cleanIpOverride: String? = null,
+        fragmentProfile: FragmentProfile = FragmentProfile(),
+        enableDoH: Boolean = false,
+        enableFakeDns: Boolean = false,
+        alpnOverride: List<String>? = null
+    ): Int {
         if (!nativePingSupported) return -1
         var tempConfigFile: File? = null
         return try {
@@ -166,7 +271,12 @@ object SmartRacingSelector {
                 tunFd = -1,
                 enableFragment = true,
                 socksPort = socksPort,
-                httpPort = httpPort
+                httpPort = httpPort,
+                fragmentProfile = fragmentProfile,
+                cleanIpOverride = cleanIpOverride,
+                enableDoH = enableDoH,
+                enableFakeDns = enableFakeDns,
+                alpnOverride = alpnOverride
             )
 
             val datDir = File(context.filesDir, "xray_assets").apply { mkdirs() }.absolutePath

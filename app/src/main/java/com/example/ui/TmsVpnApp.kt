@@ -72,6 +72,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -89,14 +90,18 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.model.AdminRole
+import com.example.data.model.SubscriptionPlanId
+import com.example.data.model.SubscriptionStatus
 import com.example.ui.components.CyberAmbientBackdrop
 import com.example.ui.components.CyberBottomNavBar
 import com.example.ui.components.CyberTopHeader
 import com.example.ui.components.UserTabDestination
 import com.example.ui.components.statusColorFor
+import com.example.ui.screens.AdminSubscriptionScreen
 import com.example.ui.screens.AntiFilterRadarScreen
 import com.example.ui.screens.ConfigManagementScreen
 import com.example.ui.screens.IntelligentEngineScreen
+import com.example.ui.screens.NexusAssistantModal
 import com.example.ui.screens.OverviewScreen
 import com.example.ui.screens.ServerManagementScreen
 import com.example.ui.screens.SystemSettingsScreen
@@ -106,6 +111,10 @@ import com.example.ui.screens.UserProfileSettingsScreen
 import com.example.ui.screens.UserServersScreen
 import com.example.ui.screens.UserStatisticsScreen
 import com.example.ui.screens.UserSubscriptionScreen
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.minimumInteractiveComponentSize
+import androidx.compose.ui.platform.testTag
 import com.example.ui.theme.BorderGoldHighlight
 import com.example.ui.theme.BorderGoldMuted
 import com.example.ui.theme.CardSurfaceDark
@@ -148,6 +157,8 @@ enum class TmsDestination(
 @Composable
 fun TmsVpnApp(
     currentUserId: String,
+    pendingActivationLink: String? = null,
+    onActivationLinkConsumed: () -> Unit = {},
     onSignOut: () -> Unit,
     onRequestVpnPermission: ((() -> Unit)) -> Unit = { it() },
     viewModel: TmsVpnViewModel = viewModel()
@@ -190,12 +201,54 @@ fun TmsVpnApp(
     val lockoutSeconds by viewModel.lockoutSeconds.collectAsStateWithLifecycle()
     val auditLogs by viewModel.auditLogs.collectAsStateWithLifecycle()
 
+    val selectedConfigIds by viewModel.selectedConfigIds.collectAsStateWithLifecycle()
+    val trustedNowMs by viewModel.trustedServerNowMs.collectAsStateWithLifecycle()
+    val userSubscription by viewModel.userSubscription.collectAsStateWithLifecycle()
+    val allocatedEndpoints by viewModel.allocatedEndpoints.collectAsStateWithLifecycle()
+    val allocationHistory by viewModel.allocationHistory.collectAsStateWithLifecycle()
+    val subscriptionHistory by viewModel.subscriptionHistory.collectAsStateWithLifecycle()
+    val myPaymentRequests by viewModel.myPaymentRequests.collectAsStateWithLifecycle()
+    val isSubscriptionOfflineCached by viewModel.isSubscriptionOfflineCached.collectAsStateWithLifecycle()
+    val subscriptionBusy by viewModel.subscriptionBusy.collectAsStateWithLifecycle()
+
+    val allSubscriptionsAdmin by viewModel.allSubscriptionsAdmin.collectAsStateWithLifecycle()
+    val endpointInventoryAdmin by viewModel.endpointInventoryAdmin.collectAsStateWithLifecycle()
+    val allPaymentRequestsAdmin by viewModel.allPaymentRequestsAdmin.collectAsStateWithLifecycle()
+    val shortageAlertsAdmin by viewModel.shortageAlertsAdmin.collectAsStateWithLifecycle()
+    val rotationLogsAdmin by viewModel.rotationLogsAdmin.collectAsStateWithLifecycle()
+    val selectedRotationUserIds by viewModel.selectedRotationUserIds.collectAsStateWithLifecycle()
+    val inspectedHistoryUserId by viewModel.inspectedHistoryUserId.collectAsStateWithLifecycle()
+    val adminInspectedAllocationHistory by viewModel.adminInspectedAllocationHistory.collectAsStateWithLifecycle()
+    val cleanIpPool by viewModel.cleanIpPool.collectAsStateWithLifecycle()
+    val isProbingCleanIps by viewModel.isProbingCleanIps.collectAsStateWithLifecycle()
+    val comboShieldEnabled by viewModel.comboShieldEnabled.collectAsStateWithLifecycle()
+    val comboBusy by viewModel.comboBusy.collectAsStateWithLifecycle()
+    val activeComboSummary by viewModel.activeComboSummary.collectAsStateWithLifecycle()
+    val registeredUsers by viewModel.registeredUsers.collectAsStateWithLifecycle()
+
+    val userNexusMessages by viewModel.userNexusMessages.collectAsStateWithLifecycle()
+    val userNexusStreaming by viewModel.userNexusStreaming.collectAsStateWithLifecycle()
+    val userDiagnosticReport by viewModel.userDiagnosticReport.collectAsStateWithLifecycle()
+    val userDiagnosticLoading by viewModel.userDiagnosticLoading.collectAsStateWithLifecycle()
+    val userDiagnosticError by viewModel.userDiagnosticError.collectAsStateWithLifecycle()
+    val adminNexusMessages by viewModel.adminNexusMessages.collectAsStateWithLifecycle()
+    val adminNexusStreaming by viewModel.adminNexusStreaming.collectAsStateWithLifecycle()
+    val userTickets by viewModel.userTickets.collectAsStateWithLifecycle()
+    val adminTickets by viewModel.adminTickets.collectAsStateWithLifecycle()
+    val ticketBusy by viewModel.ticketBusy.collectAsStateWithLifecycle()
+
     val isInAdminSpace by viewModel.isInAdminSpace.collectAsStateWithLifecycle()
     var showRadarInUserMode by remember { mutableStateOf(false) }
+    var showNexusAssistant by remember { mutableStateOf(false) }
     var currentUserTab by remember { mutableStateOf(UserTabDestination.HOME) }
+    var openServersCleanIpTab by remember { mutableStateOf(false) }
     var showNotificationsDialog by remember { mutableStateOf(false) }
 
     var currentScreen by remember { mutableStateOf(TmsDestination.OVERVIEW) }
+    var adminUsersSubTab by remember { mutableStateOf("SUBSCRIPTIONS") } // "USERS" | "SUBSCRIPTIONS"
+    var prefillGrantUid by remember { mutableStateOf("") }
+    var prefillGrantEmail by remember { mutableStateOf("") }
+    var grantModalTrigger by remember { mutableIntStateOf(0) }
     val snackbarHostState = remember { SnackbarHostState() }
 
     var showQuickRoleSwitcher by remember { mutableStateOf(false) }
@@ -207,6 +260,14 @@ fun TmsVpnApp(
                 is UiMessage.Error -> snackbarHostState.showSnackbar(msg.message)
             }
             viewModel.clearUiMessage()
+        }
+    }
+
+    LaunchedEffect(pendingActivationLink) {
+        val link = pendingActivationLink?.trim()
+        if (!link.isNullOrBlank()) {
+            viewModel.handleActivationDeepLink(link)
+            onActivationLinkConsumed()
         }
     }
 
@@ -389,7 +450,10 @@ fun TmsVpnApp(
                                                     onSelectConfig = { viewModel.selectConfigForVpn(it) },
                                                     onImportConfig = { viewModel.importConfig(it) },
                                                     onImportBatch = { viewModel.importBatchConfigs(it) },
-                                                    onOpenServersTab = { currentUserTab = UserTabDestination.SERVERS },
+                                                    onOpenServersTab = {
+                                                        openServersCleanIpTab = false
+                                                        currentUserTab = UserTabDestination.SERVERS
+                                                    },
                                                     onOpenRadar = { showRadarInUserMode = true },
                                                     healthReport = healthReport,
                                                     healthCheckInProgress = healthCheckInProgress,
@@ -413,7 +477,41 @@ fun TmsVpnApp(
                                                     onRunIspAutoTune = { viewModel.runIspAutoTune(context) },
                                                     leakCheckReport = leakCheckReport,
                                                     leakCheckInProgress = leakCheckInProgress,
-                                                    onRunLeakCheck = { viewModel.runLeakGuardCheck() }
+                                                    onRunLeakCheck = { viewModel.runLeakGuardCheck() },
+                                                    onOpenNexusAssistant = { showNexusAssistant = true },
+                                                    userSubscription = userSubscription,
+                                                    trustedNowMs = trustedNowMs,
+                                                    cleanIpHealthyCount = metrics.cleanIpHealthyCount,
+                                                    cleanIpTotalCount = cleanIpPool.size,
+                                                    onAutoBypassDeTr = {
+                                                        onRequestVpnPermission {
+                                                            viewModel.connectAutoBypassDeTr(context)
+                                                        }
+                                                    },
+                                                    onOpenSubscriptionTab = {
+                                                        currentUserTab = UserTabDestination.SUBSCRIPTION
+                                                    },
+                                                    onOpenCleanIpPool = {
+                                                        openServersCleanIpTab = true
+                                                        currentUserTab = UserTabDestination.SERVERS
+                                                    },
+                                                    isComboShieldEnabled = comboShieldEnabled,
+                                                    isComboBusy = comboBusy,
+                                                    activeComboSummary = activeComboSummary,
+                                                    onToggleComboShield = { enabled ->
+                                                        if (enabled) {
+                                                            onRequestVpnPermission {
+                                                                viewModel.toggleComboShield(context, true)
+                                                            }
+                                                        } else {
+                                                            viewModel.toggleComboShield(context, false)
+                                                        }
+                                                    },
+                                                    onRerollComboShield = {
+                                                        onRequestVpnPermission {
+                                                            viewModel.rerollOrConnectComboShield(context, forceNextPreset = true)
+                                                        }
+                                                    }
                                                 )
                                             }
                                             UserTabDestination.SERVERS -> {
@@ -447,7 +545,33 @@ fun TmsVpnApp(
                                                     sortByLatency = sortLocationsByLatency,
                                                     onRefreshLatencies = { viewModel.refreshAllServerLatencies(context, force = true) },
                                                     onLatencyTierSelected = { viewModel.setLatencyFilterTier(it) },
-                                                    onToggleSortByLatency = { viewModel.toggleSortLocationsByLatency() }
+                                                    onToggleSortByLatency = { viewModel.toggleSortLocationsByLatency() },
+                                                    selectedConfigIds = selectedConfigIds,
+                                                    onToggleConfigSelection = { viewModel.toggleConfigSelection(it) },
+                                                    onSelectAllConfigs = { viewModel.selectAllConfigs(it) },
+                                                    onDeselectAllConfigs = { viewModel.deselectAllConfigs() },
+                                                    onDeleteSingleConfig = { viewModel.deleteConfig(it) },
+                                                    onDeleteSelectedConfigs = { viewModel.deleteSelectedConfigs() },
+                                                    onDeleteAllPermittedConfigs = { viewModel.deleteAllPermittedConfigs(it) },
+                                                    cleanIpPool = cleanIpPool,
+                                                    isProbingCleanIps = isProbingCleanIps,
+                                                    initialShowCleanIpTab = openServersCleanIpTab,
+                                                    onProbeCleanIpPool = { filterType ->
+                                                        viewModel.userProbeCleanIpPool(filterType)
+                                                    },
+                                                    onImportBulkCleanIps = { raw ->
+                                                        viewModel.importBulkCleanIps(raw)
+                                                    },
+                                                    onApplyCleanIp = { cleanHost, connectNow ->
+                                                        if (connectNow) {
+                                                            onRequestVpnPermission {
+                                                                viewModel.applyCleanIpToActiveConfig(context, cleanHost, connectImmediately = true)
+                                                                currentUserTab = UserTabDestination.HOME
+                                                            }
+                                                        } else {
+                                                            viewModel.applyCleanIpToActiveConfig(context, cleanHost, connectImmediately = false)
+                                                        }
+                                                    }
                                                 )
                                             }
                                             UserTabDestination.STATISTICS -> {
@@ -463,7 +587,27 @@ fun TmsVpnApp(
                                             UserTabDestination.SUBSCRIPTION -> {
                                                 UserSubscriptionScreen(
                                                     userProfile = userProfile,
-                                                    isPersian = isPersian
+                                                    isPersian = isPersian,
+                                                    subscription = userSubscription,
+                                                    allocatedEndpoints = allocatedEndpoints,
+                                                    allocationHistory = allocationHistory,
+                                                    history = subscriptionHistory,
+                                                    paymentRequests = myPaymentRequests,
+                                                    trustedNowMs = trustedNowMs,
+                                                    isOfflineCached = isSubscriptionOfflineCached,
+                                                    isBusy = subscriptionBusy,
+                                                    onSubmitPlanRequest = { plan, action, ref, note ->
+                                                        viewModel.submitSubscriptionRequest(plan, action, ref, note)
+                                                    },
+                                                    onConnectEndpoint = { record ->
+                                                        onRequestVpnPermission {
+                                                            viewModel.connectAllocatedEndpoint(context, record)
+                                                            currentUserTab = UserTabDestination.HOME
+                                                        }
+                                                    },
+                                                    onActivateByLink = { link ->
+                                                        viewModel.handleActivationDeepLink(link)
+                                                    }
                                                 )
                                             }
                                             UserTabDestination.PROFILE -> {
@@ -473,7 +617,8 @@ fun TmsVpnApp(
                                                     isPersian = isPersian,
                                                     onToggleLanguage = { viewModel.toggleLanguage() },
                                                     onOpenRadar = { showRadarInUserMode = true },
-                                                    onSignOut = onSignOut
+                                                    onSignOut = onSignOut,
+                                                    onOpenNexusAssistant = { showNexusAssistant = true }
                                                 )
                                             }
                                         }
@@ -697,17 +842,21 @@ fun TmsVpnApp(
                                         metrics = metrics,
                                         configs = configs,
                                         servers = servers,
-                                        vpnState = vpnConnectionState,
-                                        vpnStats = vpnSessionStats,
-                                        selectedConfig = selectedVpnConfig,
                                         isPersian = isPersian,
-                                        onConnectVpn = {
-                                            onRequestVpnPermission {
-                                                viewModel.connectVpn(context)
-                                            }
+                                        onNavigateToUsers = {
+                                            adminUsersSubTab = "USERS"
+                                            currentScreen = TmsDestination.USERS
                                         },
-                                        onDisconnectVpn = { viewModel.disconnectVpn(context) },
-                                        onAutoSelectBest = { viewModel.autoSelectBestConfig() }
+                                        onNavigateToSubscriptions = {
+                                            adminUsersSubTab = "SUBSCRIPTIONS"
+                                            currentScreen = TmsDestination.USERS
+                                        },
+                                        onNavigateToServers = {
+                                            currentScreen = TmsDestination.SERVERS
+                                        },
+                                        onNavigateToConfigs = {
+                                            currentScreen = TmsDestination.CONFIGS
+                                        }
                                     )
                                 }
                                 TmsDestination.RADAR -> {
@@ -716,12 +865,9 @@ fun TmsVpnApp(
                                         sessionStats = vpnSessionStats,
                                         configs = configs,
                                         isPersian = isPersian,
-                                        onConnectVpn = { cfg, antiFilter ->
-                                            onRequestVpnPermission {
-                                                viewModel.connectVpn(context, cfg, antiFilter)
-                                            }
-                                        },
-                                        onDisconnectVpn = { viewModel.disconnectVpn(context) }
+                                        onConnectVpn = { _, _ -> },
+                                        onDisconnectVpn = {},
+                                        isAdminMode = true
                                     )
                                 }
                                 TmsDestination.CONFIGS -> {
@@ -737,7 +883,14 @@ fun TmsVpnApp(
                                         onPingConfig = { viewModel.pingConfig(it) },
                                         onDeleteConfig = { viewModel.deleteConfig(it) },
                                         onToggleFavorite = { viewModel.toggleFavorite(it) },
-                                        onQuickAudit = { viewModel.quickAudit(it) }
+                                        onQuickAudit = { viewModel.quickAudit(it) },
+                                        selectedConfigIds = selectedConfigIds,
+                                        onToggleSelection = { viewModel.toggleConfigSelection(it) },
+                                        onSelectAll = { viewModel.selectAllConfigs(it) },
+                                        onDeselectAll = { viewModel.deselectAllConfigs() },
+                                        onDeleteSelected = { viewModel.deleteSelectedConfigs() },
+                                        onDeleteAllPermitted = { viewModel.deleteAllPermittedConfigs(it) },
+                                        previewBulkDeletion = { viewModel.previewBulkDeletion(it) }
                                     )
                                 }
                                 TmsDestination.SERVERS -> {
@@ -775,20 +928,153 @@ fun TmsVpnApp(
                                         },
                                         onDeletePolicy = { viewModel.deleteFailoverPolicy(it) },
                                         onOptimizeTopology = { viewModel.optimizeTopology(it) },
-                                        onClearAiResponse = { viewModel.clearAiResponse() }
+                                        onClearAiResponse = { viewModel.clearAiResponse() },
+                                        adminNexusMessages = adminNexusMessages,
+                                        adminNexusStreaming = adminNexusStreaming,
+                                        onSendAdminNexusMessage = { viewModel.sendAdminNexusMessage(it) },
+                                        onClearAdminNexusChat = { viewModel.clearAdminNexusChat() },
+                                        adminTickets = adminTickets,
+                                        ticketBusy = ticketBusy,
+                                        observeTicketReplies = { ticketId -> viewModel.observeTicketReplies(ticketId) },
+                                        onReplyToTicket = { ticket, msg ->
+                                            viewModel.replyToTicket(ticket, msg, asAdmin = true)
+                                        },
+                                        onUpdateTicketStatus = { ticketId, status ->
+                                            viewModel.adminUpdateTicketStatus(ticketId, status)
+                                        }
                                     )
                                 }
                                 TmsDestination.USERS -> {
-                                    UserManagementScreen(
-                                        profile = userProfile,
-                                        currentRole = currentRole,
-                                        auditLogs = auditLogs,
-                                        isPersian = isPersian,
-                                        onSwitchRole = { viewModel.switchRole(it) },
-                                        onUpdateQuota = { count, max, limit ->
-                                            viewModel.updateUserQuota(count, max, limit)
+                                    Column(modifier = Modifier.fillMaxSize()) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(horizontal = 16.dp, vertical = 8.dp),
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            FilterChip(
+                                                selected = adminUsersSubTab == "SUBSCRIPTIONS",
+                                                onClick = { adminUsersSubTab = "SUBSCRIPTIONS" },
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .minimumInteractiveComponentSize()
+                                                    .testTag("admin_subtab_subscriptions"),
+                                                label = {
+                                                    Text(
+                                                        text = if (isPersian) "اشتراک‌ها و IP اختصاصی" else "Subscriptions & IPs",
+                                                        fontSize = 11.sp,
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                },
+                                                colors = FilterChipDefaults.filterChipColors(
+                                                    selectedContainerColor = GoldContainer,
+                                                    selectedLabelColor = MetallicGold,
+                                                    containerColor = CardSurfaceDark,
+                                                    labelColor = TextGraySecondary
+                                                ),
+                                                border = BorderStroke(1.dp, if (adminUsersSubTab == "SUBSCRIPTIONS") MetallicGold else BorderGoldMuted)
+                                            )
+
+                                            FilterChip(
+                                                selected = adminUsersSubTab == "USERS",
+                                                onClick = { adminUsersSubTab = "USERS" },
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .minimumInteractiveComponentSize()
+                                                    .testTag("admin_subtab_rbac"),
+                                                label = {
+                                                    Text(
+                                                        text = if (isPersian) "کاربران، RBAC و لاگ" else "Users & RBAC",
+                                                        fontSize = 11.sp,
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                },
+                                                colors = FilterChipDefaults.filterChipColors(
+                                                    selectedContainerColor = GoldContainer,
+                                                    selectedLabelColor = MetallicGold,
+                                                    containerColor = CardSurfaceDark,
+                                                    labelColor = TextGraySecondary
+                                                ),
+                                                border = BorderStroke(1.dp, if (adminUsersSubTab == "USERS") MetallicGold else BorderGoldMuted)
+                                            )
                                         }
-                                    )
+
+                                        if (adminUsersSubTab == "SUBSCRIPTIONS") {
+                                            AdminSubscriptionScreen(
+                                                subscriptions = allSubscriptionsAdmin,
+                                                endpointInventory = endpointInventoryAdmin,
+                                                paymentRequests = allPaymentRequestsAdmin,
+                                                shortageAlerts = shortageAlertsAdmin,
+                                                rotationLogs = rotationLogsAdmin,
+                                                selectedRotationUserIds = selectedRotationUserIds,
+                                                trustedNowMs = trustedNowMs,
+                                                isBusy = subscriptionBusy,
+                                                isPersian = isPersian,
+                                                onToggleSelectUser = { viewModel.toggleRotationUserSelection(it) },
+                                                onSelectAllUsers = { viewModel.selectAllRotationUsers(it) },
+                                                onClearUserSelection = { viewModel.clearRotationUserSelection() },
+                                                onActivateSubscription = { uid, email, plan, payId ->
+                                                    viewModel.adminActivateUserSubscription(uid, email, plan, payId)
+                                                },
+                                                onRejectPayment = { payId, reason ->
+                                                    viewModel.adminRejectPayment(payId, reason)
+                                                },
+                                                onRenewSubscription = { viewModel.adminRenewUserSubscription(it) },
+                                                onChangePlan = { sub, plan -> viewModel.adminChangeUserPlan(sub, plan) },
+                                                onUpdateStatus = { sub, status, reason ->
+                                                    viewModel.adminUpdateSubscriptionStatus(sub, status, reason)
+                                                },
+                                                onUpsertEndpoint = { viewModel.adminUpsertManagedEndpoint(it) },
+                                                onImportFromNodes = { viewModel.adminImportInventoryFromCurrentNodes() },
+                                                onToggleEndpointHealth = { ep, en, hl ->
+                                                    viewModel.adminToggleEndpointHealth(ep, en, hl)
+                                                },
+                                                onResolveShortage = { viewModel.adminResolveShortageAlert(it) },
+                                                onRotateSingleUser = { viewModel.adminTriggerRotationForUser(it) },
+                                                onRotateSelectedUsers = { viewModel.adminTriggerRotationForSelectedUsers() },
+                                                onRunDailyRotationAll = { force -> viewModel.adminTriggerDailyRotationAll(force) },
+                                                inspectedHistoryUserId = inspectedHistoryUserId,
+                                                inspectedAllocationHistory = adminInspectedAllocationHistory,
+                                                onInspectUserAllocationHistory = { viewModel.inspectUserAllocationHistory(it) },
+                                                onRecordEndpointFailure = { viewModel.adminReportEndpointFailureAndFailover(it) },
+                                                cleanIpPool = cleanIpPool,
+                                                isProbingCleanIps = isProbingCleanIps,
+                                                onProbeCleanIpPool = { filterType -> viewModel.adminProbeCleanIpPool(filterType) },
+                                                onToggleCleanIpAvailability = { entity, avail ->
+                                                    viewModel.adminToggleCleanIpAvailability(entity, avail)
+                                                },
+                                                onPromoteHealthyCleanIps = { viewModel.adminPromoteHealthyCleanIpsToInventory() },
+                                                registeredUsers = registeredUsers,
+                                                onImportBulkCleanIps = { raw -> viewModel.importBulkCleanIps(raw) },
+                                                onAddIpOnlyEndpoints = { raw -> viewModel.addIpOnlyEndpoints(raw) },
+                                                preselectedGrantUid = prefillGrantUid,
+                                                preselectedGrantEmail = prefillGrantEmail,
+                                                openGrantTrigger = grantModalTrigger
+                                            )
+                                        } else {
+                                            UserManagementScreen(
+                                                profile = userProfile,
+                                                currentRole = currentRole,
+                                                auditLogs = auditLogs,
+                                                isPersian = isPersian,
+                                                onSwitchRole = { viewModel.switchRole(it) },
+                                                onUpdateQuota = { count, max, limit ->
+                                                    viewModel.updateUserQuota(count, max, limit)
+                                                },
+                                                registeredUsers = registeredUsers,
+                                                subscriptions = allSubscriptionsAdmin,
+                                                onAssignSubscriptionForUser = { user ->
+                                                    prefillGrantUid = user.userId
+                                                    prefillGrantEmail = user.email
+                                                    grantModalTrigger++
+                                                    adminUsersSubTab = "SUBSCRIPTIONS"
+                                                },
+                                                onUpdateQuotaForUser = { uid, max, limit ->
+                                                    viewModel.updateUserQuota(1, max, limit, targetUserId = uid)
+                                                }
+                                            )
+                                        }
+                                    }
                                 }
                                 TmsDestination.SETTINGS -> {
                                     SystemSettingsScreen(
@@ -949,13 +1235,49 @@ fun TmsVpnApp(
                         }
                     },
                     confirmButton = {},
-                    dismissButton = {
-                        TextButton(onClick = { showQuickRoleSwitcher = false }) {
-                            Text(text = if (isPersian) "بستن" else "Close", color = TextGraySecondary)
+                        dismissButton = {
+                            TextButton(onClick = { showQuickRoleSwitcher = false }) {
+                                Text(text = if (isPersian) "بستن" else "Close", color = TextGraySecondary)
+                            }
                         }
-                    }
-                )
+                    )
+                }
+
+                // TMS NEXUS AI Personal Assistant, Diagnostics & Support Tickets Modal (User Space)
+                if (showNexusAssistant && !isInAdminSpace) {
+                    BackHandler { showNexusAssistant = false }
+                    NexusAssistantModal(
+                        isPersian = isPersian,
+                        messages = userNexusMessages,
+                        isStreaming = userNexusStreaming,
+                        diagnosticReport = userDiagnosticReport,
+                        diagnosticLoading = userDiagnosticLoading,
+                        diagnosticError = userDiagnosticError,
+                        tickets = userTickets,
+                        ticketBusy = ticketBusy,
+                        observeTicketReplies = { ticketId -> viewModel.observeTicketReplies(ticketId) },
+                        onSendChatMessage = { viewModel.sendUserNexusMessage(it) },
+                        onClearChat = { viewModel.clearUserNexusChat() },
+                        onRunDiagnostics = { symptom -> viewModel.runUserSmartDiagnostics(symptom) },
+                        onTriggerIspAutoTune = {
+                            showNexusAssistant = false
+                            viewModel.runIspAutoTune(context)
+                        },
+                        onTriggerFailover = {
+                            showNexusAssistant = false
+                            onRequestVpnPermission {
+                                viewModel.failoverToNextHealthyConfig(context)
+                            }
+                        },
+                        onSubmitTicket = { subject, desc, cat, prio ->
+                            viewModel.submitSupportTicket(subject, desc, cat, prio)
+                        },
+                        onReplyTicket = { ticket, msg ->
+                            viewModel.replyToTicket(ticket, msg, asAdmin = false)
+                        },
+                        onDismiss = { showNexusAssistant = false }
+                    )
+                }
             }
         }
     }
-}

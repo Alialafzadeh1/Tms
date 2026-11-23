@@ -96,17 +96,36 @@ object DynamicIpDnsRotator {
         _rotationCount.value += 1
     }
 
-    fun promoteCleanIp(cleanIp: String) {
+    @Volatile
+    var pinnedCleanIpOverride: String? = null
+        private set
+
+    fun promoteCleanIp(cleanIp: String, pinForTunnel: Boolean = false) {
         val trimmed = cleanIp.trim()
         if (trimmed.isBlank()) return
         val updated = (listOf(trimmed) + ipPool.filterNot { it == trimmed }).distinct()
         ipPool = updated
         currentIpIndex = 0
         _currentCleanIp.value = trimmed
+        if (pinForTunnel) {
+            pinnedCleanIpOverride = trimmed
+        }
     }
 
-    fun getActiveOutboundIp(targetHost: String): String {
-        // If target host is already a clean IP, or rotation is active, return current clean IP
+    fun clearPinnedCleanIp() {
+        pinnedCleanIpOverride = null
+    }
+
+    fun seedCandidateIps(cleanIps: List<String>) {
+        val sanitized = cleanIps.map { it.trim() }.filter { it.isNotBlank() }.distinct()
+        if (sanitized.isEmpty()) return
+        ipPool = (ipPool + sanitized).distinct()
+    }
+
+    fun getActiveOutboundIp(targetHost: String, preferTargetHost: Boolean = true): String {
+        val pinned = pinnedCleanIpOverride?.takeIf { it.isNotBlank() }
+        if (pinned != null) return pinned
+        if (preferTargetHost && targetHost.isNotBlank()) return targetHost
         return if (_isAutoRotateEnabled.value) {
             _currentCleanIp.value
         } else {

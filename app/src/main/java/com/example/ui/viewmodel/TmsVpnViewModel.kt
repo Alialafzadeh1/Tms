@@ -2,17 +2,39 @@ package com.example.ui.viewmodel
 
 import android.app.Application
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.ai.AiResult
+import com.example.data.ai.NexusAiScope
+import com.example.data.ai.NexusChatMessage
+import com.example.data.ai.NexusContextSanitizer
+import com.example.data.ai.NexusDiagnosticReport
+import com.example.data.ai.NexusStreamEvent
 import com.example.data.ai.VpnAiEngine
 import com.example.data.model.AdminPermission
 import com.example.data.model.AdminRole
+import com.example.data.model.AllocatedEndpointRecord
+import com.example.data.model.AllocationHistoryRecord
 import com.example.data.model.AuthAuditLog
+import com.example.data.model.ConfigOrigin
 import com.example.data.model.FailoverPolicy
+import com.example.data.model.InventoryShortageAlert
+import com.example.data.model.ManagedEndpoint
 import com.example.data.model.OverviewMetrics
+import com.example.data.model.PaymentRequestRecord
+import com.example.data.model.RotationAuditLog
+import com.example.data.model.SubscriptionHistoryEvent
+import com.example.data.model.SubscriptionPlanId
+import com.example.data.model.SubscriptionStatus
+import com.example.data.model.SupportTicket
+import com.example.data.model.SupportTicketCategory
+import com.example.data.model.SupportTicketPriority
+import com.example.data.model.SupportTicketReply
+import com.example.data.model.SupportTicketStatus
 import com.example.data.model.UserProfile
+import com.example.data.model.UserSubscription
 import com.example.data.model.VpnConfig
 import com.example.data.model.VpnServer
 import com.example.data.network.NodeControlApiClient
@@ -20,13 +42,25 @@ import com.example.data.network.RealPingEngine
 import com.example.data.network.SubscriptionImporter
 import com.example.data.network.UbuntuNodeHealthResult
 import com.example.data.parser.VpnConfigParser
+import com.example.data.repository.SubscriptionRepository
+import com.example.data.repository.SupportTicketRepository
 import com.example.data.repository.VpnRepository
 import com.example.data.security.AdminSecurityManager
 import com.example.data.security.AuthAttemptResult
 import com.example.data.security.LocalUserAuthManager
 import com.example.data.security.SessionToken
+import com.example.data.subscription.BulkDeletionPlan
+import com.example.data.subscription.ConfigDeletionContext
+import com.example.data.subscription.ConfigDeletionPolicy
+import com.example.data.subscription.DedicatedIpAllocationEngine
+import com.example.data.subscription.SubscriptionLifecycleEngine
+import com.example.data.local.CleanIpAddressType
+import com.example.data.local.CleanIpEntity
+import com.example.data.local.CleanIpHealthStatus
 import com.example.data.local.LocalVpnConfigEntity
 import com.example.data.local.LocalVpnConfigRepository
+import com.example.data.local.RegisteredUserEntity
+import com.example.data.model.PaymentStatus
 import com.example.data.validation.InputValidator
 import com.example.data.validation.ValidationResult
 import com.google.firebase.Firebase
@@ -50,9 +84,11 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -62,6 +98,8 @@ import kotlinx.coroutines.sync.withPermit
 import android.content.Context
 import com.example.data.model.VpnConnectionState
 import com.example.data.model.VpnSessionStats
+import com.example.vpn.engine.AntiDpiComboEngine
+import com.example.vpn.engine.ComboBypassSummary
 import com.example.vpn.SplitTunnelManager
 import com.example.vpn.VpnController
 import com.example.vpn.engine.IspAutoTuner
@@ -83,9 +121,17 @@ sealed interface UiMessage {
 class TmsVpnViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = VpnRepository(application)
+    private val subscriptionRepository = SubscriptionRepository(application)
+    private val supportTicketRepository = SupportTicketRepository(application)
     private val localConfigRepository = LocalVpnConfigRepository(application)
     private val aiEngine = VpnAiEngine()
     private val securityManager = AdminSecurityManager(application)
+
+    private fun safeFirebaseAuth(): FirebaseAuth? =
+        runCatching { Firebase.auth }.getOrNull()
+
+    private fun safeFirebaseUser(): FirebaseUser? =
+        runCatching { Firebase.auth.currentUser }.getOrNull()
 
     // --- REAL VPN ENGINE INTEGRATION ---
     val vpnConnectionState: StateFlow<VpnConnectionState> = VpnController.connectionState
@@ -150,13 +196,38 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     private val _isPersianLanguage = MutableStateFlow(true)
     val isPersianLanguage: StateFlow<Boolean> = _isPersianLanguage.asStateFlow()
 
+    // --- TMS NEXUS AI STATE (STRICTLY SCOPED: USER_ASSISTANT vs ADMIN_COPILOT) ---
+    private val _userNexusMessages = MutableStateFlow<List<NexusChatMessage>>(emptyList())
+    val userNexusMessages: StateFlow<List<NexusChatMessage>> = _userNexusMessages.asStateFlow()
+
+    private val _userNexusStreaming = MutableStateFlow(false)
+    val userNexusStreaming: StateFlow<Boolean> = _userNexusStreaming.asStateFlow()
+
+    private val _userDiagnosticReport = MutableStateFlow<NexusDiagnosticReport?>(null)
+    val userDiagnosticReport: StateFlow<NexusDiagnosticReport?> = _userDiagnosticReport.asStateFlow()
+
+    private val _userDiagnosticLoading = MutableStateFlow(false)
+    val userDiagnosticLoading: StateFlow<Boolean> = _userDiagnosticLoading.asStateFlow()
+
+    private val _userDiagnosticError = MutableStateFlow<String?>(null)
+    val userDiagnosticError: StateFlow<String?> = _userDiagnosticError.asStateFlow()
+
+    private val _adminNexusMessages = MutableStateFlow<List<NexusChatMessage>>(emptyList())
+    val adminNexusMessages: StateFlow<List<NexusChatMessage>> = _adminNexusMessages.asStateFlow()
+
+    private val _adminNexusStreaming = MutableStateFlow(false)
+    val adminNexusStreaming: StateFlow<Boolean> = _adminNexusStreaming.asStateFlow()
+
+    private val _ticketBusy = MutableStateFlow(false)
+    val ticketBusy: StateFlow<Boolean> = _ticketBusy.asStateFlow()
+
     // --- RBAC & SECURITY STATE ---
 
     private val _activeSession = MutableStateFlow<SessionToken?>(null)
     val activeSession: StateFlow<SessionToken?> = _activeSession.asStateFlow()
 
     private val initialAdminSnapshot: Boolean = LocalUserAuthManager.isAdminEmail(
-        Firebase.auth.currentUser?.email ?: LocalUserAuthManager.offlineUserFlow.value?.email
+        safeFirebaseUser()?.email ?: LocalUserAuthManager.offlineUserFlow.value?.email
     )
 
     private val _isUnlocked = MutableStateFlow(initialAdminSnapshot)
@@ -174,6 +245,27 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         if (initialAdminSnapshot) AdminRole.SUPER_ADMIN else null
     )
 
+    // --- BULK CONFIG MANAGEMENT & TOMBSTONES ---
+    private val _selectedConfigIds = MutableStateFlow<Set<String>>(emptySet())
+    val selectedConfigIds: StateFlow<Set<String>> = _selectedConfigIds.asStateFlow()
+
+    private val _tombstonedConfigIds = MutableStateFlow<Set<String>>(emptySet())
+
+    // --- SERVER-TIME ANCHOR (PREVENT DEVICE CLOCK SPOOFING) ---
+    private val _serverAnchorEpochMs = MutableStateFlow(System.currentTimeMillis())
+    private val _serverAnchorElapsedMs = MutableStateFlow(SystemClock.elapsedRealtime())
+    private val _trustedServerNowMs = MutableStateFlow(System.currentTimeMillis())
+    val trustedServerNowMs: StateFlow<Long> = _trustedServerNowMs.asStateFlow()
+
+    private val _isSubscriptionOfflineCached = MutableStateFlow(false)
+    val isSubscriptionOfflineCached: StateFlow<Boolean> = _isSubscriptionOfflineCached.asStateFlow()
+
+    private val _subscriptionBusy = MutableStateFlow(false)
+    val subscriptionBusy: StateFlow<Boolean> = _subscriptionBusy.asStateFlow()
+
+    private val _selectedRotationUserIds = MutableStateFlow<Set<String>>(emptySet())
+    val selectedRotationUserIds: StateFlow<Set<String>> = _selectedRotationUserIds.asStateFlow()
+
     // Room local configurations StateFlow for offline persistence and inspection
     val localConfigs: StateFlow<List<LocalVpnConfigEntity>> = localConfigRepository.allEntities
         .stateIn(
@@ -182,69 +274,119 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             initialValue = emptyList()
         )
 
+    private val _isProbingCleanIps = MutableStateFlow(false)
+    val isProbingCleanIps: StateFlow<Boolean> = _isProbingCleanIps.asStateFlow()
+
+    private val _comboBusy = MutableStateFlow(false)
+    val comboBusy: StateFlow<Boolean> = _comboBusy.asStateFlow()
+
+    val comboShieldEnabled: StateFlow<Boolean> = VpnController.comboShieldEnabled
+    val activeComboSummary: StateFlow<String> = VpnController.activeComboSummary
+
+    val cleanIpPool: StateFlow<List<CleanIpEntity>> = (localConfigRepository.observeCleanIpPool() ?: flowOf(emptyList()))
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000L),
+            initialValue = emptyList()
+        )
+
     val authStateFlow: Flow<FirebaseUser?> = callbackFlow {
-        val auth = Firebase.auth
-        val listener = FirebaseAuth.AuthStateListener { currentAuth ->
-            trySend(currentAuth.currentUser)
+        val auth = safeFirebaseAuth()
+        if (auth == null) {
+            trySend(null)
+            awaitClose { }
+            return@callbackFlow
         }
-        auth.addAuthStateListener(listener)
-        trySend(auth.currentUser)
-        awaitClose { auth.removeAuthStateListener(listener) }
+        val listener = FirebaseAuth.AuthStateListener { currentAuth ->
+            trySend(runCatching { currentAuth.currentUser }.getOrNull())
+        }
+        runCatching { auth.addAuthStateListener(listener) }
+        trySend(runCatching { auth.currentUser }.getOrNull())
+        awaitClose { runCatching { auth.removeAuthStateListener(listener) } }
     }
 
-    init {
-        VpnController.syncWithService(application)
-        // Prepopulate default high-speed tested configurations so app is never empty
-        viewModelScope.launch {
-            try {
-                localConfigRepository.prepopulateDefaultsIfEmpty()
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed seeding default configs: ${e.message}")
-            }
-        }
+    private data class SessionIdentity(
+        val uid: String,
+        val email: String,
+        val displayName: String,
+        val isFirebaseUser: Boolean,
+        val isAdmin: Boolean
+    )
 
-        // Automatically synchronize remote Firestore configurations into Room local database when user is authenticated
-        viewModelScope.launch {
-            authStateFlow.collect { user ->
-                if (user != null) {
-                    try {
-                        repository.observeConfigs().catch { }.collect { remoteConfigs ->
-                            if (remoteConfigs.isNotEmpty()) {
-                                localConfigRepository.saveAllConfigs(remoteConfigs)
-                            }
-                        }
-                    } catch (e: Exception) {
-                        Log.d(TAG, "Sync to local Room database: ${e.message}")
-                    }
+    private val activeAuthIdentityFlow: Flow<SessionIdentity?> = combine(
+        authStateFlow,
+        LocalUserAuthManager.offlineUserFlow
+    ) { fbUser, emailUser ->
+        when {
+            fbUser != null -> {
+                val em = fbUser.email.orEmpty()
+                val name = fbUser.displayName?.takeIf { it.isNotBlank() }
+                    ?: em.substringBefore("@").ifBlank { "TMS User" }
+                SessionIdentity(
+                    uid = fbUser.uid,
+                    email = em,
+                    displayName = name,
+                    isFirebaseUser = true,
+                    isAdmin = LocalUserAuthManager.isAdminEmail(em)
+                )
+            }
+            emailUser != null -> {
+                SessionIdentity(
+                    uid = emailUser.uid,
+                    email = emailUser.email,
+                    displayName = emailUser.username,
+                    isFirebaseUser = false,
+                    isAdmin = emailUser.isAdmin || LocalUserAuthManager.isAdminEmail(emailUser.email)
+                )
+            }
+            else -> null
+        }
+    }.distinctUntilChanged()
+
+    private fun currentActorUid(): String {
+        return safeFirebaseUser()?.uid
+            ?: LocalUserAuthManager.offlineUserFlow.value?.uid
+            ?: "local_user"
+    }
+
+    private fun currentActorEmail(): String {
+        return safeFirebaseUser()?.email
+            ?: LocalUserAuthManager.offlineUserFlow.value?.email
+            ?: userProfile.value?.email
+            ?: ""
+    }
+
+    fun currentTrustedNowMs(): Long {
+        val elapsedDelta = (SystemClock.elapsedRealtime() - _serverAnchorElapsedMs.value).coerceAtLeast(0L)
+        return _serverAnchorEpochMs.value + elapsedDelta
+    }
+
+    private fun updateTrustedServerAnchor(serverEpochMs: Long) {
+        if (serverEpochMs > 0L) {
+            _serverAnchorEpochMs.value = serverEpochMs
+            _serverAnchorElapsedMs.value = SystemClock.elapsedRealtime()
+            _trustedServerNowMs.value = serverEpochMs
+        }
+    }
+
+    private suspend fun syncPendingConfigDeletes(uid: String) {
+        try {
+            val pending = localConfigRepository.getPendingRemoteDeletes(uid)
+            if (pending.isNotEmpty()) {
+                val res = repository.deleteConfigsBatch(pending)
+                if (res.isSuccess) {
+                    localConfigRepository.markRemoteDeletesSynced(pending)
                 }
             }
-        }
-
-        // Automatically open full Admin Control Center exclusively when signed in as alafzadehali@gmail.com
-        viewModelScope.launch {
-            combine(
-                authStateFlow,
-                LocalUserAuthManager.offlineUserFlow
-            ) { fbUser, offUser ->
-                fbUser?.email ?: offUser?.email
-            }.collect { activeEmail ->
-                val isAdmin = LocalUserAuthManager.isAdminEmail(activeEmail)
-                if (isAdmin) {
-                    _isInAdminSpace.value = true
-                    _isUnlocked.value = true
-                    _selectedRole.value = AdminRole.SUPER_ADMIN
-                    _lockoutSeconds.value = 0L
-                } else {
-                    _isInAdminSpace.value = false
-                    _isUnlocked.value = false
-                    _selectedRole.value = null
-                }
-            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.d(TAG, "Deferred remote delete sync deferred: ${e.message}")
         }
     }
 
     fun isCurrentUserAdmin(): Boolean {
-        val activeEmail = Firebase.auth.currentUser?.email ?: LocalUserAuthManager.offlineUserFlow.value?.email
+        val activeEmail = safeFirebaseUser()?.email ?: LocalUserAuthManager.offlineUserFlow.value?.email
         return LocalUserAuthManager.isAdminEmail(activeEmail)
     }
 
@@ -268,28 +410,35 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         _selectedRole.value = null
     }
 
-    // Unified configurations: remote Firestore with seamless local Room database fallback
-    val configs: StateFlow<List<VpnConfig>> = authStateFlow.flatMapLatest { user ->
-        if (user != null) {
+    // Unified configurations: remote Firestore merged with local Room database and strictly filtered by tombstones
+    val configs: StateFlow<List<VpnConfig>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        if (identity?.isFirebaseUser == true) {
             combine(
                 repository.observeConfigs().catch { error ->
                     Log.d(TAG, "Firestore observeConfigs caught, using local fallback: ${error.message}")
                     emit(emptyList())
                 },
-                localConfigRepository.allConfigs
-            ) { remoteList, localList ->
-                val merged = if (remoteList.isNotEmpty()) remoteList else localList
+                localConfigRepository.allConfigs,
+                _tombstonedConfigIds
+            ) { remoteList, localList, tombstones ->
+                val byId = linkedMapOf<String, VpnConfig>()
+                remoteList.filter { it.id !in tombstones }.forEach { byId[it.id] = it }
+                localList.filter { it.id !in tombstones }.forEach { localCfg ->
+                    byId.putIfAbsent(localCfg.id, localCfg)
+                }
+                val merged = byId.values.toList()
                 if (_selectedVpnConfig.value == null && merged.isNotEmpty()) {
                     _selectedVpnConfig.value = merged.firstOrNull()
                 }
                 merged
             }
         } else {
-            localConfigRepository.allConfigs.map { localList ->
-                if (_selectedVpnConfig.value == null && localList.isNotEmpty()) {
-                    _selectedVpnConfig.value = localList.firstOrNull()
+            combine(localConfigRepository.allConfigs, _tombstonedConfigIds) { localList, tombstones ->
+                val visible = localList.filter { it.id !in tombstones }
+                if (_selectedVpnConfig.value == null && visible.isNotEmpty()) {
+                    _selectedVpnConfig.value = visible.firstOrNull()
                 }
-                localList
+                visible
             }
         }
     }.stateIn(
@@ -298,8 +447,8 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         initialValue = emptyList()
     )
 
-    val servers: StateFlow<List<VpnServer>> = authStateFlow.flatMapLatest { user ->
-        if (user != null) {
+    val servers: StateFlow<List<VpnServer>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        if (identity?.isFirebaseUser == true) {
             repository.observeServers().catch { error ->
                 Log.d(TAG, "Firestore observeServers: ${error.message}")
                 emit(emptyList())
@@ -313,8 +462,8 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         initialValue = emptyList()
     )
 
-    val failoverPolicies: StateFlow<List<FailoverPolicy>> = authStateFlow.flatMapLatest { user ->
-        if (user != null) {
+    val failoverPolicies: StateFlow<List<FailoverPolicy>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        if (identity?.isFirebaseUser == true) {
             repository.observeFailoverPolicies().catch { error ->
                 Log.d(TAG, "Firestore observeFailoverPolicies: ${error.message}")
                 emit(emptyList())
@@ -328,14 +477,40 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         initialValue = emptyList()
     )
 
-    val userProfile: StateFlow<UserProfile?> = authStateFlow.flatMapLatest { user ->
-        if (user != null) {
-            repository.observeUserProfile().catch { error ->
-                Log.d(TAG, "Firestore observeUserProfile: ${error.message}")
-                emit(null)
-            }
-        } else {
+    val userProfile: StateFlow<UserProfile?> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        if (identity == null) {
             flowOf(null)
+        } else {
+            val localFlow = (localConfigRepository.observeRegisteredUsers() ?: flowOf(emptyList()))
+                .map { list ->
+                    list.firstOrNull {
+                        it.userId == identity.uid ||
+                            (identity.email.isNotBlank() && it.email.equals(identity.email, ignoreCase = true))
+                    } ?: UserProfile(
+                        id = identity.uid,
+                        userId = identity.uid,
+                        displayName = identity.displayName,
+                        email = identity.email,
+                        role = if (identity.isAdmin) "SUPER_ADMIN" else "USER",
+                        deviceCount = 1,
+                        maxDevices = 10,
+                        dataUsageBytes = 0.0,
+                        dataLimitBytes = 500.0 * 1024 * 1024 * 1024,
+                        subscriptionStatus = if (identity.isAdmin) "active" else "expired"
+                    )
+                }
+            if (identity.isFirebaseUser) {
+                combine(
+                    repository.observeUserProfile().catch { emit(null) },
+                    localFlow
+                ) { remoteProfile, localProfile ->
+                    remoteProfile?.copy(
+                        dataUsageBytes = maxOf(remoteProfile.dataUsageBytes, localProfile.dataUsageBytes)
+                    ) ?: localProfile
+                }
+            } else {
+                localFlow
+            }
         }
     }.stateIn(
         scope = viewModelScope,
@@ -343,8 +518,8 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         initialValue = null
     )
 
-    val auditLogs: StateFlow<List<AuthAuditLog>> = authStateFlow.flatMapLatest { user ->
-        if (user != null) {
+    val auditLogs: StateFlow<List<AuthAuditLog>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        if (identity?.isFirebaseUser == true) {
             repository.observeAuditLogs().catch { error ->
                 Log.d(TAG, "Firestore observeAuditLogs: ${error.message}")
                 emit(emptyList())
@@ -366,7 +541,372 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         initialValue = AdminRole.SUPER_ADMIN
     )
 
-    val overviewMetrics: StateFlow<OverviewMetrics> = combine(configs, servers, userProfile) { cfgList, srvList, profile ->
+    // --- USER SUBSCRIPTION & DEDICATED IP ALLOCATIONS (UNIFIED ROOM + FIRESTORE, ZERO CHURN) ---
+
+    val userSubscription: StateFlow<UserSubscription?> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        val uid = identity?.uid ?: "local_user"
+        val cachedFlow = (localConfigRepository.observeCachedSubscription(uid) ?: flowOf(null))
+            .distinctUntilChanged()
+        _isSubscriptionOfflineCached.value = false
+        if (identity?.isFirebaseUser == true) {
+            val remoteFlow = subscriptionRepository.observeMySubscription()
+                .onEach { remoteSub ->
+                    remoteSub?.updatedAt?.toDate()?.time?.let { updateTrustedServerAnchor(it) }
+                    if (remoteSub != null) {
+                        localConfigRepository.cacheSubscription(remoteSub, currentTrustedNowMs())
+                    }
+                }
+                .catch { emit(null) }
+                .distinctUntilChanged()
+            combine(remoteFlow, cachedFlow) { remoteSub, cachedSub ->
+                remoteSub ?: cachedSub
+            }
+        } else {
+            cachedFlow
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = null
+    )
+
+    val allocatedEndpoints: StateFlow<List<AllocatedEndpointRecord>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        val uid = identity?.uid ?: "local_user"
+        val cachedFlow = (localConfigRepository.observeCachedAllocatedEndpoints(uid) ?: flowOf(emptyList()))
+            .distinctUntilChanged()
+        if (identity?.isFirebaseUser == true) {
+            val remoteFlow = subscriptionRepository.observeMyAllocatedEndpoints()
+                .onEach { remoteList ->
+                    if (remoteList.isNotEmpty()) {
+                        localConfigRepository.cacheAllocatedEndpoints(uid, remoteList)
+                        localConfigRepository.replaceSubscriptionConfigs(uid, remoteList)
+                    }
+                }
+                .catch { emit(emptyList()) }
+                .distinctUntilChanged()
+            combine(remoteFlow, cachedFlow) { remoteList, cachedList ->
+                remoteList.ifEmpty { cachedList }
+            }
+        } else {
+            cachedFlow
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
+
+    val subscriptionHistory: StateFlow<List<SubscriptionHistoryEvent>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        val uid = identity?.uid ?: "local_user"
+        val cachedFlow = (localConfigRepository.observeCachedHistory(uid) ?: flowOf(emptyList()))
+            .distinctUntilChanged()
+        if (identity?.isFirebaseUser == true) {
+            val remoteFlow = subscriptionRepository.observeMySubscriptionHistory()
+                .onEach { remoteList ->
+                    if (remoteList.isNotEmpty()) {
+                        localConfigRepository.cacheSubscriptionHistory(remoteList)
+                    }
+                }
+                .catch { emit(emptyList()) }
+                .distinctUntilChanged()
+            combine(remoteFlow, cachedFlow) { remoteList, cachedList ->
+                remoteList.ifEmpty { cachedList }
+            }
+        } else {
+            cachedFlow
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
+
+    val allocationHistory: StateFlow<List<AllocationHistoryRecord>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        val uid = identity?.uid ?: "local_user"
+        val cachedFlow = (localConfigRepository.observeCachedAllocationHistory(uid) ?: flowOf(emptyList()))
+            .distinctUntilChanged()
+        if (identity?.isFirebaseUser == true) {
+            val remoteFlow = subscriptionRepository.observeMyAllocationHistory()
+                .onEach { remoteList ->
+                    if (remoteList.isNotEmpty()) {
+                        localConfigRepository.cacheAllocationHistory(remoteList)
+                    }
+                }
+                .catch { emit(emptyList()) }
+                .distinctUntilChanged()
+            combine(remoteFlow, cachedFlow) { remoteList, cachedList ->
+                remoteList.ifEmpty { cachedList }
+            }
+        } else {
+            cachedFlow
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
+
+    private val _inspectedHistoryUserId = MutableStateFlow<String?>(null)
+    val inspectedHistoryUserId: StateFlow<String?> = _inspectedHistoryUserId.asStateFlow()
+
+    val adminInspectedAllocationHistory: StateFlow<List<AllocationHistoryRecord>> =
+        combine(activeAuthIdentityFlow, _inspectedHistoryUserId) { identity, targetUid -> identity to targetUid }
+            .flatMapLatest { (identity, targetUid) ->
+                if (identity?.isAdmin == true && !targetUid.isNullOrBlank()) {
+                    val localHist = localConfigRepository.observeCachedAllocationHistory(targetUid) ?: flowOf(emptyList())
+                    if (identity.isFirebaseUser) {
+                        combine(
+                            localHist,
+                            subscriptionRepository.observeAllocationHistoryForUser(targetUid).catch { emit(emptyList()) }
+                        ) { local, remote ->
+                            (remote + local).distinctBy { it.historyId.ifBlank { "${it.endpointId}_${it.action}_${it.cycleKey}" } }
+                        }
+                    } else {
+                        localHist
+                    }
+                } else {
+                    flowOf(emptyList())
+                }
+            }
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5000L),
+                initialValue = emptyList()
+            )
+
+    val myPaymentRequests: StateFlow<List<PaymentRequestRecord>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        val uid = identity?.uid ?: "local_user"
+        val localFlow = (localConfigRepository.observeLocalPaymentRequestsForUser(uid) ?: flowOf(emptyList()))
+            .distinctUntilChanged()
+        if (identity?.isFirebaseUser == true) {
+            val remoteFlow = subscriptionRepository.observeMyPaymentRequests()
+                .onEach { if (it.isNotEmpty()) localConfigRepository.cachePaymentRequests(it) }
+                .catch { emit(emptyList()) }
+                .distinctUntilChanged()
+            combine(remoteFlow, localFlow) { remote, local ->
+                (remote + local).distinctBy { it.paymentId.ifBlank { "${it.userId}_${it.planId}_${it.createdAt}" } }
+            }
+        } else {
+            localFlow
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
+
+    // --- ADMIN SUBSCRIPTION, REGISTERED USERS & ALLOCATION CONSOLE STREAMS ---
+
+    val allSubscriptionsAdmin: StateFlow<List<UserSubscription>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        if (identity?.isAdmin == true) {
+            val localFlow = (localConfigRepository.observeAllCachedSubscriptions() ?: flowOf(emptyList()))
+                .distinctUntilChanged()
+            if (identity.isFirebaseUser) {
+                val remoteFlow = subscriptionRepository.observeAllSubscriptionsForAdmin()
+                    .catch { emit(emptyList()) }
+                    .distinctUntilChanged()
+                combine(localFlow, remoteFlow) { local, remote ->
+                    val byUid = linkedMapOf<String, UserSubscription>()
+                    remote.forEach { byUid[it.userId] = it }
+                    local.forEach { byUid.putIfAbsent(it.userId, it) }
+                    byUid.values.toList()
+                }
+            } else {
+                localFlow
+            }
+        } else {
+            flowOf(emptyList())
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
+
+    val endpointInventoryAdmin: StateFlow<List<ManagedEndpoint>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        if (identity?.isAdmin == true) {
+            val localFlow = (localConfigRepository.observeManagedEndpoints() ?: flowOf(emptyList()))
+                .distinctUntilChanged()
+            if (identity.isFirebaseUser) {
+                val remoteFlow = subscriptionRepository.observeEndpointInventoryForAdmin()
+                    .onEach { if (it.isNotEmpty()) localConfigRepository.upsertLocalManagedEndpoints(it) }
+                    .catch { emit(emptyList()) }
+                    .distinctUntilChanged()
+                combine(localFlow, remoteFlow) { local, remote ->
+                    val byId = linkedMapOf<String, ManagedEndpoint>()
+                    remote.forEach { byId[it.endpointId] = it }
+                    local.forEach { byId.putIfAbsent(it.endpointId, it) }
+                    byId.values.toList()
+                }
+            } else {
+                localFlow
+            }
+        } else {
+            flowOf(emptyList())
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
+
+    val allPaymentRequestsAdmin: StateFlow<List<PaymentRequestRecord>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        if (identity?.isAdmin == true) {
+            val localFlow = (localConfigRepository.observeAllLocalPaymentRequests() ?: flowOf(emptyList()))
+                .distinctUntilChanged()
+            if (identity.isFirebaseUser) {
+                val remoteFlow = subscriptionRepository.observeAllPaymentRequestsForAdmin()
+                    .onEach { if (it.isNotEmpty()) localConfigRepository.cachePaymentRequests(it) }
+                    .catch { emit(emptyList()) }
+                    .distinctUntilChanged()
+                combine(localFlow, remoteFlow) { local, remote ->
+                    val byId = linkedMapOf<String, PaymentRequestRecord>()
+                    remote.forEach { byId[it.paymentId] = it }
+                    local.forEach { byId.putIfAbsent(it.paymentId, it) }
+                    byId.values.toList()
+                }
+            } else {
+                localFlow
+            }
+        } else {
+            flowOf(emptyList())
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
+
+    val registeredUsers: StateFlow<List<UserProfile>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        if (identity?.isAdmin != true) {
+            flowOf(emptyList())
+        } else {
+            val localUsersFlow = (localConfigRepository.observeRegisteredUsers() ?: flowOf(emptyList()))
+            val firestoreUsersFlow = if (identity.isFirebaseUser) {
+                repository.observeAllUserProfilesForAdmin().catch { emit(emptyList()) }
+            } else {
+                flowOf(emptyList())
+            }
+            combine(
+                localUsersFlow,
+                firestoreUsersFlow,
+                allSubscriptionsAdmin,
+                allPaymentRequestsAdmin
+            ) { localUsers, remoteUsers, subs, payments ->
+                val byUid = linkedMapOf<String, UserProfile>()
+                remoteUsers.forEach { u ->
+                    val key = u.userId.ifBlank { u.id }
+                    if (key.isNotBlank()) byUid[key] = u.copy(userId = key)
+                }
+                localUsers.forEach { u ->
+                    val key = u.userId.ifBlank { u.id }
+                    if (key.isNotBlank()) byUid.putIfAbsent(key, u.copy(userId = key))
+                }
+                subs.forEach { s ->
+                    if (s.userId.isNotBlank() && s.userId !in byUid) {
+                        byUid[s.userId] = UserProfile(
+                            id = s.userId,
+                            userId = s.userId,
+                            displayName = s.userEmail.substringBefore("@").ifBlank { s.userId },
+                            email = s.userEmail,
+                            role = "USER",
+                            subscriptionStatus = s.status.lowercase()
+                        )
+                    }
+                }
+                payments.forEach { p ->
+                    if (p.userId.isNotBlank() && p.userId !in byUid) {
+                        byUid[p.userId] = UserProfile(
+                            id = p.userId,
+                            userId = p.userId,
+                            displayName = p.userEmail.substringBefore("@").ifBlank { p.userId },
+                            email = p.userEmail,
+                            role = "USER",
+                            subscriptionStatus = "pending"
+                        )
+                    }
+                }
+                // Reflect latest active subscription status onto each profile
+                val subByUid = subs.associateBy { it.userId }
+                byUid.values.map { profile ->
+                    val sub = subByUid[profile.userId]
+                    if (sub != null) {
+                        profile.copy(subscriptionStatus = sub.status.lowercase())
+                    } else {
+                        profile
+                    }
+                }.sortedByDescending { it.subscriptionStatus == "active" }
+            }
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
+
+    val shortageAlertsAdmin: StateFlow<List<InventoryShortageAlert>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        if (identity?.isAdmin == true && identity.isFirebaseUser) {
+            subscriptionRepository.observeShortageAlertsForAdmin().catch { emit(emptyList()) }
+        } else {
+            flowOf(emptyList())
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
+
+    val rotationLogsAdmin: StateFlow<List<RotationAuditLog>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        if (identity?.isAdmin == true && identity.isFirebaseUser) {
+            subscriptionRepository.observeRotationLogsForAdmin().catch { emit(emptyList()) }
+        } else {
+            flowOf(emptyList())
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
+
+    val userTickets: StateFlow<List<SupportTicket>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        if (identity?.isFirebaseUser == true) {
+            supportTicketRepository.observeUserTickets(identity.uid).catch { emit(emptyList()) }
+        } else {
+            flowOf(emptyList())
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
+
+    val adminTickets: StateFlow<List<SupportTicket>> = activeAuthIdentityFlow.flatMapLatest { identity ->
+        if (identity?.isAdmin == true && identity.isFirebaseUser) {
+            supportTicketRepository.observeAllTicketsForAdmin().catch { emit(emptyList()) }
+        } else {
+            flowOf(emptyList())
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000L),
+        initialValue = emptyList()
+    )
+
+    val overviewMetrics: StateFlow<OverviewMetrics> = combine(
+        combine(configs, servers, registeredUsers) { c, s, u -> Triple(c, s, u) },
+        combine(allSubscriptionsAdmin, allPaymentRequestsAdmin, endpointInventoryAdmin, cleanIpPool) { subs, pays, eps, clean ->
+            listOf(subs, pays, eps, clean)
+        }
+    ) { (cfgList, srvList, regUsers), adminTuple ->
+        @Suppress("UNCHECKED_CAST")
+        val subs = adminTuple[0] as List<UserSubscription>
+        @Suppress("UNCHECKED_CAST")
+        val payments = adminTuple[1] as List<PaymentRequestRecord>
+        @Suppress("UNCHECKED_CAST")
+        val endpoints = adminTuple[2] as List<ManagedEndpoint>
+        @Suppress("UNCHECKED_CAST")
+        val cleanIps = adminTuple[3] as List<CleanIpEntity>
+
         val totalCfg = cfgList.size
         val totalSrv = srvList.size
         val activeSrv = srvList.count { it.status == "online" }
@@ -392,7 +932,14 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             averageLatencyMs = avgLatency,
             totalBandwidthGb = totalBandwidth,
             systemHealthScore = healthScore,
-            isRealBackendConnected = true
+            isRealBackendConnected = true,
+            registeredUsersCount = regUsers.size,
+            activeSubscriptionsCount = subs.count { it.statusEnum() == SubscriptionStatus.ACTIVE },
+            pendingPaymentsCount = payments.count { it.status == "PENDING_PAYMENT" || it.status == "PENDING_VERIFICATION" },
+            healthyEndpointsCount = endpoints.count { it.healthy && it.enabled },
+            totalEndpointsCount = endpoints.size,
+            cleanIpHealthyCount = cleanIps.count { it.healthStatus == CleanIpHealthStatus.HEALTHY.name },
+            cleanIpTotalCount = cleanIps.size
         )
     }.stateIn(
         scope = viewModelScope,
@@ -401,20 +948,124 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     )
 
     init {
+        runCatching { VpnController.syncWithService(application) }
+        // Background IO seeding: default configs, 330+ Clean IP pool, 75-node dedicated IP inventory, and registered accounts
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val uid = currentActorUid()
+                _tombstonedConfigIds.value = localConfigRepository.getTombstonedIds(uid)
+                localConfigRepository.prepopulateDefaultsIfEmpty(uid)
+                localConfigRepository.seedCleanIpPoolIfNeeded()
+                localConfigRepository.prepopulateEndpointInventoryIfNeeded()
+                val prefProfiles = LocalUserAuthManager.getAllRegisteredPrefProfiles(getApplication())
+                if (prefProfiles.isNotEmpty()) {
+                    localConfigRepository.upsertRegisteredUsers(prefProfiles)
+                }
+                val healthyIpv4s = localConfigRepository.getCleanIpPoolOnce()
+                    .filter {
+                        it.isAvailable &&
+                            it.addressType == CleanIpAddressType.IPV4.name &&
+                            it.healthStatus != CleanIpHealthStatus.QUARANTINED.name
+                    }
+                    .map { it.host }
+                if (healthyIpv4s.isNotEmpty()) {
+                    com.example.vpn.engine.DynamicIpDnsRotator.seedCandidateIps(healthyIpv4s)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed seeding default configs/clean IPs: ${e.message}")
+            }
+        }
+
+        // Maintain live trusted server-time delta using monotonic elapsedRealtime
         viewModelScope.launch {
-            val user = Firebase.auth.currentUser
-            if (user != null) {
-                try {
-                    repository.ensureUserProfile(
-                        displayName = user.displayName ?: "Admin Operator",
-                        email = user.email ?: "operator@tmsvpn.local"
-                    )
-                } catch (e: Exception) {
-                    Log.d(TAG, "Failed ensuring user profile: ${e.message}")
+            while (true) {
+                _trustedServerNowMs.value = currentTrustedNowMs()
+                delay(30_000L)
+            }
+        }
+
+        // Keep subscriber-only Combo Anti-DPI Shield state synced with active entitlement
+        viewModelScope.launch {
+            combine(userSubscription, _trustedServerNowMs) { sub, nowMs ->
+                SubscriptionLifecycleEngine.isEntitled(sub, nowMs)
+            }.distinctUntilChanged().collect { entitled ->
+                VpnController.initComboShieldState(application, entitled)
+            }
+        }
+
+        // Unified session observer for both Email+Password & Firebase sessions
+        viewModelScope.launch {
+            activeAuthIdentityFlow.collect { identity ->
+                if (identity != null) {
+                    VpnController.setActiveAccountId(identity.uid)
+                    if (identity.isAdmin) {
+                        _isInAdminSpace.value = true
+                        _isUnlocked.value = true
+                        _selectedRole.value = AdminRole.SUPER_ADMIN
+                        _lockoutSeconds.value = 0L
+                    } else {
+                        _isInAdminSpace.value = false
+                        _isUnlocked.value = false
+                        _selectedRole.value = null
+                    }
+
+                    launch(Dispatchers.IO) {
+                        try {
+                            localConfigRepository.upsertRegisteredUser(
+                                RegisteredUserEntity(
+                                    userId = identity.uid,
+                                    displayName = identity.displayName,
+                                    email = identity.email,
+                                    role = if (identity.isAdmin) "SUPER_ADMIN" else "USER",
+                                    maxDevices = 10,
+                                    dataLimitBytes = 500.0 * 1024 * 1024 * 1024,
+                                    subscriptionStatus = if (identity.isAdmin) "active" else "expired"
+                                )
+                            )
+                            _tombstonedConfigIds.value = localConfigRepository.getTombstonedIds(identity.uid)
+                        } catch (e: Exception) {
+                            Log.d(TAG, "Local registered user sync failed: ${e.message}")
+                        }
+                    }
+
+                    if (identity.isFirebaseUser) {
+                        launch(Dispatchers.IO) {
+                            try {
+                                repository.ensureUserProfile(
+                                    displayName = identity.displayName,
+                                    email = identity.email
+                                )
+                                syncPendingConfigDeletes(identity.uid)
+                                val serverMs = subscriptionRepository.fetchTrustedServerEpochMs(currentTrustedNowMs())
+                                updateTrustedServerAnchor(serverMs)
+                                repository.observeConfigs().catch { }.collect { remoteConfigs ->
+                                    val tombstones = localConfigRepository.getTombstonedIds(identity.uid)
+                                    _tombstonedConfigIds.value = tombstones
+                                    val validRemote = remoteConfigs.filter { it.id !in tombstones }
+                                    if (validRemote.isNotEmpty()) {
+                                        localConfigRepository.saveAllConfigs(validRemote, activeUserId = identity.uid)
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                Log.d(TAG, "Firestore sync skipped/fallback: ${e.message}")
+                            }
+                        }
+                    }
+                } else {
+                    VpnController.setActiveAccountId(null)
+                    _isInAdminSpace.value = false
+                    _isUnlocked.value = false
+                    _selectedRole.value = null
+                    launch(Dispatchers.IO) {
+                        runCatching {
+                            _tombstonedConfigIds.value = localConfigRepository.getTombstonedIds(currentActorUid())
+                        }
+                    }
                 }
             }
+        }
 
-            // Check initial lockout state
+        viewModelScope.launch {
             val (locked, remaining) = securityManager.isLockedOut()
             if (locked) {
                 _lockoutSeconds.value = remaining
@@ -453,7 +1104,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
 
             viewModelScope.launch {
                 try {
-                    val user = Firebase.auth.currentUser
+                    val user = safeFirebaseUser()
                     if (user != null) {
                         repository.addAuditLog(
                             AuthAuditLog(
@@ -479,7 +1130,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     // --- ADMINISTRATOR AUTHENTICATION & SECURITY ---
 
     fun verifyAdminPin(pin: String): Boolean {
-        val user = Firebase.auth.currentUser ?: return false
+        val user = safeFirebaseUser() ?: return false
         val role = currentRole.value
         val (result, auditLog) = securityManager.verifyAdminCredential(
             userId = user.uid,
@@ -535,7 +1186,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun changeAdminPin(oldPin: String, newPin: String) {
-        val user = Firebase.auth.currentUser ?: return
+        val user = safeFirebaseUser() ?: return
         val role = currentRole.value
 
         val validation = InputValidator.validateAdminPin(newPin)
@@ -572,7 +1223,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun emergencyResetPin(recoveryToken: String, newPin: String) {
-        val user = Firebase.auth.currentUser ?: return
+        val user = safeFirebaseUser() ?: return
         val role = currentRole.value
 
         val validation = InputValidator.validateAdminPin(newPin)
@@ -632,30 +1283,32 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun switchRole(role: AdminRole) {
-        val user = Firebase.auth.currentUser ?: return
+        val uid = currentActorUid()
         _selectedRole.value = role
 
         viewModelScope.launch {
             try {
-                repository.updateUserRole(role.id)
-                repository.addAuditLog(
-                    AuthAuditLog(
-                        userId = user.uid,
-                        action = "ROLE_SWITCHED",
-                        role = role.id,
-                        module = "RBAC",
-                        status = "SUCCESS",
-                        ipOrDevice = getDeviceInfo(),
-                        details = "تغییر نقش فعال مدیر به ${role.titleEn} (${role.id})"
+                if (safeFirebaseUser() != null) {
+                    repository.updateUserRole(role.id)
+                    repository.addAuditLog(
+                        AuthAuditLog(
+                            userId = uid,
+                            action = "ROLE_SWITCHED",
+                            role = role.id,
+                            module = "RBAC",
+                            status = "SUCCESS",
+                            ipOrDevice = getDeviceInfo(),
+                            details = "تغییر نقش فعال مدیر به ${role.titleEn} (${role.id})"
+                        )
                     )
-                )
+                }
                 _uiMessage.value = UiMessage.Success(
                     if (isPersianLanguage.value) "نقش مدیریتی به «${role.titleFa}» تغییر یافت" else "Active role switched to ${role.titleEn}"
                 )
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                Log.e(TAG, "Failed updating role in Firestore", e)
+                Log.e(TAG, "Failed updating role", e)
             }
         }
     }
@@ -693,7 +1346,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
 
         viewModelScope.launch {
             try {
-                val user = Firebase.auth.currentUser
+                val user = safeFirebaseUser()
                 if (user != null) {
                     repository.addAuditLog(
                         AuthAuditLog(
@@ -718,7 +1371,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
 
         viewModelScope.launch {
             try {
-                val user = Firebase.auth.currentUser
+                val user = safeFirebaseUser()
                 if (user != null) {
                     repository.addAuditLog(
                         AuthAuditLog(
@@ -824,7 +1477,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                     try {
                         localConfigRepository.updatePingStatus(res.config.id, res.delayMs, status)
                     } catch (_: Exception) {}
-                    if (Firebase.auth.currentUser != null) {
+                    if (safeFirebaseUser() != null) {
                         try {
                             repository.updateConfigPing(res.config.id, res.delayMs, status)
                         } catch (_: Exception) {}
@@ -869,13 +1522,488 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    /**
+     * Enables or disables the subscriber-only 4-Layer Anti-DPI Combo Shield (DoH + FakeDNS +
+     * Verified Clean IP + TLS Fragment/uTLS/ALPN + ISP Combo Memory) whenever requested.
+     * Returns false when user does not have an active subscription.
+     */
+    fun toggleComboShield(context: Context, enable: Boolean): Boolean {
+        val entitled = SubscriptionLifecycleEngine.isEntitled(userSubscription.value, currentTrustedNowMs())
+        val allowed = VpnController.setComboShieldEnabled(context, enable, entitled)
+        if (!allowed) {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) {
+                    "سپر ترکیبی ضدفیلترینگ مخصوص مشترکین فعال است؛ از بخش اشتراک (داخل اپ، روبیکا یا تلگرام) تهیه کنید"
+                } else {
+                    "Anti-DPI Combo Shield is exclusive to active subscribers"
+                }
+            )
+            return false
+        }
+
+        _uiMessage.value = UiMessage.Success(
+            if (isPersianLanguage.value) {
+                if (enable) "سپر ترکیبی ضدفیلترینگ (DoH + FakeDNS + Fragment) فعال شد"
+                else "سپر ترکیبی غیرفعال شد (حالت اتصال عادی)"
+            } else {
+                if (enable) "Anti-DPI Combo Shield enabled" else "Combo Shield disabled"
+            }
+        )
+
+        // If tunnel is already active, seamlessly apply or deactivate Combo Shield
+        val activeState = VpnController.connectionState.value
+        val activeCfg = _selectedVpnConfig.value ?: VpnController.activeConfig
+        if (activeState == VpnConnectionState.CONNECTED || activeState == VpnConnectionState.CONNECTING) {
+            if (enable) {
+                rerollOrConnectComboShield(context, forceNextPreset = false)
+            } else if (activeCfg != null) {
+                VpnController.startVpn(
+                    context = context,
+                    config = activeCfg,
+                    antiFilterMode = true,
+                    forceRestart = true,
+                    comboMode = false
+                )
+            }
+        }
+        return true
+    }
+
+    fun rerollOrConnectComboShield(context: Context, forceNextPreset: Boolean = true) {
+        if (_comboBusy.value || _isRacingConnect.value) return
+        val entitled = SubscriptionLifecycleEngine.isEntitled(userSubscription.value, currentTrustedNowMs())
+        if (!entitled) {
+            VpnController.setComboShieldEnabled(context, false, isEntitled = false)
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) "برای استفاده از ترکیب ضدفیلترینگ اشتراک فعال لازم است"
+                else "Active subscription required for Combo Shield"
+            )
+            return
+        }
+
+        val candidates = configs.value.ifEmpty {
+            localConfigs.value.map { it.toDomainModel() }
+        }.ifEmpty {
+            com.example.data.model.DefaultVpnConfigs.getDefaultConfigs(currentActorUid())
+        }
+
+        viewModelScope.launch {
+            _comboBusy.value = true
+            _isRacingConnect.value = true
+            try {
+                val cleanCandidates = localConfigRepository.getCleanIpPoolOnce()
+                    .filter {
+                        it.isAvailable &&
+                            it.addressType == CleanIpAddressType.IPV4.name &&
+                            it.healthStatus != CleanIpHealthStatus.QUARANTINED.name
+                    }
+                    .sortedBy { if (it.latencyMs > 0) it.latencyMs else Int.MAX_VALUE }
+                    .map { it.host }
+                    .take(10)
+
+                val comboSummary: ComboBypassSummary = AntiDpiComboEngine.runSmartComboBypass(
+                    context = context,
+                    configs = candidates,
+                    cleanIpCandidates = cleanCandidates,
+                    forceNextPreset = forceNextPreset
+                )
+
+                val summaryText = comboSummary.preset.shortSummary(isPersianLanguage.value)
+                VpnController.updateActiveComboSummary(summaryText)
+
+                val winner = comboSummary.winnerConfig
+                if (winner != null) {
+                    val overrideIp = comboSummary.winnerCleanIp?.takeIf { it.isNotBlank() }
+                    if (overrideIp != null) {
+                        com.example.vpn.engine.DynamicIpDnsRotator.promoteCleanIp(overrideIp, pinForTunnel = true)
+                    } else {
+                        com.example.vpn.engine.DynamicIpDnsRotator.clearPinnedCleanIp()
+                    }
+                    val updatedWinner = winner.copy(pingMs = comboSummary.delayMs, status = "online")
+                    _selectedVpnConfig.value = updatedWinner
+                    VpnController.startVpn(
+                        context = context,
+                        config = updatedWinner,
+                        antiFilterMode = true,
+                        cleanIpOverride = overrideIp,
+                        forceRestart = true,
+                        comboMode = true
+                    )
+                    _uiMessage.value = UiMessage.Success(
+                        if (isPersianLanguage.value) {
+                            val memTag = if (comboSummary.usedMemoryHit) " (حافظه اپراتور)" else ""
+                            val viaIp = if (overrideIp != null) " • IP: $overrideIp" else ""
+                            "ترکیب برنده متصل شد$memTag: ${updatedWinner.name}$viaIp • $summaryText (${comboSummary.delayMs}ms)"
+                        } else {
+                            "Combo Bypass active: ${updatedWinner.name} • $summaryText (${comboSummary.delayMs}ms)"
+                        }
+                    )
+                } else {
+                    val reasonFa = comboSummary.lastFailureReason.labelFa
+                    _uiMessage.value = UiMessage.Error(
+                        if (isPersianLanguage.value) {
+                            "ترکیب سالمی یافت نشد ($reasonFa)؛ از بخش مخزن آی‌پی، سلامت IPها را بررسی کنید"
+                        } else {
+                            "No healthy combo reachable (${comboSummary.lastFailureReason.labelEn})"
+                        }
+                    )
+                }
+            } finally {
+                _comboBusy.value = false
+                _isRacingConnect.value = false
+            }
+        }
+    }
+
+    /**
+     * One-tap Automatic Anti-DPI Connect prioritizing Germany (DE) & Turkey (TR) servers,
+     * automatically using the 4-layer Combo Bypass Engine when subscriber Combo Shield is enabled.
+     */
+    fun connectAutoBypassDeTr(context: Context) {
+        if (_isRacingConnect.value) return
+        val entitled = SubscriptionLifecycleEngine.isEntitled(userSubscription.value, currentTrustedNowMs())
+        if (entitled && VpnController.comboShieldEnabled.value) {
+            rerollOrConnectComboShield(context, forceNextPreset = false)
+            return
+        }
+
+        val candidates = configs.value.ifEmpty {
+            localConfigs.value.map { it.toDomainModel() }
+        }.ifEmpty {
+            com.example.data.model.DefaultVpnConfigs.getDefaultConfigs(currentActorUid())
+        }
+
+        viewModelScope.launch {
+            _isRacingConnect.value = true
+            try {
+                val cleanCandidates = localConfigRepository.getCleanIpPoolOnce()
+                    .filter {
+                        it.isAvailable &&
+                            it.addressType == CleanIpAddressType.IPV4.name &&
+                            it.healthStatus != CleanIpHealthStatus.QUARANTINED.name
+                    }
+                    .sortedBy { if (it.latencyMs > 0) it.latencyMs else Int.MAX_VALUE }
+                    .map { it.host }
+                    .take(10)
+
+                val summary = SmartRacingSelector.raceAutoBypassDeTr(
+                    context = context,
+                    configs = candidates,
+                    cleanIpCandidates = cleanCandidates
+                )
+                _racingSummary.value = summary
+
+                val winner = summary.winner
+                if (winner != null) {
+                    val overrideIp = summary.winnerCleanIp?.takeIf { it.isNotBlank() }
+                    if (overrideIp != null) {
+                        com.example.vpn.engine.DynamicIpDnsRotator.promoteCleanIp(overrideIp, pinForTunnel = true)
+                    } else {
+                        com.example.vpn.engine.DynamicIpDnsRotator.clearPinnedCleanIp()
+                    }
+                    val updatedWinner = winner.copy(pingMs = summary.winnerDelayMs, status = "online")
+                    _selectedVpnConfig.value = updatedWinner
+                    VpnController.startVpn(
+                        context = context,
+                        config = updatedWinner,
+                        antiFilterMode = true,
+                        cleanIpOverride = overrideIp
+                    )
+                    _uiMessage.value = UiMessage.Success(
+                        if (isPersianLanguage.value) {
+                            val viaIp = if (overrideIp != null) " با Clean IP $overrideIp" else ""
+                            "اتصال ضد فیلتر برقرار شد: ${updatedWinner.name}$viaIp (${summary.winnerDelayMs}ms)"
+                        } else {
+                            "Auto-Bypass connected: ${updatedWinner.name} (${summary.winnerDelayMs}ms)"
+                        }
+                    )
+                } else {
+                    _uiMessage.value = UiMessage.Error(
+                        if (isPersianLanguage.value) {
+                            "نودهای آلمان و ترکیه موقتاً در دسترس نبودند؛ لطفاً پایش سلامت مخزن IP تمیز را اجرا کنید"
+                        } else {
+                            "DE/TR nodes unreachable; probe the Clean IP pool and retry"
+                        }
+                    )
+                }
+            } finally {
+                _isRacingConnect.value = false
+            }
+        }
+    }
+
+    fun applyCleanIpToActiveConfig(
+        context: Context,
+        cleanHost: String,
+        connectImmediately: Boolean = false
+    ) {
+        val clean = cleanHost.trim()
+        if (clean.isBlank()) return
+        com.example.vpn.engine.DynamicIpDnsRotator.promoteCleanIp(clean, pinForTunnel = true)
+        val activeTarget = _selectedVpnConfig.value
+            ?: configs.value.firstOrNull { com.example.data.model.DefaultVpnConfigs.isDeOrTrNode(it) }
+            ?: configs.value.firstOrNull()
+            ?: localConfigs.value.firstOrNull()?.toDomainModel()
+        if (activeTarget != null) {
+            _selectedVpnConfig.value = activeTarget
+        }
+        if (connectImmediately && activeTarget != null) {
+            VpnController.startVpn(
+                context = context,
+                config = activeTarget,
+                antiFilterMode = true,
+                cleanIpOverride = clean
+            )
+            _uiMessage.value = UiMessage.Success(
+                if (isPersianLanguage.value) {
+                    "اتصال با Clean IP «$clean» روی ${activeTarget.name} آغاز شد"
+                } else {
+                    "Connecting ${activeTarget.name} via Clean IP $clean"
+                }
+            )
+        } else {
+            _uiMessage.value = UiMessage.Success(
+                if (isPersianLanguage.value) {
+                    "آدرس تمیز $clean روی کانفیگ فعال تنظیم شد (SNI اصلی حفظ می‌شود)"
+                } else {
+                    "Clean host $clean pinned for active tunnel (SNI preserved)"
+                }
+            )
+        }
+    }
+
+    fun userProbeCleanIpPool(filterType: CleanIpAddressType? = null, limit: Int = 50) {
+        if (_isProbingCleanIps.value) return
+        viewModelScope.launch {
+            _isProbingCleanIps.value = true
+            try {
+                val allItems = localConfigRepository.getCleanIpPoolOnce()
+                val targets = allItems
+                    .filter { filterType == null || it.addressType == filterType.name }
+                    .sortedBy { it.lastCheckedAtMs }
+                    .take(limit)
+
+                if (targets.isEmpty()) {
+                    _uiMessage.value = UiMessage.Error(
+                        if (isPersianLanguage.value) "مخزن IPهای تمیز خالی است" else "Clean IP pool is empty"
+                    )
+                    return@launch
+                }
+
+                val semaphore = Semaphore(10)
+                val probeResults = coroutineScope {
+                    targets.map { entity ->
+                        async(Dispatchers.IO) {
+                            semaphore.withPermit {
+                                val res = RealPingEngine.ping(entity.host, entity.defaultPort, 2200)
+                                localConfigRepository.recordCleanIpHealth(
+                                    host = entity.host,
+                                    isReachable = res.isReachable,
+                                    latencyMs = res.latencyMs
+                                )
+                                entity.host to res
+                            }
+                        }
+                    }.awaitAll()
+                }
+
+                val healthyCount = probeResults.count { it.second.isReachable }
+                val healthyHosts = probeResults
+                    .filter { it.second.isReachable }
+                    .sortedBy { it.second.latencyMs }
+                    .map { it.first }
+                if (healthyHosts.isNotEmpty()) {
+                    com.example.vpn.engine.DynamicIpDnsRotator.seedCandidateIps(healthyHosts)
+                }
+
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) {
+                        "تست ${probeResults.size} آدرس از مخزن انجام شد: $healthyCount آی‌پی سالم و پرسرعت"
+                    } else {
+                        "Probed ${probeResults.size} pool entries: $healthyCount healthy on TCP/443"
+                    }
+                )
+            } finally {
+                _isProbingCleanIps.value = false
+            }
+        }
+    }
+
+    fun importBulkCleanIps(rawText: String) {
+        val text = rawText.trim()
+        if (text.isBlank()) return
+        viewModelScope.launch {
+            val inserted = localConfigRepository.importBulkCleanIps(
+                rawText = text,
+                sourceTag = if (isCurrentUserAdmin()) "ADMIN_BULK" else "USER_BULK"
+            )
+            _uiMessage.value = if (inserted > 0) {
+                UiMessage.Success(
+                    if (isPersianLanguage.value) {
+                        "$inserted آدرس جدید (شامل IP / رنج CIDR / دامنه) به مخزن IP تمیز اضافه شد"
+                    } else {
+                        "Added $inserted clean hosts to pool"
+                    }
+                )
+            } else {
+                UiMessage.Error(
+                    if (isPersianLanguage.value) {
+                        "آدرس جدیدی اضافه نشد (فرمت نامعتبر یا تکراری)"
+                    } else {
+                        "No new valid hosts inserted"
+                    }
+                )
+            }
+        }
+    }
+
+    fun addIpOnlyEndpoints(rawText: String) {
+        val text = rawText.trim()
+        if (text.isBlank()) return
+        viewModelScope.launch {
+            _subscriptionBusy.value = true
+            try {
+                val (cleanAdded, endpointsAdded) = localConfigRepository.addIpOnlyEndpoints(
+                    rawText = text,
+                    sourceTag = if (isCurrentUserAdmin()) "ADMIN_IP_ONLY" else "USER_IP_ONLY"
+                )
+                if (cleanAdded > 0 || endpointsAdded > 0) {
+                    _uiMessage.value = UiMessage.Success(
+                        if (isPersianLanguage.value) {
+                            "$cleanAdded آی‌پی تمیز و $endpointsAdded نود اختصاصی بدون نیاز به پورت ثبت شد"
+                        } else {
+                            "Registered $cleanAdded clean IPs and $endpointsAdded dedicated endpoints"
+                        }
+                    )
+                } else {
+                    _uiMessage.value = UiMessage.Error(
+                        if (isPersianLanguage.value) {
+                            "آدرس IP معتبری یافت نشد (فرمت مجاز: IPv4، IPv6 یا رنج /24)"
+                        } else {
+                            "No valid IP addresses found"
+                        }
+                    )
+                }
+            } finally {
+                _subscriptionBusy.value = false
+            }
+        }
+    }
+
+    fun handleActivationDeepLink(rawInput: String) {
+        val payload = com.example.data.subscription.SubscriptionActivationLinkEngine.parseActivationUrl(rawInput)
+        if (payload == null) {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) {
+                    "لینک یا کد فعال‌سازی نامعتبر است (فرمت معتبر: tmsvpn://activate?...)"
+                } else {
+                    "Invalid activation link (expected tmsvpn://activate?...)"
+                }
+            )
+            return
+        }
+
+        val plan = SubscriptionPlanId.fromId(payload.planId)
+        val actorUid = currentActorUid()
+        val actorEmail = currentActorEmail()
+
+        // Admin opening an activation QR/Link directly activates for the specified target user (or self)
+        if (isCurrentUserAdmin()) {
+            val targetUid = payload.targetUserId?.takeIf { it.isNotBlank() } ?: actorUid
+            val targetUser = registeredUsers.value.firstOrNull { it.userId == targetUid }
+            adminActivateUserSubscription(
+                targetUserId = targetUid,
+                targetUserEmail = targetUser?.email ?: actorEmail,
+                plan = plan,
+                paymentRequestId = null
+            )
+            return
+        }
+
+        // User opening/pasting an Admin-issued activation link (tmsvpn://activate?plan=...&ref=TMS-...&actor=...)
+        val matchesUser = payload.targetUserId.isNullOrBlank() || payload.targetUserId == actorUid
+        val hasAdminToken = !payload.actorId.isNullOrBlank() &&
+            payload.referenceCode?.startsWith("TMS-", ignoreCase = true) == true
+
+        if (!matchesUser) {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) {
+                    "این لینک فعال‌سازی برای شناسه کاربری دیگری صادر شده است"
+                } else {
+                    "This activation link belongs to a different user account"
+                }
+            )
+            return
+        }
+
+        if (hasAdminToken) {
+            viewModelScope.launch {
+                _subscriptionBusy.value = true
+                try {
+                    val now = currentTrustedNowMs()
+                    val (activated, event) = SubscriptionLifecycleEngine.activateAfterPaymentConfirmation(
+                        subscriptionId = userSubscription.value?.subscriptionId ?: "sub_$actorUid",
+                        userId = actorUid,
+                        userEmail = actorEmail,
+                        plan = plan,
+                        actorId = payload.actorId ?: "admin_link",
+                        trustedServerNowMs = now,
+                        existingSubscription = userSubscription.value
+                    )
+                    localConfigRepository.cacheSubscription(activated, now)
+                    localConfigRepository.cacheSubscriptionHistory(listOf(event))
+                    localConfigRepository.syncRegisteredUserSubscriptionStatus(actorUid, "active")
+                    val allocBatch = localConfigRepository.executeLocalAllocationOrRotation(
+                        targetSubscriptions = listOf(activated),
+                        activeConnectedEndpointByUser = emptyMap(),
+                        actorUid = payload.actorId ?: "admin_link",
+                        triggerMode = "DEEP_LINK",
+                        nowMs = now,
+                        forceManual = true
+                    )
+                    val count = allocBatch.allocationsByUser[actorUid]?.size ?: 0
+                    _uiMessage.value = UiMessage.Success(
+                        if (isPersianLanguage.value) {
+                            "اشتراک ${plan.titleFa} با لینک فعال‌سازی شد ($count IP اختصاصی)"
+                        } else {
+                            "${plan.titleEn} activated via link ($count dedicated IPs)"
+                        }
+                    )
+                } finally {
+                    _subscriptionBusy.value = false
+                }
+            }
+        } else {
+            submitSubscriptionRequest(
+                plan = plan,
+                actionType = "NEW",
+                referenceCode = payload.referenceCode ?: "LINK-${System.currentTimeMillis() % 10000}",
+                note = "Submitted via tmsvpn://activate deep link"
+            )
+        }
+    }
+
     fun runIspAutoTune(context: Context) {
         if (_isTuningIsp.value) return
         viewModelScope.launch {
             _isTuningIsp.value = true
             try {
-                val report = IspAutoTuner.benchmarkAndTuneForCurrentIsp(context)
+                val roomIpv4Candidates = localConfigRepository.getCleanIpPoolOnce()
+                    .filter {
+                        it.isAvailable &&
+                            it.addressType == CleanIpAddressType.IPV4.name &&
+                            it.healthStatus != CleanIpHealthStatus.QUARANTINED.name
+                    }
+                    .take(25)
+                    .map { it.host }
+                val mergedCandidates = (IspAutoTuner.CANDIDATE_CLEAN_IPS + roomIpv4Candidates).distinct()
+                val report = IspAutoTuner.benchmarkAndTuneForCurrentIsp(context, candidateIps = mergedCandidates)
                 if (report.bestCleanIp.isNotBlank() && report.bestCleanIpLatencyMs > 0) {
+                    localConfigRepository.recordCleanIpHealth(
+                        host = report.bestCleanIp,
+                        isReachable = true,
+                        latencyMs = report.bestCleanIpLatencyMs.toInt()
+                    )
                     _uiMessage.value = UiMessage.Success(
                         if (isPersianLanguage.value) {
                             "بهینه‌سازی ${report.transportLabel}: Clean IP ${report.bestCleanIp} (${report.bestCleanIpLatencyMs}ms) • فرگمنت ${report.fragmentProfile.length}"
@@ -916,7 +2044,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
 
     fun importSubscriptionUrl(url: String) {
         if (_isSubscriptionImporting.value) return
-        val uid = Firebase.auth.currentUser?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
+        val uid = safeFirebaseUser()?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
         viewModelScope.launch {
             _isSubscriptionImporting.value = true
             try {
@@ -944,7 +2072,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                         continue
                     }
                     localConfigRepository.saveConfig(cfg)
-                    if (Firebase.auth.currentUser != null) {
+                    if (safeFirebaseUser() != null) {
                         try {
                             repository.addConfig(cfg)
                         } catch (_: Exception) {}
@@ -996,7 +2124,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     fun provisionFromUbuntuNode(baseUrl: String, apiToken: String, quotaGb: Int = 100) {
         if (!checkPermission(AdminPermission.MANAGE_SERVERS, "تولید کانفیگ اختصاصی از نود Ubuntu")) return
         if (_nodeControlLoading.value) return
-        val user = Firebase.auth.currentUser
+        val user = safeFirebaseUser()
         val uid = user?.uid ?: "local_user"
         val email = user?.email ?: "$uid@tmsvpn.local"
 
@@ -1026,7 +2154,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     // --- CONFIG MANAGEMENT ---
 
     fun importBatchConfigs(rawBatchText: String) {
-        val uid = Firebase.auth.currentUser?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
+        val uid = safeFirebaseUser()?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
         val parseResults = VpnConfigParser.parseMultiple(rawBatchText, uid)
 
         var addedCount = 0
@@ -1059,7 +2187,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 try {
                     localConfigRepository.saveConfig(cfg)
-                    if (Firebase.auth.currentUser != null) {
+                    if (safeFirebaseUser() != null) {
                         try {
                             repository.addConfig(cfg)
                         } catch (_: Exception) {}
@@ -1074,7 +2202,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             val msgEn = "Imported $addedCount configs ($duplicateCount duplicates, $invalidCount invalid)"
             _uiMessage.value = UiMessage.Success(if (isPersianLanguage.value) msgFa else msgEn)
 
-            if (Firebase.auth.currentUser != null) {
+            if (safeFirebaseUser() != null) {
                 try {
                     repository.addAuditLog(
                         AuthAuditLog(
@@ -1093,7 +2221,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun importConfig(rawUri: String) {
-        val uid = Firebase.auth.currentUser?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
+        val uid = safeFirebaseUser()?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
         val parseResult = VpnConfigParser.parse(rawUri, uid)
         if (!parseResult.isSuccess || parseResult.config == null) {
             val err = parseResult.errorMessage ?: "خطا در تجزیه ساختار کانفیگ"
@@ -1125,7 +2253,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             try {
                 localConfigRepository.saveConfig(newConfig)
-                if (Firebase.auth.currentUser != null) {
+                if (safeFirebaseUser() != null) {
                     try {
                         repository.addConfig(newConfig)
                     } catch (e: Exception) {
@@ -1138,7 +2266,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                     if (isPersianLanguage.value) "کانفیگ ${newConfig.name} با موفقیت افزوده شد" else "Config added: ${newConfig.name}"
                 )
 
-                if (Firebase.auth.currentUser != null) {
+                if (safeFirebaseUser() != null) {
                     try {
                         repository.addAuditLog(
                             AuthAuditLog(
@@ -1170,7 +2298,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         transport: String = "tcp",
         sni: String = ""
     ) {
-        val uid = Firebase.auth.currentUser?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
+        val uid = safeFirebaseUser()?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
         val trimmedServer = server.trim()
         if (trimmedServer.isBlank()) {
             _uiMessage.value = UiMessage.Error("آدرس سرور نمی‌تواند خالی باشد / Server address is required")
@@ -1197,7 +2325,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             try {
                 localConfigRepository.saveConfig(config)
-                if (Firebase.auth.currentUser != null) {
+                if (safeFirebaseUser() != null) {
                     try {
                         repository.addConfig(config)
                     } catch (_: Exception) {}
@@ -1279,7 +2407,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
 
                                 try {
                                     localConfigRepository.updatePingStatus(cfg.id, measuredMs, status)
-                                    if (Firebase.auth.currentUser != null) {
+                                    if (safeFirebaseUser() != null) {
                                         repository.updateConfigPing(cfg.id, measuredMs, status)
                                     }
                                 } catch (e: CancellationException) {
@@ -1311,7 +2439,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             _liveLatenciesMs.update { it + (config.id to result.latencyMs) }
             try {
                 localConfigRepository.updatePingStatus(config.id, result.latencyMs, newStatus)
-                if (Firebase.auth.currentUser != null) {
+                if (safeFirebaseUser() != null) {
                     repository.updateConfigPing(config.id, result.latencyMs, newStatus)
                 }
                 if (result.isReachable) {
@@ -1329,30 +2457,165 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun deleteConfig(configId: String) {
-        if (!checkPermission(AdminPermission.MANAGE_CONFIGS, "حذف کانفیگ VPN")) return
+    // --- BULK CONFIG SELECTION & SAFE TOMBSTONE DELETION ---
 
-        val user = Firebase.auth.currentUser ?: return
+    fun toggleConfigSelection(configId: String) {
+        if (configId.isBlank()) return
+        _selectedConfigIds.update { current ->
+            if (configId in current) current - configId else current + configId
+        }
+    }
+
+    fun selectAllConfigs(visibleIds: List<String>) {
+        _selectedConfigIds.value = visibleIds.filter { it.isNotBlank() }.toSet()
+    }
+
+    fun deselectAllConfigs() {
+        _selectedConfigIds.value = emptySet()
+    }
+
+    private fun buildDeletionContext(): ConfigDeletionContext {
+        val activeState = vpnConnectionState.value
+        val activeTunnelId = if (
+            activeState == VpnConnectionState.CONNECTED ||
+            activeState == VpnConnectionState.CONNECTING
+        ) {
+            _selectedVpnConfig.value?.id ?: VpnController.activeConfig?.id
+        } else {
+            null
+        }
+        return ConfigDeletionContext(
+            actorUserId = currentActorUid(),
+            isAdminActor = isCurrentUserAdmin(),
+            hasAdminManageConfigsPermission = currentRole.value.hasPermission(AdminPermission.MANAGE_CONFIGS),
+            activeTunnelConfigId = activeTunnelId
+        )
+    }
+
+    fun previewBulkDeletion(targetIds: Set<String> = _selectedConfigIds.value): BulkDeletionPlan {
+        return ConfigDeletionPolicy.planBulkDeletion(
+            allConfigs = configs.value,
+            targetIds = targetIds,
+            context = buildDeletionContext()
+        )
+    }
+
+    fun deleteConfig(configId: String) {
+        val target = configs.value.firstOrNull { it.id == configId }
+        if (target == null) {
+            // Fallback offline/legacy removal by ID
+            viewModelScope.launch {
+                val uid = currentActorUid()
+                _tombstonedConfigIds.update { it + configId }
+                localConfigRepository.deleteWithTombstone(configId, uid, pendingRemoteDelete = true)
+                if (safeFirebaseUser() != null) {
+                    try {
+                        repository.deleteConfig(configId)
+                        localConfigRepository.markRemoteDeletesSynced(listOf(configId))
+                    } catch (_: Exception) {}
+                }
+            }
+            return
+        }
+        executeBulkDeletionPlan(setOf(configId))
+    }
+
+    fun deleteSelectedConfigs(targetIds: Set<String> = _selectedConfigIds.value) {
+        if (targetIds.isEmpty()) return
+        executeBulkDeletionPlan(targetIds)
+    }
+
+    fun deleteAllPermittedConfigs(visibleConfigs: List<VpnConfig> = configs.value) {
+        val ids = visibleConfigs.map { it.id }.filter { it.isNotBlank() }.toSet()
+        if (ids.isEmpty()) return
+        executeBulkDeletionPlan(ids)
+    }
+
+    private fun executeBulkDeletionPlan(targetIds: Set<String>) {
+        val plan = previewBulkDeletion(targetIds)
+        val deletableIds = plan.deletableIds
+        if (deletableIds.isEmpty()) {
+            val msg = if (plan.blockedSystemConfigs.isNotEmpty()) {
+                if (isPersianLanguage.value) {
+                    "کانفیگ‌های سیستمی محافظت‌شده هستند و قابل حذف نیستند (${plan.blockedSystemConfigs.size} مورد)"
+                } else {
+                    "System-managed configurations are protected (${plan.blockedSystemConfigs.size})"
+                }
+            } else if (plan.blockedSubscriptionConfigs.isNotEmpty()) {
+                if (isPersianLanguage.value) {
+                    "کانفیگ‌های اختصاصی اشتراک فقط توسط مدیر یا چرخش سرور قابل مدیریت هستند"
+                } else {
+                    "Subscription-assigned endpoints require administrator or rotation action"
+                }
+            } else {
+                if (isPersianLanguage.value) "شما مجوز حذف موارد انتخابی را ندارید" else "No permitted configurations to delete"
+            }
+            _uiMessage.value = UiMessage.Error(msg)
+            return
+        }
+
+        val uid = currentActorUid()
+        val deletingSelectedTunnel = _selectedVpnConfig.value?.id in deletableIds
+
         viewModelScope.launch {
             try {
-                localConfigRepository.deleteById(configId)
-                repository.deleteConfig(configId)
-                repository.addAuditLog(
-                    AuthAuditLog(
-                        userId = user.uid,
-                        action = "CONFIG_DELETED",
-                        role = currentRole.value.id,
-                        module = "ConfigurationManagement",
-                        status = "SUCCESS",
-                        ipOrDevice = getDeviceInfo(),
-                        details = "کانفیگ با شناسه $configId حذف شد"
-                    )
+                // Immediate UI + Tombstone persistence (works identically online & offline)
+                _tombstonedConfigIds.update { it + deletableIds }
+                _selectedConfigIds.update { it - deletableIds.toSet() }
+
+                if (deletingSelectedTunnel) {
+                    if (vpnConnectionState.value == VpnConnectionState.CONNECTED ||
+                        vpnConnectionState.value == VpnConnectionState.CONNECTING
+                    ) {
+                        VpnController.stopVpn(getApplication())
+                    }
+                    _selectedVpnConfig.value = configs.value.firstOrNull { it.id !in deletableIds }
+                }
+
+                localConfigRepository.deleteBatchWithTombstones(
+                    configIds = deletableIds,
+                    userId = uid,
+                    pendingRemoteDelete = true
                 )
-                _uiMessage.value = UiMessage.Success("کانفیگ با موفقیت حذف شد / Config deleted")
+
+                var remoteSynced = false
+                if (safeFirebaseUser() != null) {
+                    val remoteResult = repository.deleteConfigsBatch(deletableIds)
+                    if (remoteResult.isSuccess) {
+                        localConfigRepository.markRemoteDeletesSynced(deletableIds)
+                        remoteSynced = true
+                    }
+                    try {
+                        repository.addAuditLog(
+                            AuthAuditLog(
+                                userId = safeFirebaseUser()?.uid ?: uid,
+                                action = if (deletableIds.size == 1) "CONFIG_DELETED" else "BULK_CONFIG_DELETED",
+                                role = currentRole.value.id,
+                                module = "ConfigurationManagement",
+                                status = "SUCCESS",
+                                ipOrDevice = getDeviceInfo(),
+                                details = "حذف ${deletableIds.size} کانفیگ (محافظت‌شده رد شده: ${plan.blockedCount}، همگام‌سازی ابری: $remoteSynced)"
+                            )
+                        )
+                    } catch (_: Exception) {}
+                }
+
+                val skippedSuffix = if (plan.blockedCount > 0) {
+                    if (isPersianLanguage.value) " • ${plan.blockedCount} مورد سیستمی/اشتراکی محافظت شد"
+                    else " • ${plan.blockedCount} protected kept"
+                } else ""
+
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) {
+                        "${deletableIds.size} کانفیگ حذف شد$skippedSuffix"
+                    } else {
+                        "Deleted ${deletableIds.size} configuration(s)$skippedSuffix"
+                    }
+                )
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                _uiMessage.value = UiMessage.Error("خطا در حذف کانفیگ: ${e.localizedMessage}")
+                _uiMessage.value = UiMessage.Error("خطا در حذف کانفیگ‌ها: ${e.localizedMessage}")
             }
         }
     }
@@ -1361,13 +2624,754 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             try {
                 localConfigRepository.updateFavorite(config.id, !config.isFavorite)
-                if (Firebase.auth.currentUser != null) {
+                if (safeFirebaseUser() != null) {
                     repository.updateConfig(config.copy(isFavorite = !config.isFavorite))
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Failed toggling favorite", e)
+            }
+        }
+    }
+
+    // --- USER SUBSCRIPTION REQUESTS & ALLOCATED CONNECTIONS ---
+
+    fun submitSubscriptionRequest(
+        plan: SubscriptionPlanId,
+        actionType: String,
+        referenceCode: String,
+        note: String
+    ) {
+        val uid = currentActorUid()
+        val email = currentActorEmail()
+        if (uid == "local_user" && email.isBlank()) {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) {
+                    "لطفاً ابتدا با ایمیل و رمز عبور وارد شوید."
+                } else {
+                    "Please sign in with your email and password first."
+                }
+            )
+            return
+        }
+
+        viewModelScope.launch {
+            _subscriptionBusy.value = true
+            try {
+                val nowMs = currentTrustedNowMs()
+                val subId = userSubscription.value?.subscriptionId ?: "sub_$uid"
+                val payId = "pay_${uid}_$nowMs"
+                val record = PaymentRequestRecord(
+                    paymentId = payId,
+                    userId = uid,
+                    userEmail = email,
+                    subscriptionId = subId,
+                    planId = plan.id,
+                    actionType = actionType,
+                    provider = "MANUAL_ADMIN",
+                    referenceCode = referenceCode.trim(),
+                    status = "PENDING_PAYMENT",
+                    note = note.trim(),
+                    createdAt = SubscriptionLifecycleEngine.timestampOf(nowMs)
+                )
+                localConfigRepository.saveLocalPaymentRequest(record)
+                if (userSubscription.value == null) {
+                    val pendingSub = UserSubscription(
+                        subscriptionId = subId,
+                        userId = uid,
+                        userEmail = email,
+                        planId = plan.id,
+                        planDurationDays = plan.durationDays,
+                        endpointAllocationLimit = plan.dailyAllocationLimit,
+                        status = SubscriptionStatus.PENDING_PAYMENT.name,
+                        paymentStatus = PaymentStatus.UNPAID.name,
+                        createdAt = SubscriptionLifecycleEngine.timestampOf(nowMs),
+                        updatedAt = SubscriptionLifecycleEngine.timestampOf(nowMs)
+                    )
+                    localConfigRepository.cacheSubscription(pendingSub, nowMs)
+                    localConfigRepository.syncRegisteredUserSubscriptionStatus(uid, "pending")
+                }
+
+                if (safeFirebaseUser() != null) {
+                    subscriptionRepository.submitPaymentRequest(
+                        plan = plan,
+                        actionType = actionType,
+                        subscriptionId = subId,
+                        referenceCode = referenceCode,
+                        note = note,
+                        userEmail = email
+                    )
+                }
+
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) {
+                        "درخواست اشتراک «${plan.titleFa}» ثبت شد و در انتظار تایید مدیریت است."
+                    } else {
+                        "Subscription request '${plan.titleEn}' submitted as PENDING_PAYMENT."
+                    }
+                )
+            } catch (e: Exception) {
+                _uiMessage.value = UiMessage.Error(e.localizedMessage ?: "خطا در ثبت درخواست")
+            } finally {
+                _subscriptionBusy.value = false
+            }
+        }
+    }
+
+    fun connectAllocatedEndpoint(context: Context, record: AllocatedEndpointRecord) {
+        val cfg = record.toVpnConfig()
+        selectConfigForVpn(cfg)
+        connectVpn(context, cfg, antiFilterMode = true)
+    }
+
+    // --- ADMIN SUBSCRIPTION, INVENTORY & DAILY ROTATION OPERATIONS ---
+
+    fun toggleRotationUserSelection(userId: String) {
+        _selectedRotationUserIds.update { current ->
+            if (userId in current) current - userId else current + userId
+        }
+    }
+
+    fun selectAllRotationUsers(userIds: List<String>) {
+        _selectedRotationUserIds.value = userIds.toSet()
+    }
+
+    fun clearRotationUserSelection() {
+        _selectedRotationUserIds.value = emptySet()
+    }
+
+    fun adminActivateUserSubscription(
+        targetUserId: String,
+        targetUserEmail: String,
+        plan: SubscriptionPlanId,
+        paymentRequestId: String? = null
+    ) {
+        if (!checkPermission(AdminPermission.MANAGE_USERS, "فعال‌سازی اشتراک کاربر")) return
+        viewModelScope.launch {
+            _subscriptionBusy.value = true
+            try {
+                val now = if (safeFirebaseUser() != null) {
+                    subscriptionRepository.fetchTrustedServerEpochMs(currentTrustedNowMs())
+                } else {
+                    currentTrustedNowMs()
+                }
+                updateTrustedServerAnchor(now)
+                val actorUid = currentActorUid()
+                val cleanUid = targetUserId.trim()
+                val existingSub = allSubscriptionsAdmin.value.firstOrNull {
+                    it.userId == cleanUid ||
+                        (targetUserEmail.isNotBlank() && it.userEmail.equals(targetUserEmail.trim(), ignoreCase = true))
+                }
+                val resolvedEmail = targetUserEmail.trim().ifBlank { existingSub?.userEmail.orEmpty() }
+
+                val (activated, event) = SubscriptionLifecycleEngine.activateAfterPaymentConfirmation(
+                    subscriptionId = existingSub?.subscriptionId ?: "sub_$cleanUid",
+                    userId = cleanUid,
+                    userEmail = resolvedEmail,
+                    plan = plan,
+                    actorId = actorUid,
+                    trustedServerNowMs = now,
+                    existingSubscription = existingSub
+                )
+
+                localConfigRepository.upsertRegisteredUser(
+                    RegisteredUserEntity(
+                        userId = cleanUid,
+                        displayName = resolvedEmail.substringBefore("@").ifBlank { cleanUid },
+                        email = resolvedEmail.ifBlank { "$cleanUid@tmsvpn.local" },
+                        role = "USER",
+                        maxDevices = 10,
+                        dataLimitBytes = 500.0 * 1024 * 1024 * 1024,
+                        subscriptionStatus = "active",
+                        updatedAtMs = now
+                    )
+                )
+                localConfigRepository.cacheSubscription(activated, now)
+                localConfigRepository.cacheSubscriptionHistory(listOf(event))
+                if (!paymentRequestId.isNullOrBlank()) {
+                    localConfigRepository.markLocalPaymentStatus(
+                        paymentId = paymentRequestId,
+                        status = "CONFIRMED",
+                        verifiedBy = actorUid,
+                        note = "Verified & activated ${plan.titleEn}",
+                        verifiedAtMs = now
+                    )
+                }
+
+                val localBatch = localConfigRepository.executeLocalAllocationOrRotation(
+                    targetSubscriptions = listOf(activated),
+                    activeConnectedEndpointByUser = emptyMap(),
+                    actorUid = actorUid,
+                    triggerMode = "MANUAL_SINGLE",
+                    nowMs = now,
+                    forceManual = true
+                )
+
+                if (safeFirebaseUser() != null) {
+                    subscriptionRepository.adminActivateSubscription(
+                        targetUserId = cleanUid,
+                        targetUserEmail = resolvedEmail,
+                        plan = plan,
+                        paymentRequestId = paymentRequestId,
+                        trustedNowMs = now
+                    ).onSuccess { remoteActivated ->
+                        subscriptionRepository.executeRotationTransaction(
+                            targetSubscriptions = listOf(remoteActivated),
+                            activeEndpointByUser = emptyMap(),
+                            triggerMode = "MANUAL_SINGLE",
+                            trustedNowMs = now,
+                            forceManual = true
+                        )
+                    }
+                }
+
+                val allocCount = localBatch.allocationsByUser[cleanUid]?.size ?: 0
+                val shortageCount = localBatch.shortageAlerts.size
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) {
+                        "اشتراک ${plan.titleFa} فعال و $allocCount IP اختصاصی تخصیص یافت" +
+                            if (shortageCount > 0) " (کمبود ظرفیت گزارش شد)" else ""
+                    } else {
+                        "Activated ${plan.titleEn}; allocated $allocCount endpoints"
+                    }
+                )
+            } catch (e: Exception) {
+                _uiMessage.value = UiMessage.Error(e.localizedMessage ?: "خطا در فعال‌سازی اشتراک")
+            } finally {
+                _subscriptionBusy.value = false
+            }
+        }
+    }
+
+    fun adminRejectPayment(paymentId: String, reason: String) {
+        if (!checkPermission(AdminPermission.MANAGE_USERS, "رد درخواست پرداخت")) return
+        viewModelScope.launch {
+            _subscriptionBusy.value = true
+            try {
+                val actorUid = currentActorUid()
+                val note = reason.ifBlank { "Rejected by administrator" }
+                localConfigRepository.markLocalPaymentStatus(
+                    paymentId = paymentId,
+                    status = "REJECTED",
+                    verifiedBy = actorUid,
+                    note = note
+                )
+                if (safeFirebaseUser() != null) {
+                    subscriptionRepository.adminRejectPaymentRequest(paymentId, note)
+                }
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) "درخواست پرداخت رد شد" else "Payment request rejected"
+                )
+            } catch (e: Exception) {
+                _uiMessage.value = UiMessage.Error(e.localizedMessage ?: "خطا")
+            } finally {
+                _subscriptionBusy.value = false
+            }
+        }
+    }
+
+    fun adminRenewUserSubscription(subscription: UserSubscription, plan: SubscriptionPlanId = subscription.planEnum()) {
+        if (!checkPermission(AdminPermission.MANAGE_USERS, "تمدید اشتراک")) return
+        viewModelScope.launch {
+            _subscriptionBusy.value = true
+            try {
+                val now = if (safeFirebaseUser() != null) {
+                    subscriptionRepository.fetchTrustedServerEpochMs(currentTrustedNowMs())
+                } else {
+                    currentTrustedNowMs()
+                }
+                updateTrustedServerAnchor(now)
+                val actorUid = currentActorUid()
+                val (renewed, event) = SubscriptionLifecycleEngine.renew(
+                    existing = subscription,
+                    plan = plan,
+                    actorId = actorUid,
+                    trustedServerNowMs = now
+                )
+                localConfigRepository.cacheSubscription(renewed, now)
+                localConfigRepository.cacheSubscriptionHistory(listOf(event))
+                localConfigRepository.syncRegisteredUserSubscriptionStatus(renewed.userId, "active")
+                localConfigRepository.executeLocalAllocationOrRotation(
+                    targetSubscriptions = listOf(renewed),
+                    activeConnectedEndpointByUser = emptyMap(),
+                    actorUid = actorUid,
+                    triggerMode = "MANUAL_SINGLE",
+                    nowMs = now,
+                    forceManual = false
+                )
+                if (safeFirebaseUser() != null) {
+                    subscriptionRepository.adminRenewSubscription(subscription, plan, now)
+                }
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) "اشتراک به مدت ${plan.durationDays} روز تمدید شد" else "Subscription renewed (+${plan.durationDays}d)"
+                )
+            } catch (e: Exception) {
+                _uiMessage.value = UiMessage.Error(e.localizedMessage ?: "خطا در تمدید")
+            } finally {
+                _subscriptionBusy.value = false
+            }
+        }
+    }
+
+    fun adminChangeUserPlan(subscription: UserSubscription, newPlan: SubscriptionPlanId) {
+        if (!checkPermission(AdminPermission.MANAGE_USERS, "تغییر پلن اشتراک")) return
+        viewModelScope.launch {
+            _subscriptionBusy.value = true
+            try {
+                val now = if (safeFirebaseUser() != null) {
+                    subscriptionRepository.fetchTrustedServerEpochMs(currentTrustedNowMs())
+                } else {
+                    currentTrustedNowMs()
+                }
+                updateTrustedServerAnchor(now)
+                val actorUid = currentActorUid()
+                val (updated, event) = SubscriptionLifecycleEngine.changePlan(
+                    existing = subscription,
+                    newPlan = newPlan,
+                    actorId = actorUid,
+                    trustedServerNowMs = now
+                )
+                localConfigRepository.cacheSubscription(updated, now)
+                localConfigRepository.cacheSubscriptionHistory(listOf(event))
+                localConfigRepository.executeLocalAllocationOrRotation(
+                    targetSubscriptions = listOf(updated),
+                    activeConnectedEndpointByUser = mapOf(updated.userId to _selectedVpnConfig.value?.endpointId),
+                    actorUid = actorUid,
+                    triggerMode = "MANUAL_SINGLE",
+                    nowMs = now,
+                    forceManual = true
+                )
+                if (safeFirebaseUser() != null) {
+                    subscriptionRepository.adminChangePlan(subscription, newPlan, now).onSuccess { remoteUpdated ->
+                        subscriptionRepository.executeRotationTransaction(
+                            targetSubscriptions = listOf(remoteUpdated),
+                            activeEndpointByUser = mapOf(remoteUpdated.userId to _selectedVpnConfig.value?.endpointId),
+                            triggerMode = "MANUAL_SINGLE",
+                            trustedNowMs = now,
+                            forceManual = true
+                        )
+                    }
+                }
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) "پلن به ${newPlan.titleFa} تغییر یافت و سهمیه IP تنظیم شد" else "Plan changed to ${newPlan.titleEn}"
+                )
+            } catch (e: Exception) {
+                _uiMessage.value = UiMessage.Error(e.localizedMessage ?: "خطا در تغییر پلن")
+            } finally {
+                _subscriptionBusy.value = false
+            }
+        }
+    }
+
+    fun adminUpdateSubscriptionStatus(subscription: UserSubscription, newStatus: SubscriptionStatus, reason: String) {
+        if (!checkPermission(AdminPermission.MANAGE_USERS, "تغییر وضعیت اشتراک")) return
+        viewModelScope.launch {
+            _subscriptionBusy.value = true
+            try {
+                val now = if (safeFirebaseUser() != null) {
+                    subscriptionRepository.fetchTrustedServerEpochMs(currentTrustedNowMs())
+                } else {
+                    currentTrustedNowMs()
+                }
+                updateTrustedServerAnchor(now)
+                val actorUid = currentActorUid()
+                val (updated, event) = SubscriptionLifecycleEngine.updateStatus(
+                    existing = subscription,
+                    newStatus = newStatus,
+                    actorId = actorUid,
+                    reason = reason,
+                    trustedServerNowMs = now
+                )
+                localConfigRepository.cacheSubscription(updated, now)
+                localConfigRepository.cacheSubscriptionHistory(listOf(event))
+                localConfigRepository.syncRegisteredUserSubscriptionStatus(updated.userId, newStatus.name.lowercase())
+                localConfigRepository.executeLocalAllocationOrRotation(
+                    targetSubscriptions = listOf(updated),
+                    activeConnectedEndpointByUser = emptyMap(),
+                    actorUid = actorUid,
+                    triggerMode = if (newStatus == SubscriptionStatus.ACTIVE) "MANUAL_SINGLE" else "STATUS_REVOCATION",
+                    nowMs = now,
+                    forceManual = true
+                )
+                if (safeFirebaseUser() != null) {
+                    subscriptionRepository.adminSetSubscriptionStatus(subscription, newStatus, reason, now).onSuccess { remoteUpdated ->
+                        if (newStatus != SubscriptionStatus.ACTIVE) {
+                            subscriptionRepository.executeRotationTransaction(
+                                targetSubscriptions = listOf(remoteUpdated),
+                                activeEndpointByUser = emptyMap(),
+                                triggerMode = "STATUS_REVOCATION",
+                                trustedNowMs = now,
+                                forceManual = true
+                            )
+                        }
+                    }
+                }
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) "وضعیت اشتراک به ${newStatus.titleFa} تغییر یافت" else "Status updated to ${newStatus.name}"
+                )
+            } catch (e: Exception) {
+                _uiMessage.value = UiMessage.Error(e.localizedMessage ?: "خطا")
+            } finally {
+                _subscriptionBusy.value = false
+            }
+        }
+    }
+
+    fun adminUpsertManagedEndpoint(endpoint: ManagedEndpoint) {
+        if (!checkPermission(AdminPermission.MANAGE_SERVERS, "مدیریت استخر IP اختصاصی")) return
+        viewModelScope.launch {
+            _subscriptionBusy.value = true
+            try {
+                localConfigRepository.upsertLocalManagedEndpoint(endpoint)
+                if (safeFirebaseUser() != null) {
+                    subscriptionRepository.adminUpsertEndpoint(endpoint)
+                }
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) "نود ${endpoint.name} در مخزن مرکزی ثبت شد" else "Endpoint saved to central pool"
+                )
+            } catch (e: Exception) {
+                _uiMessage.value = UiMessage.Error(e.localizedMessage ?: "خطا در ثبت نود")
+            } finally {
+                _subscriptionBusy.value = false
+            }
+        }
+    }
+
+    fun adminImportInventoryFromCurrentNodes() {
+        if (!checkPermission(AdminPermission.MANAGE_SERVERS, "واردسازی نودهای سالم به استخر اختصاصی")) return
+        val sourceServers = servers.value
+        val sourceConfigs = configs.value
+        if (sourceServers.isEmpty() && sourceConfigs.isEmpty()) {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) "هیچ نود یا کانفیگ فعالی برای همگام‌سازی یافت نشد" else "No existing nodes to import"
+            )
+            return
+        }
+        viewModelScope.launch {
+            _subscriptionBusy.value = true
+            try {
+                var imported = 0
+                sourceServers.filter { it.status == "online" }.forEachIndexed { idx, srv ->
+                    val ep = ManagedEndpoint(
+                        endpointId = "inv_srv_${srv.id.ifBlank { idx.toString() }}",
+                        name = srv.name,
+                        country = srv.country,
+                        countryCode = srv.countryCode,
+                        host = srv.host,
+                        port = srv.port,
+                        protocol = when {
+                            srv.protocol.contains("vmess", ignoreCase = true) -> "vmess"
+                            srv.protocol.contains("trojan", ignoreCase = true) -> "trojan"
+                            srv.protocol.contains("shadow", ignoreCase = true) -> "shadowsocks"
+                            else -> "vless"
+                        },
+                        transport = "ws",
+                        security = "tls",
+                        sni = srv.host,
+                        enabled = true,
+                        healthy = true,
+                        priorityTier = if (srv.stabilityScore >= 90) 3 else 2,
+                        latencyMs = srv.latencyMs,
+                        stabilityScore = srv.stabilityScore
+                    )
+                    localConfigRepository.upsertLocalManagedEndpoint(ep)
+                    if (safeFirebaseUser() != null) {
+                        subscriptionRepository.adminUpsertEndpoint(ep)
+                    }
+                    imported++
+                }
+                if (imported == 0) {
+                    sourceConfigs.forEachIndexed { idx, cfg ->
+                        val ep = ManagedEndpoint(
+                            endpointId = "inv_cfg_${cfg.id.take(40).ifBlank { idx.toString() }}",
+                            name = cfg.name,
+                            country = "Global",
+                            countryCode = "GL",
+                            host = cfg.server,
+                            port = cfg.port,
+                            protocol = cfg.protocol.lowercase(),
+                            transport = cfg.transport,
+                            security = cfg.security,
+                            sni = cfg.sni,
+                            pathOrServiceName = cfg.pathOrServiceName,
+                            enabled = true,
+                            healthy = cfg.status != "offline",
+                            priorityTier = if (cfg.pingMs in 1..150) 3 else 2,
+                            latencyMs = cfg.pingMs,
+                            stabilityScore = if (cfg.status == "online") 95 else 80
+                        )
+                        localConfigRepository.upsertLocalManagedEndpoint(ep)
+                        if (safeFirebaseUser() != null) {
+                            subscriptionRepository.adminUpsertEndpoint(ep)
+                        }
+                        imported++
+                    }
+                }
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) "$imported نود واقعی به استخر IP اختصاصی اضافه شد (بدون افشای اطلاعات خصوصی)"
+                    else "Synced $imported endpoints into central pool"
+                )
+            } finally {
+                _subscriptionBusy.value = false
+            }
+        }
+    }
+
+    fun adminProbeCleanIpPool(filterType: CleanIpAddressType? = null, limit: Int = 50) {
+        if (!checkPermission(AdminPermission.MANAGE_SERVERS, "پایش سلامت مخزن IPهای تمیز")) return
+        userProbeCleanIpPool(filterType = filterType, limit = limit)
+    }
+
+    fun adminToggleCleanIpAvailability(entity: CleanIpEntity, isAvailable: Boolean) {
+        if (!checkPermission(AdminPermission.MANAGE_SERVERS, "تغییر دسترسی‌پذیری IP تمیز")) return
+        viewModelScope.launch {
+            localConfigRepository.updateCleanIpAvailability(
+                host = entity.host,
+                isAvailable = isAvailable
+            )
+        }
+    }
+
+    fun adminPromoteHealthyCleanIpsToInventory(protocol: String = "vless") {
+        if (!checkPermission(AdminPermission.MANAGE_SERVERS, "انتقال IPهای سالم به استخر اشتراک")) return
+        viewModelScope.launch {
+            _subscriptionBusy.value = true
+            try {
+                val existingHosts = endpointInventoryAdmin.value.map { it.host.lowercase() }.toSet()
+                val healthyPool = localConfigRepository.getCleanIpPoolOnce()
+                    .filter {
+                        it.isAvailable &&
+                            it.healthStatus == CleanIpHealthStatus.HEALTHY.name &&
+                            it.host.lowercase() !in existingHosts
+                    }
+                    .sortedBy { if (it.latencyMs > 0) it.latencyMs else Int.MAX_VALUE }
+                    .take(50)
+
+                if (healthyPool.isEmpty()) {
+                    _uiMessage.value = UiMessage.Error(
+                        if (isPersianLanguage.value) {
+                            "ابتدا «پایش سلامت واقعی» را اجرا کنید تا IPهای سالم تایید شوند (یا همه موارد سالم قبلاً وارد شده‌اند)."
+                        } else {
+                            "Run live health probe first so verified HEALTHY hosts can be promoted cleanly."
+                        }
+                    )
+                    return@launch
+                }
+
+                var added = 0
+                healthyPool.forEachIndexed { idx, cleanIp ->
+                    val cleanId = "inv_clean_${cleanIp.host.replace(Regex("[^a-zA-Z0-9]"), "_").take(50)}"
+                    val ep = ManagedEndpoint(
+                        endpointId = cleanId,
+                        name = "Clean ${cleanIp.addressTypeEnum().labelEn} #${idx + 1}",
+                        country = "Anycast CDN",
+                        countryCode = "CD",
+                        host = cleanIp.host,
+                        port = cleanIp.defaultPort.coerceIn(1, 65535),
+                        protocol = protocol.lowercase(),
+                        transport = "ws",
+                        security = "tls",
+                        sni = if (cleanIp.addressType == CleanIpAddressType.DOMAIN.name) cleanIp.host else "",
+                        pathOrServiceName = "/ws",
+                        enabled = true,
+                        healthy = true,
+                        priorityTier = if (cleanIp.latencyMs in 1..180) 3 else 2,
+                        latencyMs = cleanIp.latencyMs,
+                        stabilityScore = cleanIp.stabilityScore.coerceIn(60, 100)
+                    )
+                    localConfigRepository.upsertLocalManagedEndpoint(ep)
+                    if (safeFirebaseUser() != null) {
+                        subscriptionRepository.adminUpsertEndpoint(ep)
+                    }
+                    added++
+                }
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) {
+                        "$added آدرس سالم و تست‌شده به استخر مرکزی IP اختصاصی منتقل شد"
+                    } else {
+                        "Promoted $added verified healthy endpoints to central pool"
+                    }
+                )
+            } finally {
+                _subscriptionBusy.value = false
+            }
+        }
+    }
+
+    fun adminToggleEndpointHealth(endpoint: ManagedEndpoint, enabled: Boolean, healthy: Boolean) {
+        if (!checkPermission(AdminPermission.MANAGE_SERVERS, "تغییر وضعیت سلامت نود")) return
+        viewModelScope.launch {
+            _subscriptionBusy.value = true
+            try {
+                localConfigRepository.updateLocalManagedEndpointHealth(endpoint.endpointId, enabled, healthy)
+                if (safeFirebaseUser() != null) {
+                    subscriptionRepository.adminToggleEndpointHealth(endpoint, enabled, healthy)
+                }
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) "وضعیت نود ${endpoint.name} به‌روز شد" else "Endpoint health updated"
+                )
+            } finally {
+                _subscriptionBusy.value = false
+            }
+        }
+    }
+
+    fun adminResolveShortageAlert(alertId: String) {
+        if (!checkPermission(AdminPermission.MANAGE_SERVERS, "بستن هشدار کمبود ظرفیت")) return
+        viewModelScope.launch {
+            if (safeFirebaseUser() != null) {
+                subscriptionRepository.adminResolveShortageAlert(alertId)
+            }
+        }
+    }
+
+    fun inspectUserAllocationHistory(userId: String?) {
+        _inspectedHistoryUserId.value = userId?.takeIf { it.isNotBlank() }
+    }
+
+    fun adminReportEndpointFailureAndFailover(endpoint: ManagedEndpoint) {
+        if (!checkPermission(AdminPermission.MANAGE_SERVERS, "ثبت خطا و جایگزینی خودکار نود اختصاصی")) return
+        val targetUid = endpoint.assignedUserId.ifBlank { currentActorUid() }
+        val targetSub = allSubscriptionsAdmin.value.firstOrNull { it.userId == targetUid }
+        viewModelScope.launch {
+            _subscriptionBusy.value = true
+            try {
+                val now = if (safeFirebaseUser() != null) {
+                    subscriptionRepository.fetchTrustedServerEpochMs(currentTrustedNowMs())
+                } else {
+                    currentTrustedNowMs()
+                }
+                updateTrustedServerAnchor(now)
+                val activeEp = if (vpnConnectionState.value == VpnConnectionState.CONNECTED) {
+                    _selectedVpnConfig.value?.endpointId
+                } else null
+                localConfigRepository.recordLocalEndpointFailureAndFailover(
+                    endpointId = endpoint.endpointId,
+                    targetUserId = targetUid,
+                    subscription = targetSub,
+                    activeConnectedEndpointId = activeEp,
+                    actorUid = currentActorUid(),
+                    nowMs = now
+                )
+                if (safeFirebaseUser() != null) {
+                    val res = subscriptionRepository.recordEndpointFailureAndFailover(
+                        endpointId = endpoint.endpointId,
+                        targetUserId = targetUid,
+                        subscription = targetSub,
+                        activeConnectedEndpointId = activeEp,
+                        trustedNowMs = now
+                    )
+                    res.getOrNull()?.let { outcome ->
+                        if (outcome.allocationHistoryEvents.isNotEmpty()) {
+                            localConfigRepository.cacheAllocationHistory(outcome.allocationHistoryEvents)
+                        }
+                    }
+                }
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) {
+                        "خطای نود ${endpoint.name} ثبت شد و جایگزینی اتمیک انجام شد"
+                    } else {
+                        "Recorded failure on ${endpoint.name}; atomic failover executed"
+                    }
+                )
+            } finally {
+                _subscriptionBusy.value = false
+            }
+        }
+    }
+
+    fun adminTriggerRotationForUser(subscription: UserSubscription, forceManual: Boolean = true) {
+        if (!checkPermission(AdminPermission.MANAGE_USERS, "چرخش دستی IP کاربر")) return
+        runRotationBatch(
+            targets = listOf(subscription),
+            triggerMode = "MANUAL_SINGLE",
+            forceManual = forceManual
+        )
+    }
+
+    fun adminTriggerRotationForSelectedUsers(forceManual: Boolean = true) {
+        if (!checkPermission(AdminPermission.MANAGE_USERS, "چرخش گروهی IP کاربران انتخابی")) return
+        val selectedIds = _selectedRotationUserIds.value
+        val targets = allSubscriptionsAdmin.value.filter { it.userId in selectedIds || it.subscriptionId in selectedIds }
+        if (targets.isEmpty()) {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) "هیچ کاربری برای چرخش انتخاب نشده است" else "No users selected for rotation"
+            )
+            return
+        }
+        runRotationBatch(
+            targets = targets,
+            triggerMode = "MANUAL_SELECTED",
+            forceManual = forceManual
+        )
+    }
+
+    fun adminTriggerDailyRotationAll(forceManual: Boolean = false) {
+        if (!checkPermission(AdminPermission.MANAGE_USERS, "اجرای زمان‌بند چرخش روزانه")) return
+        val targets = allSubscriptionsAdmin.value.filter { it.statusEnum() == SubscriptionStatus.ACTIVE }
+        if (targets.isEmpty()) {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) "اشتراک فعالی برای چرخش وجود ندارد" else "No active subscriptions to rotate"
+            )
+            return
+        }
+        runRotationBatch(
+            targets = targets,
+            triggerMode = if (forceManual) "MANUAL_ALL" else "SCHEDULED_DAILY",
+            forceManual = forceManual
+        )
+    }
+
+    private fun runRotationBatch(
+        targets: List<UserSubscription>,
+        triggerMode: String,
+        forceManual: Boolean
+    ) {
+        viewModelScope.launch {
+            _subscriptionBusy.value = true
+            try {
+                val now = if (safeFirebaseUser() != null) {
+                    subscriptionRepository.fetchTrustedServerEpochMs(currentTrustedNowMs())
+                } else {
+                    currentTrustedNowMs()
+                }
+                updateTrustedServerAnchor(now)
+                val actorUid = currentActorUid()
+                val activeEndpoint = if (vpnConnectionState.value == VpnConnectionState.CONNECTED) {
+                    _selectedVpnConfig.value?.endpointId
+                } else null
+                val activeMap = mapOf(actorUid to activeEndpoint)
+
+                val summary = localConfigRepository.executeLocalAllocationOrRotation(
+                    targetSubscriptions = targets,
+                    activeConnectedEndpointByUser = activeMap,
+                    actorUid = actorUid,
+                    triggerMode = triggerMode,
+                    nowMs = now,
+                    forceManual = forceManual
+                )
+                if (safeFirebaseUser() != null) {
+                    subscriptionRepository.executeRotationTransaction(
+                        targetSubscriptions = targets,
+                        activeEndpointByUser = activeMap,
+                        triggerMode = triggerMode,
+                        trustedNowMs = now,
+                        forceManual = forceManual
+                    )
+                }
+                val log = summary.auditLog
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) {
+                        "چرخش (${log.status}): ${log.rotatedUsersCount}/${log.targetUserCount} کاربر • ${log.replacedEndpointsCount} جایگزینی • ${log.shortageCount} کمبود"
+                    } else {
+                        "Rotation ${log.status}: ${log.rotatedUsersCount}/${log.targetUserCount} rotated, ${log.shortageCount} shortages"
+                    }
+                )
+            } catch (e: Exception) {
+                _uiMessage.value = UiMessage.Error(e.localizedMessage ?: "خطا در چرخش اختصاصی")
+            } finally {
+                _subscriptionBusy.value = false
             }
         }
     }
@@ -1384,7 +3388,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     ) {
         if (!checkPermission(AdminPermission.MANAGE_SERVERS, "افزودن نود سرور جدید")) return
 
-        val user = Firebase.auth.currentUser ?: return
+        val uid = currentActorUid()
 
         // Comprehensive Field Validation
         val validation = InputValidator.validateServer(
@@ -1406,7 +3410,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             try {
                 val server = VpnServer(
-                    userId = user.uid,
+                    userId = uid,
                     name = name.trim(),
                     country = country.trim(),
                     countryCode = countryCode.trim().uppercase(),
@@ -1421,18 +3425,20 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                     activeUsers = 0,
                     stabilityScore = 95
                 )
-                repository.addServer(server)
-                repository.addAuditLog(
-                    AuthAuditLog(
-                        userId = user.uid,
-                        action = "SERVER_ADDED",
-                        role = currentRole.value.id,
-                        module = "ServerManagement",
-                        status = "SUCCESS",
-                        ipOrDevice = getDeviceInfo(),
-                        details = "نود سرور جدید ${server.name} (${server.countryCode}) در هاست ${server.host}:${server.port} ثبت شد"
+                if (safeFirebaseUser() != null) {
+                    repository.addServer(server)
+                    repository.addAuditLog(
+                        AuthAuditLog(
+                            userId = uid,
+                            action = "SERVER_ADDED",
+                            role = currentRole.value.id,
+                            module = "ServerManagement",
+                            status = "SUCCESS",
+                            ipOrDevice = getDeviceInfo(),
+                            details = "نود سرور جدید ${server.name} (${server.countryCode}) در هاست ${server.host}:${server.port} ثبت شد"
+                        )
                     )
-                )
+                }
                 _uiMessage.value = UiMessage.Success("سرور جدید با موفقیت اعتبارسنجی و افزوده شد / Node added")
             } catch (e: CancellationException) {
                 throw e
@@ -1458,7 +3464,9 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                 10
             }
             try {
-                repository.updateServerHealth(server.id, result.latencyMs, newStatus, score)
+                if (safeFirebaseUser() != null) {
+                    repository.updateServerHealth(server.id, result.latencyMs, newStatus, score)
+                }
                 if (result.isReachable) {
                     _uiMessage.value = UiMessage.Success("پینگ واقعی سرور: ${result.latencyMs}ms (امتیاز پایداری: $score%)")
                 } else {
@@ -1477,21 +3485,23 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     fun deleteServer(serverId: String) {
         if (!checkPermission(AdminPermission.MANAGE_SERVERS, "حذف نود سرور")) return
 
-        val user = Firebase.auth.currentUser ?: return
+        val uid = currentActorUid()
         viewModelScope.launch {
             try {
-                repository.deleteServer(serverId)
-                repository.addAuditLog(
-                    AuthAuditLog(
-                        userId = user.uid,
-                        action = "SERVER_DELETED",
-                        role = currentRole.value.id,
-                        module = "ServerManagement",
-                        status = "SUCCESS",
-                        ipOrDevice = getDeviceInfo(),
-                        details = "سرور با شناسه $serverId حذف شد"
+                if (safeFirebaseUser() != null) {
+                    repository.deleteServer(serverId)
+                    repository.addAuditLog(
+                        AuthAuditLog(
+                            userId = uid,
+                            action = "SERVER_DELETED",
+                            role = currentRole.value.id,
+                            module = "ServerManagement",
+                            status = "SUCCESS",
+                            ipOrDevice = getDeviceInfo(),
+                            details = "سرور با شناسه $serverId حذف شد"
+                        )
                     )
-                )
+                }
                 _uiMessage.value = UiMessage.Success("سرور با موفقیت حذف شد / Server deleted")
             } catch (e: CancellationException) {
                 throw e
@@ -1511,7 +3521,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     ) {
         if (!checkPermission(AdminPermission.MANAGE_FAILOVER, "افزودن سیاست مسیریابی خودکار")) return
 
-        val user = Firebase.auth.currentUser ?: return
+        val uid = currentActorUid()
 
         val validation = InputValidator.validateFailoverPolicy(
             name = name,
@@ -1530,25 +3540,27 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             try {
                 val policy = FailoverPolicy(
-                    userId = user.uid,
+                    userId = uid,
                     name = name.trim(),
                     primaryServerId = primaryServerId,
                     backupServerId = backupServerId,
                     latencyThresholdMs = thresholdMs,
                     autoSwitchEnabled = true
                 )
-                repository.addFailoverPolicy(policy)
-                repository.addAuditLog(
-                    AuthAuditLog(
-                        userId = user.uid,
-                        action = "FAILOVER_POLICY_ADDED",
-                        role = currentRole.value.id,
-                        module = "IntelligentEngine",
-                        status = "SUCCESS",
-                        ipOrDevice = getDeviceInfo(),
-                        details = "سیاست تغییر مسیر خودکار «${policy.name}» با آستانه ${thresholdMs}ms ثبت شد"
+                if (safeFirebaseUser() != null) {
+                    repository.addFailoverPolicy(policy)
+                    repository.addAuditLog(
+                        AuthAuditLog(
+                            userId = uid,
+                            action = "FAILOVER_POLICY_ADDED",
+                            role = currentRole.value.id,
+                            module = "IntelligentEngine",
+                            status = "SUCCESS",
+                            ipOrDevice = getDeviceInfo(),
+                            details = "سیاست تغییر مسیر خودکار «${policy.name}» با آستانه ${thresholdMs}ms ثبت شد"
+                        )
                     )
-                )
+                }
                 _uiMessage.value = UiMessage.Success("سیاست مسیریابی جایگزین (Failover) فعال شد")
             } catch (e: CancellationException) {
                 throw e
@@ -1563,7 +3575,9 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
 
         viewModelScope.launch {
             try {
-                repository.deleteFailoverPolicy(policyId)
+                if (safeFirebaseUser() != null) {
+                    repository.deleteFailoverPolicy(policyId)
+                }
                 _uiMessage.value = UiMessage.Success("سیاست حذف شد")
             } catch (e: CancellationException) {
                 throw e
@@ -1575,24 +3589,32 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
 
     // --- USER MANAGEMENT & QUOTAS ---
 
-    fun updateUserQuota(deviceCount: Int, maxDevices: Int, dataLimitBytes: Double) {
+    fun updateUserQuota(
+        deviceCount: Int,
+        maxDevices: Int,
+        dataLimitBytes: Double,
+        targetUserId: String = currentActorUid()
+    ) {
         if (!checkPermission(AdminPermission.MANAGE_USERS, "تغییر سهمیه و مدیریت کاربران")) return
 
-        val user = Firebase.auth.currentUser ?: return
+        val uid = currentActorUid()
         viewModelScope.launch {
             try {
-                repository.updateUserQuota(deviceCount, maxDevices, dataLimitBytes)
-                repository.addAuditLog(
-                    AuthAuditLog(
-                        userId = user.uid,
-                        action = "USER_QUOTA_UPDATED",
-                        role = currentRole.value.id,
-                        module = "UserManagement",
-                        status = "SUCCESS",
-                        ipOrDevice = getDeviceInfo(),
-                        details = "سهمیه دستگاه‌ها ($deviceCount/$maxDevices) و حجم داده ($dataLimitBytes bytes) به‌روز شد"
+                localConfigRepository.updateRegisteredUserQuota(targetUserId, maxDevices, dataLimitBytes)
+                if (safeFirebaseUser() != null) {
+                    repository.updateUserQuota(deviceCount, maxDevices, dataLimitBytes)
+                    repository.addAuditLog(
+                        AuthAuditLog(
+                            userId = uid,
+                            action = "USER_QUOTA_UPDATED",
+                            role = currentRole.value.id,
+                            module = "UserManagement",
+                            status = "SUCCESS",
+                            ipOrDevice = getDeviceInfo(),
+                            details = "سهمیه کاربر $targetUserId ($deviceCount/$maxDevices دستگاه، $dataLimitBytes بایت) به‌روز شد"
+                        )
                     )
-                )
+                }
                 _uiMessage.value = UiMessage.Success(
                     if (isPersianLanguage.value) "سهمیه کاربر با موفقیت به‌روزرسانی شد" else "User quota updated successfully"
                 )
@@ -1636,7 +3658,15 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             val activeLat = configs.value.take(5).joinToString("\n") { c ->
                 "- Config ${c.name}: Ping=${c.pingMs}ms Status=${c.status}"
             }
-            when (val res = aiEngine.optimizeRoutingAndFailover(srvSummary, activeLat, userProblemPrompt)) {
+            val adminSnap = buildAdminOperationsContextSnapshot()
+            when (
+                val res = aiEngine.optimizeRoutingAndFailover(
+                    serversSummary = srvSummary,
+                    activeLatency = activeLat,
+                    userQuery = userProblemPrompt,
+                    adminOperationsSnapshot = adminSnap
+                )
+            ) {
                 is AiResult.Success -> {
                     _aiResponse.value = res.responseText
                 }
@@ -1652,10 +3682,314 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         _aiResponse.value = null
     }
 
+    // --- TMS NEXUS AI (USER ASSISTANT & ADMIN OPERATIONS COPILOT + SUPPORT TICKETS) ---
+
+    private fun buildUserSafeContextSnapshot(): String {
+        val currentConfigs = configs.value
+        val selected = _selectedVpnConfig.value ?: currentConfigs.firstOrNull()
+        return NexusContextSanitizer.buildUserSafeContext(
+            vpnState = vpnConnectionState.value,
+            selectedConfig = selected,
+            userConfigCount = currentConfigs.size,
+            onlineConfigCount = currentConfigs.count { it.status == "online" },
+            sessionStats = vpnSessionStats.value,
+            healthReport = healthReport.value,
+            leakCheckReport = leakCheckReport.value,
+            ispTuningReport = ispTuningReport.value,
+            userSubscription = userSubscription.value,
+            allocatedEndpointCount = allocatedEndpoints.value.size
+        )
+    }
+
+    private fun buildAdminOperationsContextSnapshot(): String {
+        return NexusContextSanitizer.buildAdminOperationsContext(
+            servers = servers.value,
+            configs = configs.value,
+            endpointInventory = endpointInventoryAdmin.value,
+            cleanIpPool = cleanIpPool.value,
+            subscriptions = allSubscriptionsAdmin.value,
+            shortageAlerts = shortageAlertsAdmin.value,
+            rotationLogs = rotationLogsAdmin.value
+        )
+    }
+
+    fun sendUserNexusMessage(prompt: String) {
+        val cleanPrompt = prompt.trim()
+        if (cleanPrompt.isBlank() || _userNexusStreaming.value) return
+
+        val userMsgId = "usr_${System.currentTimeMillis()}"
+        val botMsgId = "bot_${System.currentTimeMillis() + 1}"
+        val historySnapshot = _userNexusMessages.value
+
+        _userNexusMessages.value = historySnapshot + listOf(
+            NexusChatMessage(
+                id = userMsgId,
+                isFromUser = true,
+                text = cleanPrompt,
+                scope = NexusAiScope.USER_ASSISTANT
+            ),
+            NexusChatMessage(
+                id = botMsgId,
+                isFromUser = false,
+                text = "",
+                scope = NexusAiScope.USER_ASSISTANT,
+                isStreaming = true
+            )
+        )
+
+        viewModelScope.launch {
+            _userNexusStreaming.value = true
+            try {
+                val safeContext = buildUserSafeContextSnapshot()
+                aiEngine.streamNexusAssistant(
+                    scope = NexusAiScope.USER_ASSISTANT,
+                    sanitizedTelemetryContext = safeContext,
+                    userMessage = cleanPrompt,
+                    recentHistory = historySnapshot,
+                    isPersian = isPersianLanguage.value
+                ).collect { event ->
+                    when (event) {
+                        is NexusStreamEvent.Partial -> {
+                            _userNexusMessages.update { list ->
+                                list.map { if (it.id == botMsgId) it.copy(text = event.accumulatedText, isStreaming = true) else it }
+                            }
+                        }
+                        is NexusStreamEvent.Completed -> {
+                            _userNexusMessages.update { list ->
+                                list.map { if (it.id == botMsgId) it.copy(text = event.fullText, isStreaming = false, isError = false) else it }
+                            }
+                        }
+                        is NexusStreamEvent.Error -> {
+                            _userNexusMessages.update { list ->
+                                list.map { if (it.id == botMsgId) it.copy(text = event.message, isStreaming = false, isError = true) else it }
+                            }
+                        }
+                    }
+                }
+            } finally {
+                _userNexusStreaming.value = false
+            }
+        }
+    }
+
+    fun clearUserNexusChat() {
+        _userNexusMessages.value = emptyList()
+    }
+
+    fun runUserSmartDiagnostics(symptom: String = "") {
+        if (_userDiagnosticLoading.value) return
+        viewModelScope.launch {
+            _userDiagnosticLoading.value = true
+            _userDiagnosticError.value = null
+            val res = aiEngine.diagnoseConnectionStructured(
+                sanitizedUserContext = buildUserSafeContextSnapshot(),
+                symptomDescription = symptom
+            )
+            res.onSuccess { report ->
+                _userDiagnosticReport.value = report
+            }.onFailure { err ->
+                _userDiagnosticError.value = err.localizedMessage ?: "خطا در اجرای عیب‌یابی هوشمند Firebase AI"
+            }
+            _userDiagnosticLoading.value = false
+        }
+    }
+
+    fun sendAdminNexusMessage(prompt: String) {
+        if (!checkPermission(AdminPermission.RUN_INTELLIGENCE, "استفاده از دستیار عملیات NEXUS AI")) return
+        val cleanPrompt = prompt.trim()
+        if (cleanPrompt.isBlank() || _adminNexusStreaming.value) return
+
+        val userMsgId = "adm_usr_${System.currentTimeMillis()}"
+        val botMsgId = "adm_bot_${System.currentTimeMillis() + 1}"
+        val historySnapshot = _adminNexusMessages.value
+
+        _adminNexusMessages.value = historySnapshot + listOf(
+            NexusChatMessage(
+                id = userMsgId,
+                isFromUser = true,
+                text = cleanPrompt,
+                scope = NexusAiScope.ADMIN_COPILOT
+            ),
+            NexusChatMessage(
+                id = botMsgId,
+                isFromUser = false,
+                text = "",
+                scope = NexusAiScope.ADMIN_COPILOT,
+                isStreaming = true
+            )
+        )
+
+        viewModelScope.launch {
+            _adminNexusStreaming.value = true
+            try {
+                val opsContext = buildAdminOperationsContextSnapshot()
+                aiEngine.streamNexusAssistant(
+                    scope = NexusAiScope.ADMIN_COPILOT,
+                    sanitizedTelemetryContext = opsContext,
+                    userMessage = cleanPrompt,
+                    recentHistory = historySnapshot,
+                    isPersian = isPersianLanguage.value
+                ).collect { event ->
+                    when (event) {
+                        is NexusStreamEvent.Partial -> {
+                            _adminNexusMessages.update { list ->
+                                list.map { if (it.id == botMsgId) it.copy(text = event.accumulatedText, isStreaming = true) else it }
+                            }
+                        }
+                        is NexusStreamEvent.Completed -> {
+                            _adminNexusMessages.update { list ->
+                                list.map { if (it.id == botMsgId) it.copy(text = event.fullText, isStreaming = false, isError = false) else it }
+                            }
+                        }
+                        is NexusStreamEvent.Error -> {
+                            _adminNexusMessages.update { list ->
+                                list.map { if (it.id == botMsgId) it.copy(text = event.message, isStreaming = false, isError = true) else it }
+                            }
+                        }
+                    }
+                }
+            } finally {
+                _adminNexusStreaming.value = false
+            }
+        }
+    }
+
+    fun clearAdminNexusChat() {
+        _adminNexusMessages.value = emptyList()
+    }
+
+    fun observeTicketReplies(ticketId: String): Flow<List<SupportTicketReply>> {
+        return supportTicketRepository.observeTicketReplies(ticketId)
+    }
+
+    fun submitSupportTicket(
+        subject: String,
+        description: String,
+        category: SupportTicketCategory,
+        priority: SupportTicketPriority
+    ) {
+        val fbUser = safeFirebaseUser()
+        if (fbUser == null) {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) {
+                    "ارسال تیکت پشتیبانی ابری نیازمند نشست فعال ابری است؛ از کانال‌های رسمی پشتیبانی یا دستیار هوشمند استفاده کنید."
+                } else {
+                    "Cloud ticket sync requires an active cloud session; please use AI diagnostics or official support channels."
+                }
+            )
+            return
+        }
+        val cleanSubject = subject.trim()
+        val cleanDesc = description.trim()
+        if (cleanSubject.isBlank() || cleanDesc.isBlank()) {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) "عنوان و توضیحات تیکت الزامی است." else "Subject and description are required."
+            )
+            return
+        }
+
+        viewModelScope.launch {
+            _ticketBusy.value = true
+            try {
+                var finalCategory = category
+                var finalPriority = priority
+                var triageSummary = ""
+                // Attempt AI triage cleanly; if offline/unavailable, ticket still submits normally
+                aiEngine.triageSupportTicket(
+                    subject = cleanSubject,
+                    description = cleanDesc,
+                    sanitizedUserContext = buildUserSafeContextSnapshot()
+                ).onSuccess { triage ->
+                    if (category == SupportTicketCategory.GENERAL) {
+                        finalCategory = SupportTicketCategory.fromString(triage.category)
+                    }
+                    finalPriority = SupportTicketPriority.fromString(triage.priority)
+                    triageSummary = buildString {
+                        append(triage.aiTriageSummary)
+                        if (triage.instantUserSteps.isNotEmpty()) {
+                            append("\nپیشنهاد فوری NEXUS AI: ")
+                            append(triage.instantUserSteps.joinToString(" | "))
+                        }
+                    }
+                }
+
+                val res = supportTicketRepository.createTicket(
+                    subject = cleanSubject,
+                    description = cleanDesc,
+                    category = finalCategory,
+                    priority = finalPriority,
+                    aiTriageSummary = triageSummary,
+                    userEmail = fbUser.email ?: userProfile.value?.email ?: ""
+                )
+                if (res.isSuccess) {
+                    _uiMessage.value = UiMessage.Success(
+                        if (isPersianLanguage.value) "تیکت پشتیبانی با موفقیت ثبت شد" else "Support ticket submitted"
+                    )
+                } else {
+                    _uiMessage.value = UiMessage.Error(
+                        res.exceptionOrNull()?.localizedMessage ?: "خطا در ثبت تیکت پشتیبانی"
+                    )
+                }
+            } finally {
+                _ticketBusy.value = false
+            }
+        }
+    }
+
+    fun replyToTicket(
+        ticket: SupportTicket,
+        message: String,
+        asAdmin: Boolean,
+        nextStatus: SupportTicketStatus? = null
+    ) {
+        if (asAdmin && !checkPermission(AdminPermission.MANAGE_USERS, "پاسخ‌دهی به تیکت پشتیبانی")) return
+        val cleanMsg = message.trim()
+        if (cleanMsg.isBlank()) return
+        viewModelScope.launch {
+            _ticketBusy.value = true
+            try {
+                val res = supportTicketRepository.postReply(
+                    ticket = ticket,
+                    message = cleanMsg,
+                    isAdminReply = asAdmin,
+                    nextStatus = nextStatus
+                )
+                if (res.isSuccess) {
+                    _uiMessage.value = UiMessage.Success(
+                        if (isPersianLanguage.value) "پاسخ با موفقیت ارسال شد" else "Reply posted"
+                    )
+                } else {
+                    _uiMessage.value = UiMessage.Error(res.exceptionOrNull()?.localizedMessage ?: "خطا در ارسال پاسخ")
+                }
+            } finally {
+                _ticketBusy.value = false
+            }
+        }
+    }
+
+    fun adminUpdateTicketStatus(ticketId: String, status: SupportTicketStatus) {
+        if (!checkPermission(AdminPermission.MANAGE_USERS, "تغییر وضعیت تیکت پشتیبانی")) return
+        viewModelScope.launch {
+            _ticketBusy.value = true
+            try {
+                val res = supportTicketRepository.adminUpdateStatus(ticketId, status)
+                if (res.isSuccess) {
+                    _uiMessage.value = UiMessage.Success(
+                        if (isPersianLanguage.value) "وضعیت تیکت به ${status.titleFa} تغییر یافت" else "Ticket marked ${status.titleEn}"
+                    )
+                } else {
+                    _uiMessage.value = UiMessage.Error(res.exceptionOrNull()?.localizedMessage ?: "خطا")
+                }
+            } finally {
+                _ticketBusy.value = false
+            }
+        }
+    }
+
     private fun logValidationFailure(module: String, errorDetails: String) {
         viewModelScope.launch {
             try {
-                val user = Firebase.auth.currentUser ?: return@launch
+                val user = safeFirebaseUser() ?: return@launch
                 repository.addAuditLog(
                     AuthAuditLog(
                         userId = user.uid,

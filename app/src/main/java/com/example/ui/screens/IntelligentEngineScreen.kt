@@ -78,8 +78,27 @@ import com.example.ui.theme.TextWhitePrimary
 
 import com.example.data.model.AdminPermission
 import com.example.data.model.AdminRole
+import com.example.data.model.SupportTicket
+import com.example.data.model.SupportTicketReply
+import com.example.data.model.SupportTicketStatus
+import com.example.data.ai.NexusChatMessage
+import com.example.ui.theme.ElectricCyan
+import com.example.ui.theme.ElevatedSurface
+import com.example.ui.theme.StatusConnected
 import com.example.ui.theme.StatusWarningAmber
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.SupportAgent
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOf
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -94,10 +113,20 @@ fun IntelligentEngineScreen(
     onAddPolicy: (name: String, primaryId: String, backupId: String, threshold: Int) -> Unit,
     onDeletePolicy: (String) -> Unit,
     onOptimizeTopology: (String) -> Unit,
-    onClearAiResponse: () -> Unit
+    onClearAiResponse: () -> Unit,
+    adminNexusMessages: List<NexusChatMessage> = emptyList(),
+    adminNexusStreaming: Boolean = false,
+    onSendAdminNexusMessage: (String) -> Unit = {},
+    onClearAdminNexusChat: () -> Unit = {},
+    adminTickets: List<SupportTicket> = emptyList(),
+    ticketBusy: Boolean = false,
+    observeTicketReplies: (String) -> Flow<List<SupportTicketReply>> = { flowOf(emptyList()) },
+    onReplyToTicket: (SupportTicket, String) -> Unit = { _, _ -> },
+    onUpdateTicketStatus: (String, SupportTicketStatus) -> Unit = { _, _ -> }
 ) {
     val canRunAi = currentRole.hasPermission(AdminPermission.RUN_INTELLIGENCE)
     val canManageFailover = currentRole.hasPermission(AdminPermission.MANAGE_FAILOVER)
+    val canManageUsers = currentRole.hasPermission(AdminPermission.MANAGE_USERS)
 
     var showAddPolicyDialog by remember { mutableStateOf(false) }
     var policyName by remember { mutableStateOf("") }
@@ -106,6 +135,8 @@ fun IntelligentEngineScreen(
     var thresholdMs by remember { mutableFloatStateOf(250f) }
 
     var userCustomAiPrompt by remember { mutableStateOf("") }
+    var copilotPrompt by remember { mutableStateOf("") }
+    var inspectedAdminTicket by remember { mutableStateOf<SupportTicket?>(null) }
 
     // Rank servers by lowest latency (ignoring offline -1)
     val sortedByLatency = remember(servers) {
@@ -552,6 +583,275 @@ fun IntelligentEngineScreen(
                 }
             }
         }
+
+        // TMS NEXUS AI Operations Copilot (Streaming Live Operations Console)
+        item {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("admin_nexus_copilot_card")
+                    .border(BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.65f)), RoundedCornerShape(16.dp)),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF0F1520)),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Column(modifier = Modifier.padding(18.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = if (isPersian) "دستیار عملیات TMS NEXUS AI (زنده)" else "TMS NEXUS AI Operations Copilot",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = ElectricCyan
+                            )
+                            Text(
+                                text = if (isPersian) "تحلیل لحظه‌ای مخزن ۱۵۰ IP تمیز، کمبود ظرفیت و چرخش اشتراک‌ها" else "Live streaming audit for clean IP pool, shortages & rotation",
+                                fontSize = 11.sp,
+                                color = TextGraySecondary
+                            )
+                        }
+                        if (adminNexusMessages.isNotEmpty()) {
+                            IconButton(
+                                onClick = onClearAdminNexusChat,
+                                enabled = !adminNexusStreaming
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.DeleteSweep,
+                                    contentDescription = if (isPersian) "پاک کردن" else "Clear",
+                                    tint = TextGraySecondary
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    val adminQuickPrompts = if (isPersian) {
+                        listOf(
+                            "وضعیت سلامت مخزن ۱۵۰ IP تمیز و موارد قرنطینه را تحلیل کن",
+                            "آیا هشدار کمبود ظرفیت برای پلن‌های اشتراک داریم؟",
+                            "پیشنهاد چرخش روزانه و Failover بدون اختلال بده"
+                        )
+                    } else {
+                        listOf(
+                            "Audit 150 clean IP pool health & quarantined hosts",
+                            "Analyze unresolved subscription capacity shortages",
+                            "Recommend safe daily rotation & failover strategy"
+                        )
+                    }
+
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(adminQuickPrompts) { quick ->
+                            OutlinedButton(
+                                onClick = { if (canRunAi && !adminNexusStreaming) onSendAdminNexusMessage(quick) },
+                                enabled = canRunAi && !adminNexusStreaming,
+                                modifier = Modifier.height(48.dp),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(0.8.dp, ElectricCyan.copy(alpha = 0.55f))
+                            ) {
+                                Text(
+                                    text = quick,
+                                    fontSize = 10.sp,
+                                    color = ElectricCyan,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+
+                    if (adminNexusMessages.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            adminNexusMessages.takeLast(4).forEach { msg ->
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(
+                                            when {
+                                                msg.isError -> StatusOfflineRed.copy(alpha = 0.14f)
+                                                msg.isFromUser -> ElectricCyan.copy(alpha = 0.14f)
+                                                else -> ElevatedSurface
+                                            }
+                                        )
+                                        .border(
+                                            BorderStroke(
+                                                0.7.dp,
+                                                when {
+                                                    msg.isError -> StatusOfflineRed.copy(alpha = 0.7f)
+                                                    msg.isFromUser -> ElectricCyan.copy(alpha = 0.5f)
+                                                    else -> BorderGoldMuted
+                                                }
+                                            ),
+                                            RoundedCornerShape(10.dp)
+                                        )
+                                        .padding(10.dp)
+                                ) {
+                                    Column {
+                                        Text(
+                                            text = when {
+                                                msg.isFromUser -> if (isPersian) "مدیر" else "Admin"
+                                                msg.isError -> if (isPersian) "خطای سرویس AI" else "AI Error"
+                                                else -> "NEXUS Copilot"
+                                            },
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (msg.isError) StatusOfflineRed else ElectricCyan
+                                        )
+                                        Spacer(modifier = Modifier.height(3.dp))
+                                        Text(
+                                            text = if (msg.isStreaming && msg.text.isBlank()) {
+                                                if (isPersian) "در حال پردازش..." else "Streaming..."
+                                            } else {
+                                                msg.text
+                                            },
+                                            fontSize = 12.sp,
+                                            lineHeight = 19.sp,
+                                            color = if (msg.isError) StatusOfflineRed else TextWhitePrimary
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = copilotPrompt,
+                            onValueChange = { copilotPrompt = it },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("admin_nexus_prompt_input"),
+                            enabled = canRunAi,
+                            placeholder = {
+                                Text(
+                                    text = if (isPersian) "دستور یا سوال عملیاتی مدیر..." else "Ask NEXUS Operations Copilot...",
+                                    fontSize = 11.sp,
+                                    color = TextGraySecondary
+                                )
+                            },
+                            singleLine = true,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = ElectricCyan,
+                                unfocusedBorderColor = BorderGoldMuted,
+                                focusedTextColor = TextWhitePrimary,
+                                unfocusedTextColor = TextWhitePrimary
+                            ),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+                        Button(
+                            onClick = {
+                                val clean = copilotPrompt.trim()
+                                if (clean.isNotBlank()) {
+                                    copilotPrompt = ""
+                                    onSendAdminNexusMessage(clean)
+                                }
+                            },
+                            enabled = canRunAi && !adminNexusStreaming && copilotPrompt.isNotBlank(),
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("admin_nexus_send_button"),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = ElectricCyan,
+                                contentColor = Color(0xFF0A1018)
+                            ),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(imageVector = Icons.AutoMirrored.Filled.Send, contentDescription = null, modifier = Modifier.size(18.dp))
+                        }
+                    }
+                }
+            }
+        }
+
+        // Support Tickets Triage Queue
+        item {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("admin_support_tickets_card")
+                    .border(BorderStroke(1.dp, BorderGoldMuted), RoundedCornerShape(16.dp)),
+                colors = CardDefaults.cardColors(containerColor = CardSurfaceDark),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Column(modifier = Modifier.padding(18.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Filled.SupportAgent,
+                                contentDescription = null,
+                                tint = MetallicGold,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = if (isPersian) "تیکت‌های پشتیبانی کاربران (${adminTickets.size})" else "User Support Tickets (${adminTickets.size})",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MetallicGold
+                            )
+                        }
+                        if (!canManageUsers) {
+                            Text(
+                                text = if (isPersian) "فقط خواندنی" else "Read-Only",
+                                fontSize = 10.sp,
+                                color = StatusWarningAmber
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    if (adminTickets.isEmpty()) {
+                        Text(
+                            text = if (isPersian) "تیکت باز یا ثبت‌شده‌ای وجود ندارد." else "No support tickets in queue.",
+                            fontSize = 12.sp,
+                            color = TextGraySecondary
+                        )
+                    } else {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            adminTickets.take(15).forEach { ticket ->
+                                SupportTicketCard(
+                                    ticket = ticket,
+                                    isPersian = isPersian,
+                                    onClick = { inspectedAdminTicket = ticket }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    inspectedAdminTicket?.let { activeTicket ->
+        val syncedTicket = adminTickets.firstOrNull { it.ticketId == activeTicket.ticketId } ?: activeTicket
+        val replies by observeTicketReplies(syncedTicket.ticketId)
+            .collectAsStateWithLifecycle(initialValue = emptyList())
+        TicketConversationDialog(
+            ticket = syncedTicket,
+            replies = replies,
+            isAdmin = canManageUsers,
+            isBusy = ticketBusy,
+            isPersian = isPersian,
+            onSendReply = { msg -> onReplyToTicket(syncedTicket, msg) },
+            onUpdateStatus = if (canManageUsers) {
+                { newStatus -> onUpdateTicketStatus(syncedTicket.ticketId, newStatus) }
+            } else null,
+            onDismiss = { inspectedAdminTicket = null }
+        )
     }
 
     // Add Policy Dialog

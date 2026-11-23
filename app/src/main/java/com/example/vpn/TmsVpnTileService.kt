@@ -77,10 +77,18 @@ class TmsVpnTileService : TileService() {
 
         val scope = tileScope ?: CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
         scope.launch {
-            val targetConfig = VpnController.activeConfig
-                ?: runCatching {
-                    LocalVpnConfigRepository(applicationContext).allConfigs.firstOrNull()?.firstOrNull()
-                }.getOrNull()
+            val repo = LocalVpnConfigRepository(applicationContext)
+            val savedConfigs = runCatching { repo.allConfigs.firstOrNull().orEmpty() }.getOrDefault(emptyList())
+            val deTrSaved = savedConfigs
+                .filter { DefaultVpnConfigs.isDeOrTrNode(it) }
+                .sortedWith(compareBy<com.example.data.model.VpnConfig> { if (it.pingMs > 0) it.pingMs else Int.MAX_VALUE })
+            val defaultDeTr = DefaultVpnConfigs.getDefaultConfigs()
+                .filter { DefaultVpnConfigs.isDeOrTrNode(it) }
+
+            val targetConfig = deTrSaved.firstOrNull()
+                ?: VpnController.activeConfig
+                ?: savedConfigs.firstOrNull()
+                ?: defaultDeTr.firstOrNull()
                 ?: DefaultVpnConfigs.getDefaultConfigs().firstOrNull()
 
             if (targetConfig == null) {
@@ -88,11 +96,20 @@ class TmsVpnTileService : TileService() {
                 return@launch
             }
 
+            val bestCleanIp = runCatching {
+                repo.getCleanIpPoolOnce()
+                    .filter { it.healthStatus == com.example.data.local.CleanIpHealthStatus.HEALTHY.name && it.host.isNotBlank() }
+                    .minByOrNull { if (it.latencyMs > 0) it.latencyMs else Int.MAX_VALUE }
+                    ?.host
+            }.getOrNull()
+                ?: com.example.vpn.engine.IspAutoTuner.getCachedCleanIp(applicationContext)
+
             updateTileForState(VpnConnectionState.CONNECTING)
             VpnController.startVpn(
                 context = applicationContext,
                 config = targetConfig,
-                antiFilterMode = true
+                antiFilterMode = true,
+                cleanIpOverride = bestCleanIp
             )
         }
     }

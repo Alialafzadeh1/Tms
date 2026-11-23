@@ -1,12 +1,10 @@
 package com.example.ui.screens
 
-import android.app.Activity
-import android.content.Context
-import android.util.Log
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,10 +23,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Email
-import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.Visibility
@@ -39,7 +36,6 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
@@ -65,11 +61,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.credentials.CredentialManager
-import androidx.credentials.CustomCredential
-import androidx.credentials.GetCredentialRequest
-import androidx.credentials.exceptions.GetCredentialCancellationException
-import com.example.R
+import com.example.data.local.LocalVpnConfigRepository
+import com.example.data.local.RegisteredUserEntity
 import com.example.data.security.LocalUserAuthManager
 import com.example.ui.components.CyberAmbientBackdrop
 import com.example.ui.components.CyberGlassCard
@@ -87,18 +80,9 @@ import com.example.ui.theme.StatusConnected
 import com.example.ui.theme.StatusError
 import com.example.ui.theme.TextCyberPrimary
 import com.example.ui.theme.TextCyberSecondary
-import com.google.android.libraries.identity.googleid.GetGoogleIdOption
-import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
-import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
-import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential.Companion.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
-import com.google.firebase.Firebase
-import com.google.firebase.auth.GoogleAuthProvider
-import com.google.firebase.auth.auth
-import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.tasks.await
-
-private const val TAG = "AuthScreen"
+import kotlinx.coroutines.withContext
 
 @Composable
 fun AuthScreen(
@@ -106,30 +90,21 @@ fun AuthScreen(
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
-    val credentialManager = remember(context) { CredentialManager.create(context) }
     val localAuthManager = remember(context) { LocalUserAuthManager(context) }
 
-    var isLoading by remember { mutableStateOf(false) }
-    var isAutoSigningIn by remember { mutableStateOf(true) }
+    var isSignUpMode by remember { mutableStateOf(false) }
+    var isSubmitting by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
-    var showEmailPasswordSection by remember { mutableStateOf(false) }
+    var displayNameInput by remember { mutableStateOf("") }
     var emailInput by remember { mutableStateOf("") }
     var passwordInput by remember { mutableStateOf("") }
     var passwordVisible by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
-        attemptAutoSignIn(
-            context = context,
-            credentialManager = credentialManager,
-            onAuthSuccess = {
-                isAutoSigningIn = false
-                onAuthSuccess()
-            },
-            onUnauthenticated = {
-                isAutoSigningIn = false
-            }
-        )
+        if (LocalUserAuthManager.restoreOfflineSession(context) != null) {
+            onAuthSuccess()
+        }
     }
 
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
@@ -156,9 +131,9 @@ fun AuthScreen(
                             .verticalScroll(rememberScrollState()),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        TmsLogoEmblem(accentColor = ElectricCyan, size = 72.dp)
+                        TmsLogoEmblem(accentColor = ElectricCyan, size = 68.dp)
 
-                        Spacer(modifier = Modifier.height(14.dp))
+                        Spacer(modifier = Modifier.height(12.dp))
 
                         Text(
                             text = "TMS VPN",
@@ -170,18 +145,18 @@ fun AuthScreen(
                         )
 
                         Text(
-                            text = "PREMIUM CYBER TECHNOLOGY",
+                            text = "TMS NEXUS AI • QUANTUM TUNNEL",
                             fontFamily = JetBrainsMonoFontFamily,
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             color = ElectricCyan,
-                            letterSpacing = 1.8.sp
+                            letterSpacing = 1.6.sp
                         )
 
                         Spacer(modifier = Modifier.height(10.dp))
 
                         Text(
-                            text = "ورود به سپر امن TMS VPN",
+                            text = if (isSignUpMode) "ایجاد حساب کاربری TMS VPN" else "ورود با ایمیل و رمز عبور",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = TextCyberPrimary,
@@ -191,35 +166,238 @@ fun AuthScreen(
                         Spacer(modifier = Modifier.height(6.dp))
 
                         Text(
-                            text = "با حساب گوگل وارد شوید یا در زمان قطعی و اینترنت ملی از ورود آفلاین با ایمیل و رمز عبور استفاده کنید.",
+                            text = "احراز هویت امن، یکپارچه و پرسرعت بدون نیاز به حساب گوگل — تمامی اشتراک‌ها و نودهای اختصاصی آلمان/ترکیه بلافاصله فعال می‌شوند.",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextCyberSecondary,
                             textAlign = TextAlign.Center,
                             lineHeight = 19.sp
                         )
 
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        // Segmented Mode Toggle: Login vs Sign Up
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(SecondarySurface)
+                                .border(BorderStroke(1.dp, GlassBorderSubtle), RoundedCornerShape(14.dp))
+                                .padding(4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf(false to "ورود به حساب", true to "ثبت‌نام جدید").forEach { (signUpFlag, label) ->
+                                val selected = isSignUpMode == signUpFlag
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(
+                                            if (selected) ElectricCyan.copy(alpha = 0.22f)
+                                            else androidx.compose.ui.graphics.Color.Transparent
+                                        )
+                                        .border(
+                                            width = if (selected) 1.dp else 0.dp,
+                                            color = if (selected) ElectricCyan else androidx.compose.ui.graphics.Color.Transparent,
+                                            shape = RoundedCornerShape(10.dp)
+                                        )
+                                        .clickable {
+                                            isSignUpMode = signUpFlag
+                                            errorMessage = null
+                                        }
+                                        .padding(vertical = 10.dp)
+                                        .testTag(if (signUpFlag) "auth_mode_register_tab" else "auth_mode_login_tab"),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = label,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp,
+                                        color = if (selected) ElectricCyan else TextCyberSecondary
+                                    )
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        AnimatedVisibility(visible = isSignUpMode) {
+                            OutlinedTextField(
+                                value = displayNameInput,
+                                onValueChange = { displayNameInput = it },
+                                label = { Text("نام و نام خانوادگی (نمایشی)") },
+                                leadingIcon = {
+                                    Icon(imageVector = Icons.Filled.Person, contentDescription = null, tint = PremiumTeal)
+                                },
+                                singleLine = true,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 10.dp)
+                                    .testTag("auth_name_input"),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = ElectricCyan,
+                                    unfocusedBorderColor = GlassBorderSubtle,
+                                    focusedTextColor = TextCyberPrimary,
+                                    unfocusedTextColor = TextCyberPrimary
+                                ),
+                                shape = RoundedCornerShape(12.dp)
+                            )
+                        }
+
+                        OutlinedTextField(
+                            value = emailInput,
+                            onValueChange = { emailInput = it },
+                            label = { Text("نشانی ایمیل (Email)") },
+                            leadingIcon = {
+                                Icon(imageVector = Icons.Filled.Email, contentDescription = null, tint = ElectricCyan)
+                            },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("auth_email_input"),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = ElectricCyan,
+                                unfocusedBorderColor = GlassBorderSubtle,
+                                focusedTextColor = TextCyberPrimary,
+                                unfocusedTextColor = TextCyberPrimary
+                            ),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        OutlinedTextField(
+                            value = passwordInput,
+                            onValueChange = { passwordInput = it },
+                            label = { Text("رمز عبور (حداقل ۶ کاراکتر)") },
+                            leadingIcon = {
+                                Icon(imageVector = Icons.Filled.Lock, contentDescription = null, tint = ElectricCyan)
+                            },
+                            trailingIcon = {
+                                IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                                    Icon(
+                                        imageVector = if (passwordVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                        contentDescription = "نمایش یا مخفی‌سازی رمز",
+                                        tint = TextCyberSecondary
+                                    )
+                                }
+                            },
+                            singleLine = true,
+                            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("auth_password_input"),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = ElectricCyan,
+                                unfocusedBorderColor = GlassBorderSubtle,
+                                focusedTextColor = TextCyberPrimary,
+                                unfocusedTextColor = TextCyberPrimary
+                            ),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+
+                        if (errorMessage != null) {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                text = errorMessage.orEmpty(),
+                                color = StatusError,
+                                style = MaterialTheme.typography.bodySmall,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.testTag("auth_error_text")
+                            )
+                        }
+
                         Spacer(modifier = Modifier.height(16.dp))
+
+                        Button(
+                            onClick = {
+                                errorMessage = null
+                                isSubmitting = true
+                                val res = localAuthManager.signInOrRegisterOfflineEmail(
+                                    rawEmail = emailInput,
+                                    rawPassword = passwordInput,
+                                    rawDisplayName = displayNameInput,
+                                    requireExplicitSignUp = isSignUpMode
+                                )
+                                val signedUser = res.user
+                                if (res.isSuccess && signedUser != null) {
+                                    coroutineScope.launch {
+                                        val now = System.currentTimeMillis()
+                                        withContext(Dispatchers.IO) {
+                                            runCatching {
+                                                LocalVpnConfigRepository(context.applicationContext)
+                                                    .upsertRegisteredUser(
+                                                        RegisteredUserEntity(
+                                                            userId = signedUser.uid,
+                                                            displayName = signedUser.username,
+                                                            email = signedUser.email,
+                                                            role = signedUser.role,
+                                                            maxDevices = 10,
+                                                            dataLimitBytes = 500.0 * 1024 * 1024 * 1024,
+                                                            subscriptionStatus = if (signedUser.isAdmin) "active" else "expired",
+                                                            createdAtMs = now,
+                                                            updatedAtMs = now
+                                                        )
+                                                    )
+                                            }
+                                        }
+                                        isSubmitting = false
+                                        onAuthSuccess()
+                                    }
+                                } else {
+                                    isSubmitting = false
+                                    errorMessage = res.errorMessage
+                                }
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(50.dp)
+                                .testTag("auth_email_submit_button"),
+                            shape = RoundedCornerShape(14.dp),
+                            enabled = !isSubmitting,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = ElectricCyan,
+                                contentColor = DeepGraphite
+                            )
+                        ) {
+                            if (isSubmitting) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(20.dp),
+                                    color = DeepGraphite,
+                                    strokeWidth = 2.dp
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                            }
+                            Text(
+                                text = if (isSignUpMode) "ثبت‌نام و ورود به برنامه" else "ورود با ایمیل و رمز عبور",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(14.dp))
 
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(16.dp))
-                                .background(SecondarySurface.copy(alpha = 0.85f))
-                                .border(BorderStroke(1.dp, GlassBorderSubtle), RoundedCornerShape(16.dp))
-                                .padding(14.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(ElevatedSurface.copy(alpha = 0.75f))
+                                .border(BorderStroke(1.dp, GlassBorderCyan.copy(alpha = 0.4f)), RoundedCornerShape(14.dp))
+                                .padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Icon(
                                     imageVector = Icons.Filled.VerifiedUser,
                                     contentDescription = null,
                                     tint = StatusConnected,
-                                    modifier = Modifier.size(18.dp)
+                                    modifier = Modifier.size(16.dp)
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = "احراز هویت ابری Google Sign-In با همگام‌سازی کامل",
-                                    style = MaterialTheme.typography.bodySmall,
+                                    text = "اتصال مستقیم ایمیل و رمز عبور با رمزنگاری PBKDF2-SHA256",
+                                    style = MaterialTheme.typography.labelSmall,
                                     color = TextCyberPrimary
                                 )
                             }
@@ -228,227 +406,14 @@ fun AuthScreen(
                                     imageVector = Icons.Filled.Shield,
                                     contentDescription = null,
                                     tint = ElectricCyan,
-                                    modifier = Modifier.size(18.dp)
+                                    modifier = Modifier.size(16.dp)
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = "پشتیبانی از ورود با ایمیل و رمز عبور در شرایط اینترنت ملی",
-                                    style = MaterialTheme.typography.bodySmall,
+                                    text = "پشتیبانی کامل از مخزن IP تمیز (۳۳۰+ IP)، نودهای آلمان/ترکیه و اشتراک‌ها",
+                                    style = MaterialTheme.typography.labelSmall,
                                     color = TextCyberSecondary
                                 )
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(18.dp))
-
-                        if (errorMessage != null) {
-                            Text(
-                                text = errorMessage.orEmpty(),
-                                color = StatusError,
-                                style = MaterialTheme.typography.bodySmall,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier
-                                    .padding(bottom = 12.dp)
-                                    .testTag("auth_error_text")
-                            )
-                        }
-
-                        Button(
-                            onClick = {
-                                isLoading = true
-                                errorMessage = null
-                                onGoogleSignInClicked(
-                                    context = context,
-                                    credentialManager = credentialManager,
-                                    onAuthSuccess = {
-                                        isLoading = false
-                                        onAuthSuccess()
-                                    },
-                                    onAuthError = { err ->
-                                        isLoading = false
-                                        errorMessage = err
-                                        showEmailPasswordSection = true
-                                    },
-                                    scope = coroutineScope,
-                                    onAuthCancelled = {
-                                        isLoading = false
-                                    }
-                                )
-                            },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(52.dp)
-                                .testTag("auth_google_sign_in_button"),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = ElectricCyan,
-                                contentColor = DeepGraphite
-                            ),
-                            shape = RoundedCornerShape(14.dp),
-                            enabled = !isLoading && !isAutoSigningIn
-                        ) {
-                            if (isLoading || isAutoSigningIn) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(22.dp),
-                                    color = DeepGraphite,
-                                    strokeWidth = 2.dp
-                                )
-                                Spacer(modifier = Modifier.width(10.dp))
-                                Text(
-                                    text = if (isAutoSigningIn) "در حال بررسی حساب..." else "در حال اتصال به گوگل...",
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 14.sp
-                                )
-                            } else {
-                                Icon(
-                                    imageVector = Icons.Filled.AccountCircle,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "ورود با حساب گوگل (Google Sign-In)",
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 14.sp
-                                )
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        // Offline / National Intranet Email & Password Toggle Button
-                        OutlinedButton(
-                            onClick = { showEmailPasswordSection = !showEmailPasswordSection },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(48.dp)
-                                .testTag("auth_email_mode_toggle"),
-                            shape = RoundedCornerShape(14.dp),
-                            border = BorderStroke(1.dp, GlassBorderCyan),
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = PremiumTeal)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.Hub,
-                                contentDescription = null,
-                                tint = PremiumTeal,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = if (showEmailPasswordSection) {
-                                    "بستن فرم ایمیل و رمز عبور"
-                                } else {
-                                    "ورود با ایمیل و رمز عبور (حالت اینترنت ملی)"
-                                },
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 12.sp,
-                                color = PremiumTeal
-                            )
-                        }
-
-                        AnimatedVisibility(visible = showEmailPasswordSection) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(top = 12.dp)
-                                    .clip(RoundedCornerShape(16.dp))
-                                    .background(ElevatedSurface)
-                                    .border(BorderStroke(1.dp, GlassBorderSubtle), RoundedCornerShape(16.dp))
-                                    .padding(14.dp),
-                                verticalArrangement = Arrangement.spacedBy(10.dp)
-                            ) {
-                                Text(
-                                    text = "ورود / فعال‌سازی آفلاین با ایمیل و رمز عبور",
-                                    style = MaterialTheme.typography.titleSmall,
-                                    color = ElectricCyan,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = "در زمان اختلال اینترنت یا مسدود بودن گوگل، بدون نیاز به سرور خارجی وارد شوید تا بتوانید اتصال VPN را برقرار کنید.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = TextCyberSecondary
-                                )
-
-                                OutlinedTextField(
-                                    value = emailInput,
-                                    onValueChange = { emailInput = it },
-                                    label = { Text("ایمیل (Email)") },
-                                    leadingIcon = {
-                                        Icon(imageVector = Icons.Filled.Email, contentDescription = null, tint = ElectricCyan)
-                                    },
-                                    singleLine = true,
-                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .testTag("auth_email_input"),
-                                    colors = OutlinedTextFieldDefaults.colors(
-                                        focusedBorderColor = ElectricCyan,
-                                        unfocusedBorderColor = GlassBorderSubtle,
-                                        focusedTextColor = TextCyberPrimary,
-                                        unfocusedTextColor = TextCyberPrimary
-                                    ),
-                                    shape = RoundedCornerShape(12.dp)
-                                )
-
-                                OutlinedTextField(
-                                    value = passwordInput,
-                                    onValueChange = { passwordInput = it },
-                                    label = { Text("رمز عبور (حداقل ۶ کاراکتر)") },
-                                    leadingIcon = {
-                                        Icon(imageVector = Icons.Filled.Lock, contentDescription = null, tint = ElectricCyan)
-                                    },
-                                    trailingIcon = {
-                                        IconButton(onClick = { passwordVisible = !passwordVisible }) {
-                                            Icon(
-                                                imageVector = if (passwordVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                                                contentDescription = "Toggle password",
-                                                tint = TextCyberSecondary
-                                            )
-                                        }
-                                    },
-                                    singleLine = true,
-                                    visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .testTag("auth_password_input"),
-                                    colors = OutlinedTextFieldDefaults.colors(
-                                        focusedBorderColor = ElectricCyan,
-                                        unfocusedBorderColor = GlassBorderSubtle,
-                                        focusedTextColor = TextCyberPrimary,
-                                        unfocusedTextColor = TextCyberPrimary
-                                    ),
-                                    shape = RoundedCornerShape(12.dp)
-                                )
-
-                                Button(
-                                    onClick = {
-                                        errorMessage = null
-                                        val res = localAuthManager.signInOrRegisterOfflineEmail(
-                                            rawEmail = emailInput,
-                                            rawPassword = passwordInput
-                                        )
-                                        if (res.isSuccess) {
-                                            onAuthSuccess()
-                                        } else {
-                                            errorMessage = res.errorMessage
-                                        }
-                                    },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(48.dp)
-                                        .testTag("auth_email_submit_button"),
-                                    shape = RoundedCornerShape(12.dp),
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = PremiumTeal,
-                                        contentColor = DeepGraphite
-                                    )
-                                ) {
-                                    Text(
-                                        text = "ورود / ثبت با ایمیل و رمز عبور",
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 13.sp
-                                    )
-                                }
                             }
                         }
                     }
@@ -458,89 +423,3 @@ fun AuthScreen(
     }
 }
 
-private suspend fun attemptAutoSignIn(
-    context: Context,
-    credentialManager: CredentialManager,
-    onAuthSuccess: () -> Unit,
-    onUnauthenticated: () -> Unit
-) {
-    if (Firebase.auth.currentUser != null || LocalUserAuthManager.restoreOfflineSession(context) != null) {
-        onAuthSuccess()
-        return
-    }
-    val clientId = try {
-        context.getString(R.string.default_web_client_id)
-    } catch (e: Exception) {
-        Log.w(TAG, "default_web_client_id missing for auto sign-in", e)
-        onUnauthenticated()
-        return
-    }
-
-    val googleIdOption = GetGoogleIdOption.Builder()
-        .setFilterByAuthorizedAccounts(true)
-        .setServerClientId(clientId)
-        .setAutoSelectEnabled(true)
-        .build()
-
-    val request = GetCredentialRequest.Builder()
-        .addCredentialOption(googleIdOption)
-        .build()
-
-    try {
-        val result = credentialManager.getCredential(context as Activity, request)
-        val credential = result.credential
-        if (credential is CustomCredential && credential.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
-            val googleIdToken = GoogleIdTokenCredential.createFrom(credential.data).idToken
-            val authCredential = GoogleAuthProvider.getCredential(googleIdToken, null)
-            Firebase.auth.signInWithCredential(authCredential).await()
-            onAuthSuccess()
-        } else {
-            onUnauthenticated()
-        }
-    } catch (e: Exception) {
-        Log.d(TAG, "Silent auto sign-in unavailable: ${e.message}")
-        onUnauthenticated()
-    }
-}
-
-private fun onGoogleSignInClicked(
-    context: Context,
-    credentialManager: CredentialManager,
-    onAuthSuccess: () -> Unit,
-    onAuthError: (String) -> Unit,
-    scope: CoroutineScope,
-    onAuthCancelled: () -> Unit
-) {
-    val clientId = try {
-        context.getString(R.string.default_web_client_id)
-    } catch (e: Exception) {
-        onAuthError("پیکربندی ورود گوگل یافت نشد: default_web_client_id missing")
-        return
-    }
-
-    val signInOption = GetSignInWithGoogleOption.Builder(serverClientId = clientId).build()
-    val request = GetCredentialRequest.Builder()
-        .addCredentialOption(signInOption)
-        .build()
-
-    scope.launch {
-        try {
-            val result = credentialManager.getCredential(context as Activity, request)
-            val credential = result.credential
-            if (credential is CustomCredential && credential.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
-                val googleIdToken = GoogleIdTokenCredential.createFrom(credential.data).idToken
-                val authCredential = GoogleAuthProvider.getCredential(googleIdToken, null)
-                Firebase.auth.signInWithCredential(authCredential).await()
-                onAuthSuccess()
-            } else {
-                onAuthError("نوع اعتبار دریافتی نامعتبر است")
-            }
-        } catch (e: GetCredentialCancellationException) {
-            Log.w(TAG, "Google Sign-In flow cancelled or dismissed: ${e.message}", e)
-            onAuthCancelled()
-        } catch (e: Exception) {
-            Log.e(TAG, "Google Sign-In failed", e)
-            onAuthError(e.localizedMessage ?: "خطا در ورود با حساب گوگل")
-        }
-    }
-}

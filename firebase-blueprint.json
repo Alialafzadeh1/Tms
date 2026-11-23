@@ -19,6 +19,10 @@
         "pingMs": { "type": "integer", "description": "Last tested latency in milliseconds (-1 for offline)" },
         "status": { "type": "string", "description": "Status: online, offline, untested" },
         "isFavorite": { "type": "boolean", "description": "Flag for favorite config" },
+        "origin": { "type": "string", "description": "Source category: USER_IMPORTED, SUBSCRIPTION_ASSIGNED, SYSTEM_MANAGED" },
+        "subscriptionId": { "type": "string", "description": "Linked subscription ID when origin is SUBSCRIPTION_ASSIGNED" },
+        "endpointId": { "type": "string", "description": "Linked inventory endpoint ID" },
+        "allocationVersion": { "type": "integer", "description": "Allocation version number" },
         "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp via serverTimestamp" },
         "updatedAt": { "type": "string", "format": "date-time", "description": "Last update timestamp via serverTimestamp" }
       },
@@ -72,7 +76,7 @@
         "userId": { "type": "string", "description": "User identifier matching auth.uid" },
         "displayName": { "type": "string", "description": "User display name" },
         "email": { "type": "string", "description": "User email address" },
-        "role": { "type": "string", "description": "RBAC Role: SUPER_ADMIN, SERVER_MANAGER, USER_ADMIN, AUDITOR" },
+        "role": { "type": "string", "description": "RBAC Role: user, SUPER_ADMIN, SERVER_MANAGER, USER_ADMIN, AUDITOR" },
         "deviceCount": { "type": "integer", "description": "Currently active registered devices" },
         "maxDevices": { "type": "integer", "description": "Maximum device limit" },
         "dataUsageBytes": { "type": "number", "description": "Bandwidth consumed in bytes" },
@@ -98,12 +102,245 @@
         "createdAt": { "type": "string", "format": "date-time", "description": "Server timestamp of event" }
       },
       "required": ["userId", "action", "role", "module", "status", "createdAt"]
+    },
+    "UserSubscription": {
+      "title": "User Subscription",
+      "description": "Server-controlled user subscription plan, entitlement state, and rotation version",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Owner Firebase UID" },
+        "userEmail": { "type": "string", "description": "Owner email for admin lookup" },
+        "planId": { "type": "string", "description": "Plan ID: plan_1m, plan_3m, plan_1y" },
+        "planDurationDays": { "type": "integer", "description": "Plan duration in days (30, 90, 365)" },
+        "endpointAllocationLimit": { "type": "integer", "description": "Daily dedicated IP endpoint quota (5, 15, 50)" },
+        "startDate": { "type": "string", "format": "date-time", "description": "Trusted activation timestamp" },
+        "expirationDate": { "type": "string", "format": "date-time", "description": "Trusted expiration timestamp" },
+        "status": { "type": "string", "description": "PENDING_PAYMENT, ACTIVE, EXPIRED, SUSPENDED, CANCELLED" },
+        "paymentStatus": { "type": "string", "description": "UNPAID, PENDING_VERIFICATION, CONFIRMED, FAILED, REFUNDED" },
+        "lastDailyRotation": { "type": "string", "format": "date-time", "description": "Last daily rotation timestamp" },
+        "lastRotationCycleKey": { "type": "string", "description": "UTC date key YYYY-MM-DD for idempotent daily rotation" },
+        "currentAllocationVersion": { "type": "integer", "description": "Monotonic allocation version" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation server timestamp" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Update server timestamp" }
+      },
+      "required": ["userId", "planId", "planDurationDays", "endpointAllocationLimit", "status", "paymentStatus", "currentAllocationVersion", "createdAt", "updatedAt"]
+    },
+    "ManagedEndpoint": {
+      "title": "Central Managed Endpoint",
+      "description": "Central healthy endpoint pool entry with exclusive ownership tracking and zero private credentials",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "country": { "type": "string" },
+        "countryCode": { "type": "string" },
+        "host": { "type": "string" },
+        "port": { "type": "integer" },
+        "protocol": { "type": "string" },
+        "transport": { "type": "string" },
+        "security": { "type": "string" },
+        "sni": { "type": "string" },
+        "pathOrServiceName": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "healthy": { "type": "boolean" },
+        "priorityTier": { "type": "integer" },
+        "latencyMs": { "type": "integer" },
+        "stabilityScore": { "type": "integer" },
+        "assignedUserId": { "type": "string" },
+        "assignedSubscriptionId": { "type": "string" },
+        "allocationExpiresAt": { "type": "string", "format": "date-time" },
+        "failureCount": { "type": "integer" },
+        "cooldownUntil": { "type": "string", "format": "date-time" },
+        "lastHealthCheckAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "countryCode", "host", "port", "protocol", "enabled", "healthy", "priorityTier", "assignedUserId", "createdAt", "updatedAt"]
+    },
+    "AllocatedEndpointRecord": {
+      "title": "Private Allocated Endpoint",
+      "description": "User-isolated dedicated endpoint allocation with user credential token",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "subscriptionId": { "type": "string" },
+        "endpointId": { "type": "string" },
+        "endpointName": { "type": "string" },
+        "country": { "type": "string" },
+        "countryCode": { "type": "string" },
+        "host": { "type": "string" },
+        "port": { "type": "integer" },
+        "protocol": { "type": "string" },
+        "transport": { "type": "string" },
+        "security": { "type": "string" },
+        "sni": { "type": "string" },
+        "pathOrServiceName": { "type": "string" },
+        "credentialToken": { "type": "string" },
+        "rawConfig": { "type": "string" },
+        "allocationVersion": { "type": "integer" },
+        "cycleKey": { "type": "string" },
+        "allocationStatus": { "type": "string" },
+        "healthy": { "type": "boolean" },
+        "latencyMs": { "type": "integer" },
+        "allocatedAt": { "type": "string", "format": "date-time" },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "subscriptionId", "endpointId", "host", "port", "protocol", "credentialToken", "rawConfig", "allocationVersion", "allocationStatus", "updatedAt"]
+    },
+    "SubscriptionHistoryEvent": {
+      "title": "Subscription History Event",
+      "description": "Immutable subscription lifecycle audit event",
+      "type": "object",
+      "properties": {
+        "subscriptionId": { "type": "string" },
+        "userId": { "type": "string" },
+        "action": { "type": "string" },
+        "fromPlanId": { "type": "string" },
+        "toPlanId": { "type": "string" },
+        "statusAfter": { "type": "string" },
+        "actorId": { "type": "string" },
+        "details": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["subscriptionId", "userId", "action", "statusAfter", "actorId", "createdAt"]
+    },
+    "AllocationHistoryRecord": {
+      "title": "Allocation History Record",
+      "description": "Immutable per-user dedicated endpoint allocation, rotation, failure, cooldown, and revocation log",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "subscriptionId": { "type": "string" },
+        "planId": { "type": "string" },
+        "endpointId": { "type": "string" },
+        "endpointName": { "type": "string" },
+        "host": { "type": "string" },
+        "port": { "type": "integer" },
+        "protocol": { "type": "string" },
+        "action": { "type": "string" },
+        "allocationVersion": { "type": "integer" },
+        "cycleKey": { "type": "string" },
+        "reason": { "type": "string" },
+        "actorId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "subscriptionId", "endpointId", "action", "allocationVersion", "actorId", "createdAt"]
+    },
+    "PaymentRequestRecord": {
+      "title": "Payment Verification Request",
+      "description": "User-submitted payment intent awaiting trusted backend/admin verification",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "userEmail": { "type": "string" },
+        "subscriptionId": { "type": "string" },
+        "planId": { "type": "string" },
+        "actionType": { "type": "string" },
+        "provider": { "type": "string" },
+        "referenceCode": { "type": "string" },
+        "status": { "type": "string" },
+        "note": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "verifiedAt": { "type": "string", "format": "date-time" },
+        "verifiedBy": { "type": "string" }
+      },
+      "required": ["userId", "planId", "actionType", "status", "createdAt"]
+    },
+    "InventoryShortageAlert": {
+      "title": "Inventory Shortage Alert",
+      "description": "Admin alert emitted when healthy inventory cannot satisfy an active user quota",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "subscriptionId": { "type": "string" },
+        "planId": { "type": "string" },
+        "requestedCount": { "type": "integer" },
+        "allocatedCount": { "type": "integer" },
+        "shortfallCount": { "type": "integer" },
+        "cycleKey": { "type": "string" },
+        "reason": { "type": "string" },
+        "resolved": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "subscriptionId", "planId", "requestedCount", "allocatedCount", "shortfallCount", "cycleKey", "resolved", "createdAt"]
+    },
+    "RotationAuditLog": {
+      "title": "Rotation Scheduler Audit Log",
+      "description": "Immutable log of daily or manual endpoint rotation operations",
+      "type": "object",
+      "properties": {
+        "cycleKey": { "type": "string" },
+        "triggerMode": { "type": "string" },
+        "triggeredByUid": { "type": "string" },
+        "targetUserCount": { "type": "integer" },
+        "rotatedUsersCount": { "type": "integer" },
+        "replacedEndpointsCount": { "type": "integer" },
+        "shortageCount": { "type": "integer" },
+        "status": { "type": "string" },
+        "details": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["cycleKey", "triggerMode", "triggeredByUid", "status", "createdAt"]
+    },
+    "AdminRecord": {
+      "title": "Authorized Admin Record",
+      "description": "Admin registry document used by Firestore rules",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "email": { "type": "string" },
+        "role": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "email", "role", "createdAt"]
+    },
+    "SupportTicket": {
+      "title": "TMS NEXUS AI Support Ticket",
+      "description": "User support ticket with optional AI triage summary and admin status tracking",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "userEmail": { "type": "string" },
+        "subject": { "type": "string" },
+        "category": { "type": "string" },
+        "priority": { "type": "string" },
+        "status": { "type": "string" },
+        "description": { "type": "string" },
+        "aiTriageSummary": { "type": "string" },
+        "lastReplyText": { "type": "string" },
+        "lastReplyByRole": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "subject", "category", "priority", "status", "description", "createdAt", "updatedAt"]
+    },
+    "SupportTicketReply": {
+      "title": "Support Ticket Reply",
+      "description": "Append-only message inside a support ticket conversation",
+      "type": "object",
+      "properties": {
+        "ticketId": { "type": "string" },
+        "userId": { "type": "string" },
+        "senderUid": { "type": "string" },
+        "senderRole": { "type": "string" },
+        "message": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ticketId", "userId", "senderUid", "senderRole", "message", "createdAt"]
     }
   },
   "firestore": {
+    "/admins/{adminUid}": {
+      "schema": "AdminRecord",
+      "description": "Authorized administrator registry"
+    },
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profile and quota metadata"
+    },
     "/users/{userId}/vpn_configs/{configId}": {
       "schema": "VpnConfig",
-      "description": "VPN configurations owned by the user"
+      "description": "VPN configurations owned by the user (user-imported, subscription-assigned, system-managed)"
     },
     "/users/{userId}/vpn_servers/{serverId}": {
       "schema": "VpnServer",
@@ -115,11 +352,47 @@
     },
     "/users/{userId}/audit_logs/{logId}": {
       "schema": "AuthAuditLog",
-      "description": "Security and RBAC audit logs for administrator operations"
+      "description": "Security and RBAC audit logs"
     },
-    "/users/{userId}": {
-      "schema": "UserProfile",
-      "description": "User profile and subscription metadata"
+    "/users/{userId}/allocated_endpoints/{allocationId}": {
+      "schema": "AllocatedEndpointRecord",
+      "description": "Private per-user dedicated IP endpoint allocations with user credentials"
+    },
+    "/users/{userId}/subscription_history/{eventId}": {
+      "schema": "SubscriptionHistoryEvent",
+      "description": "User subscription lifecycle audit trail"
+    },
+    "/users/{userId}/allocation_history/{historyId}": {
+      "schema": "AllocationHistoryRecord",
+      "description": "Immutable dedicated endpoint allocation, rotation, cooldown, and revocation history per user"
+    },
+    "/subscriptions/{subscriptionId}": {
+      "schema": "UserSubscription",
+      "description": "Central server-verified user subscriptions"
+    },
+    "/endpoint_inventory/{endpointId}": {
+      "schema": "ManagedEndpoint",
+      "description": "Central healthy endpoint pool with exclusivity lock and zero private credentials"
+    },
+    "/payment_requests/{paymentId}": {
+      "schema": "PaymentRequestRecord",
+      "description": "User payment verification requests confirmed only by trusted admin/backend"
+    },
+    "/shortage_alerts/{alertId}": {
+      "schema": "InventoryShortageAlert",
+      "description": "Administrator alerts for insufficient healthy endpoints"
+    },
+    "/rotation_logs/{logId}": {
+      "schema": "RotationAuditLog",
+      "description": "Append-only daily and manual rotation audit logs"
+    },
+    "/support_tickets/{ticketId}": {
+      "schema": "SupportTicket",
+      "description": "User support tickets with AI triage and admin reply tracking"
+    },
+    "/support_tickets/{ticketId}/replies/{replyId}": {
+      "schema": "SupportTicketReply",
+      "description": "Immutable replies within a support ticket thread"
     }
   }
 }

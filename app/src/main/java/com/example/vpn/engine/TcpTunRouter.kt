@@ -139,16 +139,28 @@ class TcpTunRouter(
         targetPort: Int
     ) {
         try {
-            val effectiveConfig = if (DynamicIpDnsRotator.isAutoRotateEnabled.value) {
-                config.copy(server = DynamicIpDnsRotator.getActiveOutboundIp(config.server))
-            } else {
-                config
-            }
+            val primaryHost = DynamicIpDnsRotator.getActiveOutboundIp(config.server, preferTargetHost = true)
+            val primaryConfig = if (primaryHost != config.server) config.copy(server = primaryHost) else config
 
             var proxySuccess = false
+            if (primaryConfig.server.isNotBlank()) {
+                proxySuccess = tryProxyConnection(session, primaryConfig, targetHost, targetPort)
+            }
 
-            if (effectiveConfig.server.isNotBlank()) {
-                proxySuccess = tryProxyConnection(session, effectiveConfig, targetHost, targetPort)
+            // Retry once via verified Clean IP rotation if primary dial failed on WS/TLS CDN config
+            if (!proxySuccess && scope.isActive && session.socket?.isClosed != true &&
+                DynamicIpDnsRotator.isAutoRotateEnabled.value &&
+                config.transport.equals("ws", ignoreCase = true)
+            ) {
+                val fallbackCleanIp = DynamicIpDnsRotator.currentCleanIp.value
+                if (fallbackCleanIp.isNotBlank() && !fallbackCleanIp.equals(primaryConfig.server, ignoreCase = true)) {
+                    proxySuccess = tryProxyConnection(
+                        session,
+                        config.copy(server = fallbackCleanIp),
+                        targetHost,
+                        targetPort
+                    )
+                }
             }
 
             // Failover to Direct Anti-DPI Piercing if proxy fails or wasn't configured

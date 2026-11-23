@@ -27,6 +27,23 @@ service cloud.firestore {
       return val is timestamp && val <= request.time;
     }
 
+    // Bootstrapped primary super-admin verified email check (O(1), safe inside allow list)
+    function isBootstrappedAdmin() {
+      return isSignedIn() &&
+             request.auth.token.email_verified == true &&
+             request.auth.token.email == 'alafzadehali@gmail.com';
+    }
+
+    // Full Admin check for get/create/update/delete (verified email OR registered /admins/{uid})
+    function isAdmin() {
+      return isBootstrappedAdmin() ||
+             (isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    function isValidConfigOrigin(origin) {
+      return origin == 'USER_IMPORTED' || origin == 'SUBSCRIPTION_ASSIGNED' || origin == 'SYSTEM_MANAGED';
+    }
+
     function isValidVpnConfig(data) {
       return data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
              data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
@@ -42,6 +59,10 @@ service cloud.firestore {
              (!('pingMs' in data) || (data.pingMs is int)) &&
              (!('status' in data) || (data.status is string && (data.status == 'online' || data.status == 'offline' || data.status == 'untested'))) &&
              (!('isFavorite' in data) || (data.isFavorite is bool)) &&
+             (!('origin' in data) || (data.origin is string && isValidConfigOrigin(data.origin))) &&
+             (!('subscriptionId' in data) || (data.subscriptionId is string && data.subscriptionId.size() <= 128)) &&
+             (!('endpointId' in data) || (data.endpointId is string && data.endpointId.size() <= 128)) &&
+             (!('allocationVersion' in data) || (data.allocationVersion is int && data.allocationVersion >= 0)) &&
              isValidTimestamp(data.updatedAt);
     }
 
@@ -105,50 +126,252 @@ service cloud.firestore {
              isValidTimestamp(data.createdAt);
     }
 
-    match /users/{userId} {
-      allow get: if isSignedIn() && request.auth.uid == userId && isValidId(userId);
-      allow list: if false;
+    function isValidPlanId(planId) {
+      return planId == 'plan_1m' || planId == 'plan_3m' || planId == 'plan_1y';
+    }
 
+    function isValidSubscriptionStatus(s) {
+      return s == 'PENDING_PAYMENT' || s == 'ACTIVE' || s == 'EXPIRED' || s == 'SUSPENDED' || s == 'CANCELLED';
+    }
+
+    function isValidPaymentStatus(p) {
+      return p == 'UNPAID' || p == 'PENDING_VERIFICATION' || p == 'CONFIRMED' || p == 'FAILED' || p == 'REFUNDED';
+    }
+
+    function isValidUserSubscription(data) {
+      return data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             (!('userEmail' in data) || (data.userEmail is string && data.userEmail.size() <= 256)) &&
+             data.planId is string && isValidPlanId(data.planId) &&
+             data.planDurationDays is int && (data.planDurationDays == 30 || data.planDurationDays == 90 || data.planDurationDays == 365) &&
+             data.endpointAllocationLimit is int && (data.endpointAllocationLimit == 5 || data.endpointAllocationLimit == 15 || data.endpointAllocationLimit == 50) &&
+             (!('startDate' in data) || data.startDate == null || data.startDate is timestamp) &&
+             (!('expirationDate' in data) || data.expirationDate == null || data.expirationDate is timestamp) &&
+             data.status is string && isValidSubscriptionStatus(data.status) &&
+             data.paymentStatus is string && isValidPaymentStatus(data.paymentStatus) &&
+             (!('lastDailyRotation' in data) || data.lastDailyRotation == null || data.lastDailyRotation is timestamp) &&
+             (!('lastRotationCycleKey' in data) || (data.lastRotationCycleKey is string && data.lastRotationCycleKey.size() <= 32)) &&
+             data.currentAllocationVersion is int && data.currentAllocationVersion >= 0 &&
+             isValidTimestamp(data.updatedAt);
+    }
+
+    function isValidManagedEndpoint(data) {
+      return data.name is string && data.name.size() > 0 && data.name.size() <= 120 &&
+             (!('country' in data) || (data.country is string && data.country.size() <= 100)) &&
+             data.countryCode is string && data.countryCode.size() >= 2 && data.countryCode.size() <= 8 &&
+             data.host is string && data.host.size() > 0 && data.host.size() <= 256 &&
+             data.port is int && data.port >= 1 && data.port <= 65535 &&
+             data.protocol is string && (data.protocol == 'vless' || data.protocol == 'vmess' || data.protocol == 'trojan' || data.protocol == 'shadowsocks') &&
+             (!('transport' in data) || (data.transport is string && data.transport.size() <= 32)) &&
+             (!('security' in data) || (data.security is string && data.security.size() <= 32)) &&
+             (!('sni' in data) || (data.sni is string && data.sni.size() <= 256)) &&
+             (!('pathOrServiceName' in data) || (data.pathOrServiceName is string && data.pathOrServiceName.size() <= 256)) &&
+             data.enabled is bool &&
+             data.healthy is bool &&
+             data.priorityTier is int && data.priorityTier >= 1 && data.priorityTier <= 3 &&
+             (!('latencyMs' in data) || data.latencyMs is int) &&
+             (!('stabilityScore' in data) || (data.stabilityScore is int && data.stabilityScore >= 0 && data.stabilityScore <= 100)) &&
+             data.assignedUserId is string && data.assignedUserId.size() <= 128 &&
+             (!('assignedSubscriptionId' in data) || (data.assignedSubscriptionId is string && data.assignedSubscriptionId.size() <= 128)) &&
+             (!('allocationExpiresAt' in data) || data.allocationExpiresAt == null || data.allocationExpiresAt is timestamp) &&
+             (!('failureCount' in data) || (data.failureCount is int && data.failureCount >= 0)) &&
+             (!('cooldownUntil' in data) || data.cooldownUntil == null || data.cooldownUntil is timestamp) &&
+             (!('lastHealthCheckAt' in data) || data.lastHealthCheckAt == null || data.lastHealthCheckAt is timestamp) &&
+             isValidTimestamp(data.updatedAt) &&
+             // Never allow private credentials inside central shared inventory
+             !('uuidOrPassword' in data) &&
+             !('credentialToken' in data) &&
+             !('rawConfig' in data);
+    }
+
+    function isValidAllocatedEndpoint(data) {
+      return data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             data.subscriptionId is string && data.subscriptionId.size() > 0 && data.subscriptionId.size() <= 128 &&
+             data.endpointId is string && data.endpointId.size() > 0 && data.endpointId.size() <= 128 &&
+             (!('endpointName' in data) || (data.endpointName is string && data.endpointName.size() <= 120)) &&
+             (!('country' in data) || (data.country is string && data.country.size() <= 100)) &&
+             (!('countryCode' in data) || (data.countryCode is string && data.countryCode.size() <= 8)) &&
+             data.host is string && data.host.size() > 0 && data.host.size() <= 256 &&
+             data.port is int && data.port >= 1 && data.port <= 65535 &&
+             data.protocol is string && (data.protocol == 'vless' || data.protocol == 'vmess' || data.protocol == 'trojan' || data.protocol == 'shadowsocks') &&
+             (!('transport' in data) || (data.transport is string && data.transport.size() <= 32)) &&
+             (!('security' in data) || (data.security is string && data.security.size() <= 32)) &&
+             (!('sni' in data) || (data.sni is string && data.sni.size() <= 256)) &&
+             (!('pathOrServiceName' in data) || (data.pathOrServiceName is string && data.pathOrServiceName.size() <= 256)) &&
+             data.credentialToken is string && data.credentialToken.size() > 0 && data.credentialToken.size() <= 512 &&
+             data.rawConfig is string && data.rawConfig.size() > 0 && data.rawConfig.size() <= 4096 &&
+             data.allocationVersion is int && data.allocationVersion >= 0 &&
+             (!('cycleKey' in data) || (data.cycleKey is string && data.cycleKey.size() <= 32)) &&
+             data.allocationStatus is string && (data.allocationStatus == 'ACTIVE' || data.allocationStatus == 'ROTATED_OUT' || data.allocationStatus == 'FAILED' || data.allocationStatus == 'REVOKED') &&
+             (!('healthy' in data) || data.healthy is bool) &&
+             (!('latencyMs' in data) || data.latencyMs is int) &&
+             (!('allocatedAt' in data) || data.allocatedAt == null || data.allocatedAt is timestamp) &&
+             (!('expiresAt' in data) || data.expiresAt == null || data.expiresAt is timestamp) &&
+             isValidTimestamp(data.updatedAt);
+    }
+
+    function isValidSubscriptionHistoryEvent(data) {
+      return data.subscriptionId is string && data.subscriptionId.size() > 0 && data.subscriptionId.size() <= 128 &&
+             data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             data.action is string && data.action.size() > 0 && data.action.size() <= 64 &&
+             (!('fromPlanId' in data) || (data.fromPlanId is string && data.fromPlanId.size() <= 32)) &&
+             (!('toPlanId' in data) || (data.toPlanId is string && data.toPlanId.size() <= 32)) &&
+             data.statusAfter is string && isValidSubscriptionStatus(data.statusAfter) &&
+             data.actorId is string && data.actorId.size() > 0 && data.actorId.size() <= 128 &&
+             (!('details' in data) || (data.details is string && data.details.size() <= 512)) &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    function isValidAllocationHistoryAction(action) {
+      return action == 'ALLOCATED' ||
+             action == 'ROTATED_OUT' ||
+             action == 'REPLACED_FAILED' ||
+             action == 'REVOKED_EXPIRED' ||
+             action == 'COOLDOWN_EXCLUDED';
+    }
+
+    function isValidAllocationHistoryRecord(data) {
+      return data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             data.subscriptionId is string && data.subscriptionId.size() <= 128 &&
+             (!('planId' in data) || (data.planId is string && data.planId.size() <= 32)) &&
+             data.endpointId is string && data.endpointId.size() > 0 && data.endpointId.size() <= 128 &&
+             (!('endpointName' in data) || (data.endpointName is string && data.endpointName.size() <= 120)) &&
+             (!('host' in data) || (data.host is string && data.host.size() <= 256)) &&
+             (!('port' in data) || (data.port is int && data.port >= 1 && data.port <= 65535)) &&
+             (!('protocol' in data) || (data.protocol is string && data.protocol.size() <= 32)) &&
+             data.action is string && isValidAllocationHistoryAction(data.action) &&
+             data.allocationVersion is int && data.allocationVersion >= 0 &&
+             (!('cycleKey' in data) || (data.cycleKey is string && data.cycleKey.size() <= 32)) &&
+             (!('reason' in data) || (data.reason is string && data.reason.size() <= 512)) &&
+             data.actorId is string && data.actorId.size() > 0 && data.actorId.size() <= 128 &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    function isValidPaymentRequest(data) {
+      return data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             (!('userEmail' in data) || (data.userEmail is string && data.userEmail.size() <= 256)) &&
+             (!('subscriptionId' in data) || (data.subscriptionId is string && data.subscriptionId.size() <= 128)) &&
+             data.planId is string && isValidPlanId(data.planId) &&
+             data.actionType is string && (data.actionType == 'NEW' || data.actionType == 'RENEW' || data.actionType == 'UPGRADE' || data.actionType == 'DOWNGRADE') &&
+             (!('provider' in data) || (data.provider is string && data.provider.size() <= 64)) &&
+             (!('referenceCode' in data) || (data.referenceCode is string && data.referenceCode.size() <= 128)) &&
+             data.status is string && (data.status == 'PENDING_PAYMENT' || data.status == 'PENDING_VERIFICATION' || data.status == 'CONFIRMED' || data.status == 'FAILED' || data.status == 'REJECTED') &&
+             (!('note' in data) || (data.note is string && data.note.size() <= 512)) &&
+             (!('verifiedBy' in data) || (data.verifiedBy is string && data.verifiedBy.size() <= 128)) &&
+             (!('verifiedAt' in data) || data.verifiedAt == null || data.verifiedAt is timestamp) &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    function isValidShortageAlert(data) {
+      return data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             data.subscriptionId is string && data.subscriptionId.size() > 0 && data.subscriptionId.size() <= 128 &&
+             data.planId is string && isValidPlanId(data.planId) &&
+             data.requestedCount is int && data.requestedCount >= 0 &&
+             data.allocatedCount is int && data.allocatedCount >= 0 &&
+             data.shortfallCount is int && data.shortfallCount >= 0 &&
+             data.cycleKey is string && data.cycleKey.size() > 0 && data.cycleKey.size() <= 32 &&
+             (!('reason' in data) || (data.reason is string && data.reason.size() <= 512)) &&
+             data.resolved is bool &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    function isValidRotationAuditLog(data) {
+      return data.cycleKey is string && data.cycleKey.size() > 0 && data.cycleKey.size() <= 32 &&
+             data.triggerMode is string && data.triggerMode.size() > 0 && data.triggerMode.size() <= 64 &&
+             data.triggeredByUid is string && data.triggeredByUid.size() > 0 && data.triggeredByUid.size() <= 128 &&
+             (!('targetUserCount' in data) || (data.targetUserCount is int && data.targetUserCount >= 0)) &&
+             (!('rotatedUsersCount' in data) || (data.rotatedUsersCount is int && data.rotatedUsersCount >= 0)) &&
+             (!('replacedEndpointsCount' in data) || (data.replacedEndpointsCount is int && data.replacedEndpointsCount >= 0)) &&
+             (!('shortageCount' in data) || (data.shortageCount is int && data.shortageCount >= 0)) &&
+             data.status is string && data.status.size() > 0 && data.status.size() <= 32 &&
+             (!('details' in data) || (data.details is string && data.details.size() <= 1024)) &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    // --- ADMIN REGISTRY ---
+    match /admins/{adminUid} {
+      allow get: if isSignedIn() && isValidId(adminUid) && (request.auth.uid == adminUid || isAdmin());
+      allow list: if isBootstrappedAdmin();
+      allow create, update, delete: if isBootstrappedAdmin() && isValidId(adminUid);
+    }
+
+    // --- USERS & USER-SCOPED SUBCOLLECTIONS ---
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
+      allow list: if isBootstrappedAdmin();
+
+      // Prevent self-escalation on profile creation: non-admins cannot set role != 'user' or subscriptionStatus == 'active'
       allow create: if isSignedIn() &&
-                       request.auth.uid == userId &&
+                       isValidId(userId) &&
                        incoming().userId == userId &&
                        incoming().createdAt is timestamp &&
                        isValidTimestamp(incoming().createdAt) &&
-                       isValidUserProfile(incoming());
+                       isValidUserProfile(incoming()) && (
+                         isAdmin() || (
+                           request.auth.uid == userId &&
+                           incoming().role == 'user' &&
+                           (incoming().subscriptionStatus == 'expired' || incoming().subscriptionStatus == 'trial')
+                         )
+                       );
 
+      // Non-admins may only update displayName; RBAC role, device quotas, & subscriptionStatus require Admin
       allow update: if isSignedIn() &&
-                       request.auth.uid == userId &&
+                       isValidId(userId) &&
                        incoming().userId == existing().userId &&
                        incoming().createdAt == existing().createdAt &&
-                       isValidUserProfile(incoming());
+                       isValidUserProfile(incoming()) && (
+                         isAdmin() || (
+                           request.auth.uid == userId &&
+                           incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt'])
+                         )
+                       );
 
-      allow delete: if isSignedIn() && request.auth.uid == userId;
+      allow delete: if isAdmin() && isValidId(userId);
 
       match /vpn_configs/{configId} {
-        allow get: if isSignedIn() && request.auth.uid == userId && isValidId(configId);
-        allow list: if isSignedIn() && request.auth.uid == userId;
+        allow get: if isSignedIn() && isValidId(configId) && (request.auth.uid == userId || isAdmin());
+        allow list: if isSignedIn() && (request.auth.uid == userId || isBootstrappedAdmin());
 
         allow create: if isSignedIn() &&
-                         request.auth.uid == userId &&
+                         isValidId(configId) &&
                          incoming().userId == userId &&
                          incoming().createdAt is timestamp &&
                          isValidTimestamp(incoming().createdAt) &&
-                         isValidVpnConfig(incoming());
+                         isValidVpnConfig(incoming()) && (
+                           isAdmin() || (
+                             request.auth.uid == userId &&
+                             (!('origin' in incoming()) || incoming().origin == 'USER_IMPORTED')
+                           )
+                         );
 
         allow update: if isSignedIn() &&
-                         request.auth.uid == userId &&
+                         isValidId(configId) &&
                          incoming().userId == existing().userId &&
                          incoming().createdAt == existing().createdAt &&
-                         isValidVpnConfig(incoming());
+                         isValidVpnConfig(incoming()) && (
+                           isAdmin() || (
+                             request.auth.uid == userId &&
+                             (!('origin' in existing()) || existing().origin == 'USER_IMPORTED') &&
+                             (!('origin' in incoming()) || incoming().origin == existing().origin)
+                           )
+                         );
 
-        allow delete: if isSignedIn() && request.auth.uid == userId && isValidId(configId);
+        // System-managed configurations cannot be deleted; subscription configs require Admin/rotation
+        allow delete: if isSignedIn() &&
+                         isValidId(configId) &&
+                         (!('origin' in existing()) || existing().origin != 'SYSTEM_MANAGED') && (
+                           isAdmin() || (
+                             request.auth.uid == userId &&
+                             (!('origin' in existing()) || existing().origin == 'USER_IMPORTED')
+                           )
+                         );
       }
 
       match /vpn_servers/{serverId} {
-        allow get: if isSignedIn() && request.auth.uid == userId && isValidId(serverId);
-        allow list: if isSignedIn() && request.auth.uid == userId;
+        allow get: if isSignedIn() && isValidId(serverId) && (request.auth.uid == userId || isAdmin());
+        allow list: if isSignedIn() && (request.auth.uid == userId || isBootstrappedAdmin());
 
         allow create: if isSignedIn() &&
+                         isValidId(serverId) &&
                          request.auth.uid == userId &&
                          incoming().userId == userId &&
                          incoming().createdAt is timestamp &&
@@ -156,19 +379,21 @@ service cloud.firestore {
                          isValidVpnServer(incoming());
 
         allow update: if isSignedIn() &&
+                         isValidId(serverId) &&
                          request.auth.uid == userId &&
                          incoming().userId == existing().userId &&
                          incoming().createdAt == existing().createdAt &&
                          isValidVpnServer(incoming());
 
-        allow delete: if isSignedIn() && request.auth.uid == userId && isValidId(serverId);
+        allow delete: if isSignedIn() && isValidId(serverId) && request.auth.uid == userId;
       }
 
       match /failover_policies/{policyId} {
-        allow get: if isSignedIn() && request.auth.uid == userId && isValidId(policyId);
-        allow list: if isSignedIn() && request.auth.uid == userId;
+        allow get: if isSignedIn() && isValidId(policyId) && (request.auth.uid == userId || isAdmin());
+        allow list: if isSignedIn() && (request.auth.uid == userId || isBootstrappedAdmin());
 
         allow create: if isSignedIn() &&
+                         isValidId(policyId) &&
                          request.auth.uid == userId &&
                          incoming().userId == userId &&
                          incoming().createdAt is timestamp &&
@@ -176,26 +401,220 @@ service cloud.firestore {
                          isValidFailoverPolicy(incoming());
 
         allow update: if isSignedIn() &&
+                         isValidId(policyId) &&
                          request.auth.uid == userId &&
                          incoming().userId == existing().userId &&
                          incoming().createdAt == existing().createdAt &&
                          isValidFailoverPolicy(incoming());
 
-        allow delete: if isSignedIn() && request.auth.uid == userId && isValidId(policyId);
+        allow delete: if isSignedIn() && isValidId(policyId) && request.auth.uid == userId;
       }
 
       match /audit_logs/{logId} {
-        allow get: if isSignedIn() && request.auth.uid == userId && isValidId(logId);
-        allow list: if isSignedIn() && request.auth.uid == userId;
+        allow get: if isSignedIn() && isValidId(logId) && (request.auth.uid == userId || isAdmin());
+        allow list: if isSignedIn() && (request.auth.uid == userId || isBootstrappedAdmin());
 
         allow create: if isSignedIn() &&
+                         isValidId(logId) &&
                          request.auth.uid == userId &&
                          incoming().userId == userId &&
                          incoming().createdAt is timestamp &&
                          isValidTimestamp(incoming().createdAt) &&
                          isValidAuthAuditLog(incoming());
 
-        // Audit logs are append-only to prevent tampering
+        allow update, delete: if false;
+      }
+
+      // Private user-isolated dedicated endpoint allocations (contains user credential token)
+      match /allocated_endpoints/{allocationId} {
+        allow get: if isSignedIn() && isValidId(allocationId) && (request.auth.uid == userId || isAdmin());
+        allow list: if isSignedIn() && (request.auth.uid == userId || isBootstrappedAdmin());
+        allow create, update: if isAdmin() &&
+                                 isValidId(allocationId) &&
+                                 incoming().userId == userId &&
+                                 isValidAllocatedEndpoint(incoming());
+        allow delete: if isAdmin() && isValidId(allocationId);
+      }
+
+      // Immutable subscription lifecycle history
+      match /subscription_history/{eventId} {
+        allow get: if isSignedIn() && isValidId(eventId) && (request.auth.uid == userId || isAdmin());
+        allow list: if isSignedIn() && (request.auth.uid == userId || isBootstrappedAdmin());
+        allow create: if isAdmin() &&
+                         isValidId(eventId) &&
+                         incoming().userId == userId &&
+                         isValidSubscriptionHistoryEvent(incoming());
+        allow update, delete: if false;
+      }
+
+      // Immutable dedicated endpoint allocation history
+      match /allocation_history/{historyId} {
+        allow get: if isSignedIn() && isValidId(historyId) && (request.auth.uid == userId || isAdmin());
+        allow list: if isSignedIn() && (request.auth.uid == userId || isBootstrappedAdmin());
+        allow create: if isAdmin() &&
+                         isValidId(historyId) &&
+                         incoming().userId == userId &&
+                         isValidAllocationHistoryRecord(incoming());
+        allow update, delete: if false;
+      }
+    }
+
+    // --- CENTRAL SUBSCRIPTIONS ---
+    match /subscriptions/{subscriptionId} {
+      allow get: if isSignedIn() && isValidId(subscriptionId) && (existing().userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isBootstrappedAdmin());
+
+      allow create: if isAdmin() &&
+                       isValidId(subscriptionId) &&
+                       incoming().createdAt is timestamp &&
+                       isValidTimestamp(incoming().createdAt) &&
+                       isValidUserSubscription(incoming());
+
+      allow update: if isAdmin() &&
+                       isValidId(subscriptionId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       isValidUserSubscription(incoming());
+
+      allow delete: if false;
+    }
+
+    // --- CENTRAL HEALTHY ENDPOINT POOL (ZERO PRIVATE CREDENTIALS) ---
+    match /endpoint_inventory/{endpointId} {
+      allow get: if isAdmin() || (isSignedIn() && isValidId(endpointId) && existing().assignedUserId == request.auth.uid);
+      allow list: if isBootstrappedAdmin() || (isSignedIn() && resource.data.assignedUserId == request.auth.uid);
+
+      allow create: if isAdmin() &&
+                       isValidId(endpointId) &&
+                       incoming().createdAt is timestamp &&
+                       isValidTimestamp(incoming().createdAt) &&
+                       isValidManagedEndpoint(incoming());
+
+      allow update: if isAdmin() &&
+                       isValidId(endpointId) &&
+                       incoming().createdAt == existing().createdAt &&
+                       isValidManagedEndpoint(incoming());
+
+      allow delete: if isAdmin() && isValidId(endpointId);
+    }
+
+    // --- PAYMENT VERIFICATION REQUESTS ---
+    match /payment_requests/{paymentId} {
+      allow get: if isSignedIn() && isValidId(paymentId) && (existing().userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isBootstrappedAdmin());
+
+      // Client may ONLY submit an unconfirmed payment request; never CONFIRMED
+      allow create: if isSignedIn() &&
+                       isValidId(paymentId) &&
+                       incoming().userId == request.auth.uid &&
+                       (incoming().status == 'PENDING_PAYMENT' || incoming().status == 'PENDING_VERIFICATION') &&
+                       !('verifiedAt' in incoming()) &&
+                       !('verifiedBy' in incoming()) &&
+                       isValidPaymentRequest(incoming());
+
+      // Only trusted admin / backend may confirm or reject payments
+      allow update: if isAdmin() &&
+                       isValidId(paymentId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       isValidPaymentRequest(incoming());
+
+      allow delete: if false;
+    }
+
+    // --- ADMIN SHORTAGE ALERTS & ROTATION LOGS ---
+    match /shortage_alerts/{alertId} {
+      allow get: if isAdmin() && isValidId(alertId);
+      allow list: if isBootstrappedAdmin();
+      allow create, update: if isAdmin() && isValidId(alertId) && isValidShortageAlert(incoming());
+      allow delete: if isAdmin() && isValidId(alertId);
+    }
+
+    match /rotation_logs/{logId} {
+      allow get: if isAdmin() && isValidId(logId);
+      allow list: if isBootstrappedAdmin();
+      allow create: if isAdmin() && isValidId(logId) && isValidRotationAuditLog(incoming());
+      allow update, delete: if false;
+    }
+
+    // --- TMS NEXUS AI SUPPORT TICKETS ---
+    function isValidTicketStatus(s) {
+      return s == 'OPEN' || s == 'AI_TRIAGED' || s == 'ADMIN_REPLIED' || s == 'RESOLVED' || s == 'CLOSED';
+    }
+
+    function isValidTicketCategory(c) {
+      return c == 'CONNECTION' || c == 'SUBSCRIPTION' || c == 'DEDICATED_IP' || c == 'SPEED_LATENCY' || c == 'GENERAL';
+    }
+
+    function isValidTicketPriority(p) {
+      return p == 'LOW' || p == 'MEDIUM' || p == 'HIGH' || p == 'URGENT';
+    }
+
+    function isValidSupportTicket(data) {
+      return data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             (!('userEmail' in data) || (data.userEmail is string && data.userEmail.size() <= 256)) &&
+             data.subject is string && data.subject.size() > 0 && data.subject.size() <= 160 &&
+             data.category is string && isValidTicketCategory(data.category) &&
+             data.priority is string && isValidTicketPriority(data.priority) &&
+             data.status is string && isValidTicketStatus(data.status) &&
+             data.description is string && data.description.size() > 0 && data.description.size() <= 3000 &&
+             (!('aiTriageSummary' in data) || (data.aiTriageSummary is string && data.aiTriageSummary.size() <= 1000)) &&
+             (!('lastReplyText' in data) || (data.lastReplyText is string && data.lastReplyText.size() <= 300)) &&
+             (!('lastReplyByRole' in data) || (data.lastReplyByRole is string && (data.lastReplyByRole == 'USER' || data.lastReplyByRole == 'ADMIN' || data.lastReplyByRole == ''))) &&
+             isValidTimestamp(data.updatedAt);
+    }
+
+    function isValidSupportTicketReply(data, ticketId) {
+      return data.ticketId == ticketId &&
+             data.userId is string && data.userId.size() > 0 && data.userId.size() <= 128 &&
+             data.senderUid == request.auth.uid &&
+             data.senderRole is string && (data.senderRole == 'USER' || data.senderRole == 'ADMIN') &&
+             data.message is string && data.message.size() > 0 && data.message.size() <= 2000 &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    match /support_tickets/{ticketId} {
+      allow get: if isSignedIn() && isValidId(ticketId) && (existing().userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isBootstrappedAdmin());
+
+      allow create: if isSignedIn() &&
+                       isValidId(ticketId) &&
+                       incoming().userId == request.auth.uid &&
+                       (incoming().status == 'OPEN' || incoming().status == 'AI_TRIAGED') &&
+                       incoming().createdAt is timestamp &&
+                       isValidTimestamp(incoming().createdAt) &&
+                       isValidSupportTicket(incoming());
+
+      allow update: if isSignedIn() &&
+                       isValidId(ticketId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       isValidSupportTicket(incoming()) && (
+                         isAdmin() || (
+                           request.auth.uid == existing().userId &&
+                           incoming().status == 'OPEN' &&
+                           incoming().lastReplyByRole == 'USER'
+                         )
+                       );
+
+      allow delete: if false;
+
+      match /replies/{replyId} {
+        allow get, list: if isSignedIn() && (
+          isAdmin() ||
+          get(/databases/$(database)/documents/support_tickets/$(ticketId)).data.userId == request.auth.uid
+        );
+
+        allow create: if isSignedIn() &&
+                         isValidId(replyId) &&
+                         isValidSupportTicketReply(incoming(), ticketId) && (
+                           isAdmin() || (
+                             get(/databases/$(database)/documents/support_tickets/$(ticketId)).data.userId == request.auth.uid &&
+                             incoming().senderRole == 'USER' &&
+                             incoming().userId == request.auth.uid
+                           )
+                         );
+
         allow update, delete: if false;
       }
     }

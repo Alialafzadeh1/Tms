@@ -43,6 +43,7 @@ import androidx.compose.material.icons.filled.DataUsage
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.PowerOff
 import androidx.compose.material.icons.filled.PowerSettingsNew
+import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.RssFeed
 import androidx.compose.material.icons.filled.Security
@@ -85,11 +86,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.material.icons.filled.CardMembership
+import androidx.compose.material.icons.filled.Dns
+import androidx.compose.material.icons.filled.Public
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.data.model.UserSubscription
 import com.example.data.model.VpnConfig
 import com.example.data.model.VpnConnectionState
 import com.example.data.model.VpnServer
 import com.example.data.model.VpnSessionStats
+import com.example.data.subscription.SubscriptionLifecycleEngine
 import com.example.ui.components.CyberGlassCard
 import com.example.ui.components.CyberStatusPill
 import com.example.ui.components.HolographicVpnOrb
@@ -155,7 +161,20 @@ fun UserHomeScreen(
     onRunIspAutoTune: () -> Unit = {},
     leakCheckReport: LeakCheckReport? = null,
     leakCheckInProgress: Boolean = false,
-    onRunLeakCheck: () -> Unit = {}
+    onRunLeakCheck: () -> Unit = {},
+    onOpenNexusAssistant: () -> Unit = {},
+    userSubscription: UserSubscription? = null,
+    trustedNowMs: Long = System.currentTimeMillis(),
+    cleanIpHealthyCount: Int = 0,
+    cleanIpTotalCount: Int = 0,
+    onAutoBypassDeTr: () -> Unit = {},
+    onOpenSubscriptionTab: () -> Unit = {},
+    onOpenCleanIpPool: () -> Unit = {},
+    isComboShieldEnabled: Boolean = false,
+    isComboBusy: Boolean = false,
+    activeComboSummary: String = "",
+    onToggleComboShield: (Boolean) -> Unit = {},
+    onRerollComboShield: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val nationalIntranetMode by VpnController.nationalIntranetMode.collectAsStateWithLifecycle()
@@ -171,6 +190,7 @@ fun UserHomeScreen(
     var importSubscriptionMode by remember { mutableStateOf(false) }
     var subscriptionUrlInput by remember { mutableStateOf("") }
     var showRelayDialog by remember { mutableStateOf(false) }
+    var showComboPurchaseDialog by remember { mutableStateOf(false) }
     var rawInputText by remember { mutableStateOf("") }
     var customRelayInput by remember { mutableStateOf(iranRelayServer) }
     var healedInfoText by remember { mutableStateOf<String?>(null) }
@@ -426,6 +446,262 @@ fun UserHomeScreen(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // 1-Tap Automatic DE/TR Anti-DPI Bypass Button
+            Button(
+                onClick = onAutoBypassDeTr,
+                enabled = !isRacingConnect && !isDisconnecting,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+                    .testTag("home_auto_bypass_detr_button"),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF0E2925),
+                    contentColor = PremiumTeal
+                ),
+                border = BorderStroke(1.dp, PremiumTeal.copy(alpha = 0.7f))
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Public,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = if (isPersian) {
+                        "اتصال خودکار ضد فیلتر (آلمان / ترکیه)"
+                    } else {
+                        "Auto Anti-DPI Bypass (Germany / Turkey)"
+                    },
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Compact Subscription Status Card
+            val isSubActive = SubscriptionLifecycleEngine.isEntitled(userSubscription, trustedNowMs)
+            val subRemainingDays = SubscriptionLifecycleEngine.remainingDays(userSubscription, trustedNowMs)
+            val activePlanTitle = userSubscription?.planEnum()?.let {
+                if (isPersian) it.titleFa else it.titleEn
+            }
+            CyberGlassCard(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("home_subscription_banner"),
+                accentColor = if (isSubActive) StatusConnected.copy(alpha = 0.65f) else ElectricCyan.copy(alpha = 0.45f),
+                onClick = onOpenSubscriptionTab,
+                contentPadding = 12.dp
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                        Icon(
+                            imageVector = Icons.Filled.CardMembership,
+                            contentDescription = null,
+                            tint = if (isSubActive) StatusConnected else ElectricCyan,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column {
+                            Text(
+                                text = if (isSubActive && activePlanTitle != null) {
+                                    if (isPersian) "$activePlanTitle • فعال" else "$activePlanTitle • Active"
+                                } else {
+                                    if (isPersian) "اشتراک‌های اختصاصی TMS (۵ / ۱۵ / ۵۰ IP)" else "TMS Dedicated Plans (5 / 15 / 50 IPs)"
+                                },
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isSubActive) StatusConnected else TextCyberPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = if (isSubActive && userSubscription != null) {
+                                    if (isPersian) {
+                                        "$subRemainingDays روز باقی‌مانده • سهمیه روزانه ${userSubscription.endpointAllocationLimit} IP"
+                                    } else {
+                                        "${subRemainingDays}d left • ${userSubscription.endpointAllocationLimit} IPs/day"
+                                    }
+                                } else {
+                                    if (isPersian) "مشاهده و فعال‌سازی اشتراک در تمام دستگاه" else "Tap to view or activate your plan"
+                                },
+                                fontSize = 10.sp,
+                                color = TextCyberSecondary
+                            )
+                        }
+                    }
+                    Text(
+                        text = if (isPersian) "اشتراک" else "Plans",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isSubActive) StatusConnected else ElectricCyan
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Subscriber-Exclusive On-Demand 4-Layer Anti-DPI Combo Shield Card
+            val comboActiveForSubscriber = isSubActive && isComboShieldEnabled
+            CyberGlassCard(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("home_combo_shield_card"),
+                accentColor = when {
+                    comboActiveForSubscriber -> StatusConnected
+                    isSubActive -> ElectricCyan.copy(alpha = 0.55f)
+                    else -> StatusConnecting.copy(alpha = 0.5f)
+                },
+                onClick = {
+                    if (isSubActive) {
+                        onToggleComboShield(!isComboShieldEnabled)
+                    } else {
+                        showComboPurchaseDialog = true
+                    }
+                },
+                contentPadding = 12.dp
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Security,
+                                contentDescription = null,
+                                tint = when {
+                                    comboActiveForSubscriber -> StatusConnected
+                                    isSubActive -> ElectricCyan
+                                    else -> StatusConnecting
+                                },
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = if (isPersian) "سپر ترکیبی ضدفیلترینگ" else "Anti-DPI Combo Shield",
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = TextCyberPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(
+                                                if (isSubActive) PremiumTeal.copy(alpha = 0.2f)
+                                                else StatusConnecting.copy(alpha = 0.18f)
+                                            )
+                                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                                    ) {
+                                        Text(
+                                            text = if (isPersian) "ویژه مشترکین" else "VIP",
+                                            fontSize = 9.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (isSubActive) PremiumTeal else StatusConnecting
+                                        )
+                                    }
+                                }
+                                Text(
+                                    text = when {
+                                        comboActiveForSubscriber -> activeComboSummary.ifBlank {
+                                            if (isPersian) "DoH+FakeDNS • IP تمیز • Fragment+uTLS فعال"
+                                            else "DoH+FakeDNS • Clean IP • Fragment+uTLS Active"
+                                        }
+                                        isSubActive -> if (isPersian) {
+                                            "ترکیب همزمان DNS + IP تمیز + Fragment (خاموش — هر زمان خواستید روشن کنید)"
+                                        } else {
+                                            "Combine DoH + Clean IP + Fragment anytime you need"
+                                        }
+                                        else -> if (isPersian) {
+                                            "مخصوص دارندگان اشتراک فعال • برای تهیه از داخل اپ، روبیکا یا تلگرام کلیک کنید"
+                                        } else {
+                                            "Subscribers only • Tap to buy in-app or via Rubika / Telegram"
+                                        }
+                                    },
+                                    fontSize = 10.sp,
+                                    color = if (comboActiveForSubscriber) StatusConnected else TextCyberSecondary,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+
+                        Switch(
+                            checked = comboActiveForSubscriber,
+                            onCheckedChange = { checked ->
+                                if (isSubActive) {
+                                    onToggleComboShield(checked)
+                                } else {
+                                    showComboPurchaseDialog = true
+                                }
+                            },
+                            modifier = Modifier.testTag("home_combo_shield_switch"),
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = DeepGraphite,
+                                checkedTrackColor = StatusConnected,
+                                uncheckedThumbColor = MetallicSilver,
+                                uncheckedTrackColor = ElevatedSurface
+                            )
+                        )
+                    }
+
+                    if (comboActiveForSubscriber) {
+                        OutlinedButton(
+                            onClick = onRerollComboShield,
+                            enabled = !isComboBusy && !isRacingConnect,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                                .testTag("home_combo_reroll_button"),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, StatusConnected.copy(alpha = 0.6f))
+                        ) {
+                            if (isComboBusy) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(15.dp),
+                                    strokeWidth = 2.dp,
+                                    color = StatusConnected
+                                )
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Filled.Autorenew,
+                                    contentDescription = null,
+                                    tint = StatusConnected,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (isPersian) "تغییر سریع ترکیب برنده (Re-Roll Combo)" else "Re-Roll Winning Combo",
+                                color = StatusConnected,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
                 }
             }
 
@@ -753,6 +1029,56 @@ fun UserHomeScreen(
 
             Spacer(modifier = Modifier.height(10.dp))
 
+            // Clean IP Pool Quick Access Card
+            CyberGlassCard(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("home_clean_ip_pool_button"),
+                accentColor = ElectricCyan.copy(alpha = 0.5f),
+                onClick = onOpenCleanIpPool,
+                contentPadding = 12.dp
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                        Icon(
+                            imageVector = Icons.Filled.Dns,
+                            contentDescription = null,
+                            tint = ElectricCyan,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column {
+                            Text(
+                                text = if (isPersian) "مخزن IPهای تمیز ($cleanIpTotalCount آدرس)" else "Clean IP Pool ($cleanIpTotalCount hosts)",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = TextCyberPrimary
+                            )
+                            Text(
+                                text = if (isPersian) {
+                                    "سالم تاییدشده: $cleanIpHealthyCount • اعمال با حفظ SNI/TLS"
+                                } else {
+                                    "Verified healthy: $cleanIpHealthyCount • Apply with SNI preservation"
+                                },
+                                fontSize = 10.sp,
+                                color = TextCyberSecondary
+                            )
+                        }
+                    }
+                    Text(
+                        text = if (isPersian) "باز کردن" else "Open",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = ElectricCyan
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
             // REAL IN-TUNNEL HEALTH PROBE, IP/DNS LEAK GUARD & AUTO-FAILOVER CARD
             if (isConnected || healthReport != null || leakCheckReport != null) {
                 CyberGlassCard(
@@ -973,6 +1299,78 @@ fun UserHomeScreen(
                     text = if (isPersian) "افزودن کانفیگ یا لینک سابسکریپشن" else "Import Config / Subscription URL",
                     style = MaterialTheme.typography.labelLarge
                 )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // TMS NEXUS AI Personal Assistant & Diagnostics Card
+            CyberGlassCard(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("home_nexus_assistant_card"),
+                accentColor = ElectricCyan.copy(alpha = 0.65f),
+                contentPadding = 14.dp
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(38.dp)
+                                .clip(CircleShape)
+                                .background(ElectricCyan.copy(alpha = 0.16f))
+                                .border(BorderStroke(1.dp, ElectricCyan), CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Psychology,
+                                contentDescription = null,
+                                tint = ElectricCyan,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = "TMS NEXUS AI",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = ElectricCyan
+                            )
+                            Text(
+                                text = if (isPersian)
+                                    "چت هوشمند، عیب‌یابی اتصال و ثبت تیکت پشتیبانی"
+                                else
+                                    "Smart AI chat, connection diagnostics & support",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextCyberSecondary
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = onOpenNexusAssistant,
+                        modifier = Modifier
+                            .height(48.dp)
+                            .testTag("open_nexus_assistant_button"),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = ElectricCyan,
+                            contentColor = DeepGraphite
+                        )
+                    ) {
+                        Text(
+                            text = if (isPersian) "ورود" else "Open",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
             }
 
             Spacer(modifier = Modifier.height(12.dp))
@@ -1417,6 +1815,121 @@ fun UserHomeScreen(
             dismissButton = {
                 TextButton(onClick = { showRelayDialog = false }) {
                     Text(if (isPersian) "انصراف" else "Cancel", color = TextCyberSecondary)
+                }
+            }
+        )
+    }
+
+    if (showComboPurchaseDialog) {
+        AlertDialog(
+            onDismissRequest = { showComboPurchaseDialog = false },
+            containerColor = SecondarySurface,
+            modifier = Modifier.testTag("home_combo_purchase_dialog"),
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(imageVector = Icons.Filled.CardMembership, contentDescription = null, tint = StatusConnecting)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = if (isPersian) "ویژگی مخصوص مشترکین فعال" else "Subscriber-Only Anti-DPI Combo",
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = ElectricCyan
+                    )
+                }
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = if (isPersian) {
+                            "سپر ترکیبی ضدفیلترینگ (ترکیب DoH + FakeDNS + IP تمیز + Fragment/uTLS و حافظه اپراتور) مخصوص کاربرانی است که اشتراک فعال دارند.\n\nروش خرید اشتراک را انتخاب کنید:"
+                        } else {
+                            "The 4-layer Anti-DPI Combo Shield is available exclusively for active subscribers. Choose how to purchase a plan:"
+                        },
+                        fontSize = 12.sp,
+                        color = TextCyberSecondary
+                    )
+
+                    Button(
+                        onClick = {
+                            showComboPurchaseDialog = false
+                            onOpenSubscriptionTab()
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("home_combo_buy_in_app_btn"),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan, contentColor = DeepGraphite)
+                    ) {
+                        Icon(imageVector = Icons.Filled.CardMembership, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (isPersian) "خرید مستقیم از داخل برنامه" else "Buy Directly In-App",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                showComboPurchaseDialog = false
+                                runCatching {
+                                    context.startActivity(
+                                        Intent(Intent.ACTION_VIEW, Uri.parse("https://rubika.ir/TMS_Time")).apply {
+                                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                        }
+                                    )
+                                }
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .testTag("home_combo_buy_rubika_btn"),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = PremiumTeal, contentColor = DeepGraphite)
+                        ) {
+                            Text(
+                                text = if (isPersian) "کانال روبیکا" else "Rubika",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp
+                            )
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                showComboPurchaseDialog = false
+                                runCatching {
+                                    context.startActivity(
+                                        Intent(Intent.ACTION_VIEW, Uri.parse("https://t.me/TMS_TIME")).apply {
+                                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                        }
+                                    )
+                                }
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .testTag("home_combo_buy_telegram_btn"),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, ElectricCyan)
+                        ) {
+                            Text(
+                                text = if (isPersian) "کانال تلگرام" else "Telegram",
+                                color = ElectricCyan,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showComboPurchaseDialog = false }) {
+                    Text(if (isPersian) "بستن" else "Close", color = MetallicSilver)
                 }
             }
         )

@@ -129,7 +129,19 @@ data class LocalVpnConfigEntity(
      * Last update timestamp in epoch milliseconds.
      */
     @ColumnInfo(name = "updatedAtMs")
-    val updatedAtMs: Long = System.currentTimeMillis()
+    val updatedAtMs: Long = System.currentTimeMillis(),
+
+    @ColumnInfo(name = "origin", defaultValue = "USER_IMPORTED")
+    val origin: String = com.example.data.model.ConfigOrigin.USER_IMPORTED.key,
+
+    @ColumnInfo(name = "subscriptionId", defaultValue = "")
+    val subscriptionId: String = "",
+
+    @ColumnInfo(name = "endpointId", defaultValue = "")
+    val endpointId: String = "",
+
+    @ColumnInfo(name = "allocationVersion", defaultValue = "0")
+    val allocationVersion: Int = 0
 ) {
     /**
      * Maps local Room entity to domain [VpnConfig].
@@ -152,7 +164,11 @@ data class LocalVpnConfigEntity(
             status = status,
             isFavorite = isFavorite,
             createdAt = null,
-            updatedAt = null
+            updatedAt = null,
+            origin = origin,
+            subscriptionId = subscriptionId,
+            endpointId = endpointId,
+            allocationVersion = allocationVersion
         )
     }
 
@@ -183,7 +199,11 @@ data class LocalVpnConfigEntity(
                 isFavorite = config.isFavorite,
                 notes = notes,
                 createdAtMs = config.createdAt?.toDate()?.time ?: now,
-                updatedAtMs = config.updatedAt?.toDate()?.time ?: now
+                updatedAtMs = config.updatedAt?.toDate()?.time ?: now,
+                origin = config.origin.ifBlank { com.example.data.model.ConfigOrigin.USER_IMPORTED.key },
+                subscriptionId = config.subscriptionId,
+                endpointId = config.endpointId,
+                allocationVersion = config.allocationVersion
             )
         }
     }

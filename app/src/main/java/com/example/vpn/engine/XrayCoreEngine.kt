@@ -162,7 +162,11 @@ object XrayCoreEngine {
         enableFragment: Boolean = true,
         socksPort: Int = LOCAL_SOCKS_PORT,
         httpPort: Int = LOCAL_HTTP_PORT,
-        fragmentProfile: FragmentProfile = FragmentProfile()
+        fragmentProfile: FragmentProfile = FragmentProfile(),
+        cleanIpOverride: String? = null,
+        enableDoH: Boolean = false,
+        enableFakeDns: Boolean = false,
+        alpnOverride: List<String>? = null
     ): String {
         val root = JSONObject()
 
@@ -176,12 +180,30 @@ object XrayCoreEngine {
             put("loglevel", "warning")
         })
 
-        // DNS configuration with DoH/UDP fallback
+        if (enableFakeDns) {
+            root.put("fakedns", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("ipPool", "198.18.0.0/15")
+                    put("poolSize", 65535)
+                })
+            })
+        }
+
+        // DNS configuration: DoH + FakeDNS in Combo mode, standard resolvers otherwise
         root.put("dns", JSONObject().apply {
             put("servers", JSONArray().apply {
+                if (enableFakeDns) {
+                    put("fakedns")
+                }
+                if (enableDoH) {
+                    put("https+local://1.1.1.1/dns-query")
+                    put("https+local://8.8.8.8/dns-query")
+                }
                 put("1.1.1.1")
                 put("8.8.8.8")
+                put("9.9.9.9")
             })
+            put("queryStrategy", "UseIP")
         })
 
         // Inbounds: TUN (when fd provided) + local SOCKS5 & HTTP proxies for probing/health checks
@@ -201,6 +223,7 @@ object XrayCoreEngine {
                         put("http")
                         put("tls")
                         put("quic")
+                        if (enableFakeDns) put("fakedns")
                     })
                     put("routeOnly", false)
                 })
@@ -222,6 +245,7 @@ object XrayCoreEngine {
                     put("http")
                     put("tls")
                     put("quic")
+                    if (enableFakeDns) put("fakedns")
                 })
             })
         })
@@ -236,7 +260,14 @@ object XrayCoreEngine {
 
         // Primary Proxy Outbound
         val outbounds = JSONArray()
-        val proxyOutbound = buildProxyOutbound(parsed, rawConfig, enableFragment)
+        val proxyOutbound = buildProxyOutbound(
+            parsed = parsed,
+            rawConfig = rawConfig,
+            enableFragment = enableFragment,
+            fragmentProfile = fragmentProfile,
+            cleanIpOverride = cleanIpOverride,
+            alpnOverride = alpnOverride
+        )
         outbounds.put(proxyOutbound)
 
         if (enableFragment) {
@@ -253,6 +284,7 @@ object XrayCoreEngine {
                 put("streamSettings", JSONObject().apply {
                     put("sockopt", JSONObject().apply {
                         put("TcpNoDelay", true)
+                        put("tcpFastOpen", true)
                     })
                 })
             })
@@ -263,15 +295,24 @@ object XrayCoreEngine {
             put("protocol", "freedom")
         })
         outbounds.put(JSONObject().apply {
+            put("tag", "dns-out")
+            put("protocol", "dns")
+        })
+        outbounds.put(JSONObject().apply {
             put("tag", "block")
             put("protocol", "blackhole")
         })
         root.put("outbounds", outbounds)
 
-        // Routing: bypass local private subnets & keep internet through proxy
+        // Routing: bypass local private subnets, route DNS port 53 through proxy/dns-out, & tunnel internet through proxy
         root.put("routing", JSONObject().apply {
             put("domainStrategy", "IPIfNonMatch")
             put("rules", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("type", "field")
+                    put("port", "53")
+                    put("outboundTag", "proxy")
+                })
                 put(JSONObject().apply {
                     put("type", "field")
                     put("ip", JSONArray().apply {
@@ -296,23 +337,34 @@ object XrayCoreEngine {
     private fun buildProxyOutbound(
         parsed: ParsedVpnConfig,
         rawConfig: VpnConfig?,
-        enableFragment: Boolean
+        enableFragment: Boolean,
+        fragmentProfile: FragmentProfile = FragmentProfile(),
+        cleanIpOverride: String? = null,
+        alpnOverride: List<String>? = null
     ): JSONObject {
         val proto = parsed.protocol.lowercase()
         val uuidOrPass = parsed.uuidOrPassword.ifBlank { rawConfig?.uuidOrPassword.orEmpty() }
         val security = parsed.security.ifBlank { rawConfig?.security ?: "tls" }.lowercase()
         val transport = parsed.transport.ifBlank { rawConfig?.transport ?: "tcp" }.lowercase()
-        val sni = parsed.sni.ifBlank { rawConfig?.sni ?: parsed.server }
+        // Preserve original TLS SNI & Host header even when dialing a Clean IP override!
+        val originalSni = parsed.sni.ifBlank { rawConfig?.sni ?: parsed.server }
         val path = parsed.path.ifBlank { rawConfig?.pathOrServiceName ?: "/" }
+        val dialAddress = cleanIpOverride?.trim()?.takeIf { it.isNotBlank() } ?: parsed.server
 
-        // Parse extra URI query parameters (e.g. flow, pbk, sid, fp) if present
+        // Parse extra URI query parameters (e.g. flow, pbk, sid, fp, allowInsecure) if present
         val rawUri = rawConfig?.rawConfig.orEmpty().ifBlank { parsed.rawConfig }
         val flow = extractQueryParam(rawUri, "flow").orEmpty()
         val pbk = extractQueryParam(rawUri, "pbk").orEmpty()
         val sid = extractQueryParam(rawUri, "sid").orEmpty()
-        val fp = extractQueryParam(rawUri, "fp").orEmpty().ifBlank { "chrome" }
+        val fp = if (fragmentProfile.profileIndex > 0) {
+            fragmentProfile.fingerprint
+        } else {
+            extractQueryParam(rawUri, "fp").orEmpty().ifBlank { fragmentProfile.fingerprint }
+        }
         val spx = extractQueryParam(rawUri, "spx").orEmpty().ifBlank { "/" }
-        val hostHeader = extractQueryParam(rawUri, "host").orEmpty().ifBlank { parsed.hostHeader.ifBlank { sni } }
+        val allowInsecureParam = extractQueryParam(rawUri, "allowInsecure").orEmpty()
+        val allowInsecure = allowInsecureParam == "1" || allowInsecureParam.equals("true", ignoreCase = true)
+        val hostHeader = extractQueryParam(rawUri, "host").orEmpty().ifBlank { parsed.hostHeader.ifBlank { originalSni } }
 
         val outbound = JSONObject().apply {
             put("tag", "proxy")
@@ -324,7 +376,7 @@ object XrayCoreEngine {
                 outbound.put("settings", JSONObject().apply {
                     put("vnext", JSONArray().apply {
                         put(JSONObject().apply {
-                            put("address", parsed.server)
+                            put("address", dialAddress)
                             put("port", parsed.port)
                             put("users", JSONArray().apply {
                                 put(JSONObject().apply {
@@ -342,7 +394,7 @@ object XrayCoreEngine {
                 outbound.put("settings", JSONObject().apply {
                     put("servers", JSONArray().apply {
                         put(JSONObject().apply {
-                            put("address", parsed.server)
+                            put("address", dialAddress)
                             put("port", parsed.port)
                             put("password", uuidOrPass)
                         })
@@ -354,7 +406,7 @@ object XrayCoreEngine {
                 outbound.put("settings", JSONObject().apply {
                     put("vnext", JSONArray().apply {
                         put(JSONObject().apply {
-                            put("address", parsed.server)
+                            put("address", dialAddress)
                             put("port", parsed.port)
                             put("users", JSONArray().apply {
                                 put(JSONObject().apply {
@@ -374,7 +426,7 @@ object XrayCoreEngine {
                 outbound.put("settings", JSONObject().apply {
                     put("servers", JSONArray().apply {
                         put(JSONObject().apply {
-                            put("address", parsed.server)
+                            put("address", dialAddress)
                             put("port", parsed.port)
                             put("method", method)
                             put("password", pass)
@@ -387,7 +439,7 @@ object XrayCoreEngine {
                 outbound.put("settings", JSONObject().apply {
                     put("vnext", JSONArray().apply {
                         put(JSONObject().apply {
-                            put("address", parsed.server)
+                            put("address", dialAddress)
                             put("port", parsed.port)
                             put("users", JSONArray().apply {
                                 put(JSONObject().apply {
@@ -410,7 +462,7 @@ object XrayCoreEngine {
                     put("realitySettings", JSONObject().apply {
                         put("show", false)
                         put("fingerprint", fp)
-                        put("serverName", sni)
+                        put("serverName", originalSni)
                         put("publicKey", pbk)
                         put("shortId", sid)
                         put("spiderX", spx)
@@ -418,12 +470,12 @@ object XrayCoreEngine {
                 }
                 "tls" -> {
                     put("tlsSettings", JSONObject().apply {
-                        put("serverName", sni)
-                        put("allowInsecure", false)
+                        put("serverName", originalSni)
+                        put("allowInsecure", allowInsecure)
                         put("fingerprint", fp)
                         put("alpn", JSONArray().apply {
-                            put("h2")
-                            put("http/1.1")
+                            val effectiveAlpn = alpnOverride?.takeIf { it.isNotEmpty() } ?: listOf("h2", "http/1.1")
+                            effectiveAlpn.forEach { put(it) }
                         })
                     })
                 }
@@ -452,12 +504,14 @@ object XrayCoreEngine {
                 }
             }
 
-            if (enableFragment && security == "tls") {
-                put("sockopt", JSONObject().apply {
+            put("sockopt", JSONObject().apply {
+                if (enableFragment && (security == "tls" || security == "reality")) {
                     put("dialerProxy", "fragment-out")
-                    put("tcpKeepAliveInterval", 30)
-                })
-            }
+                }
+                put("tcpKeepAliveInterval", 30)
+                put("TcpNoDelay", true)
+                put("tcpFastOpen", true)
+            })
         }
 
         outbound.put("streamSettings", streamSettings)
@@ -481,7 +535,11 @@ object XrayCoreEngine {
         rawConfig: VpnConfig? = null,
         enableFragment: Boolean = true,
         fragmentProfile: FragmentProfile = FragmentProfile(),
-        preloadScope: CoroutineScope? = null
+        preloadScope: CoroutineScope? = null,
+        cleanIpOverride: String? = null,
+        enableDoH: Boolean = false,
+        enableFakeDns: Boolean = false,
+        alpnOverride: List<String>? = null
     ): XrayStartResult = withContext(Dispatchers.IO) {
         if (!assetsPrepared.get()) {
             preloadNativeAssetsAsync(context, preloadScope ?: this).await()
@@ -493,7 +551,11 @@ object XrayCoreEngine {
             parsed = parsed,
             rawConfig = rawConfig,
             enableFragment = enableFragment,
-            fragmentProfile = fragmentProfile
+            fragmentProfile = fragmentProfile,
+            cleanIpOverride = cleanIpOverride,
+            enableDoH = enableDoH,
+            enableFakeDns = enableFakeDns,
+            alpnOverride = alpnOverride
         )
     }
 
@@ -508,7 +570,11 @@ object XrayCoreEngine {
         parsed: ParsedVpnConfig,
         rawConfig: VpnConfig? = null,
         enableFragment: Boolean = true,
-        fragmentProfile: FragmentProfile = FragmentProfile()
+        fragmentProfile: FragmentProfile = FragmentProfile(),
+        cleanIpOverride: String? = null,
+        enableDoH: Boolean = false,
+        enableFakeDns: Boolean = false,
+        alpnOverride: List<String>? = null
     ): XrayStartResult {
         if (!assetsPrepared.get()) {
             prepareNativeAssetsInternal(context.applicationContext)
@@ -551,7 +617,11 @@ object XrayCoreEngine {
                 rawConfig = rawConfig,
                 tunFd = tunFd,
                 enableFragment = enableFragment,
-                fragmentProfile = fragmentProfile
+                fragmentProfile = fragmentProfile,
+                cleanIpOverride = cleanIpOverride,
+                enableDoH = enableDoH,
+                enableFakeDns = enableFakeDns,
+                alpnOverride = alpnOverride
             )
             val requestB64 = LibXray.newXrayRunFromJSONRequest(datDir, configJson)
             val responseB64 = LibXray.runXrayFromJSON(requestB64)

@@ -167,8 +167,12 @@ class PerformanceAndOfflineAuthTest {
         val user = registerRes.user
         assertNotNull(user)
         assertTrue(user!!.uid.startsWith("intranet_"))
-        assertTrue(user.isOfflineIntranetMode)
+        assertFalse(user.isOfflineIntranetMode)
         assertEquals("iran.user@example.com", user.email)
+        assertTrue(
+            LocalUserAuthManager.getAllRegisteredPrefProfiles(context)
+                .any { it.email == "iran.user@example.com" }
+        )
 
         // Plaintext password must never exist in SharedPreferences
         val rawPrefs = context.getSharedPreferences("tms_local_intranet_auth", Context.MODE_PRIVATE).all
@@ -186,7 +190,7 @@ class PerformanceAndOfflineAuthTest {
         assertFalse(reloginRes.isNewAccount)
         assertEquals(user.uid, reloginRes.user?.uid)
 
-        // Restoring session recovers offline user; clearing removes it
+        // Restoring session recovers user; clearing removes it
         val restored = LocalUserAuthManager.restoreOfflineSession(context)
         assertNotNull(restored)
         assertEquals(user.uid, restored?.uid)
@@ -209,23 +213,26 @@ class PerformanceAndOfflineAuthTest {
         }
 
         composeRule.waitForIdle()
-        composeRule.onNodeWithTag("auth_google_sign_in_button").assertIsDisplayed()
-        composeRule.onNodeWithTag("auth_email_mode_toggle").performScrollTo().assertIsDisplayed()
+        assertEquals(0, composeRule.onAllNodesWithTag("auth_google_sign_in_button").fetchSemanticsNodes().size)
+        composeRule.onNodeWithTag("auth_mode_login_tab").assertIsDisplayed()
+        composeRule.onNodeWithTag("auth_mode_register_tab").assertIsDisplayed()
 
-        // Toggle offline National Intranet Email & Password panel
-        composeRule.onNodeWithTag("auth_email_mode_toggle").performClick()
+        // Switch to Registration tab and sign up with Display Name, Email & Password
+        composeRule.onNodeWithTag("auth_mode_register_tab").performClick()
         composeRule.waitForIdle()
 
+        composeRule.onNodeWithTag("auth_name_input").performScrollTo().performTextInput("Ali Rezaei")
         composeRule.onNodeWithTag("auth_email_input").performScrollTo().performTextInput("ali.intranet@tms.ir")
         composeRule.onNodeWithTag("auth_password_input").performScrollTo().performTextInput("Pass@2026")
         composeRule.onNodeWithTag("auth_email_submit_button").performScrollTo().performClick()
-        composeRule.waitForIdle()
 
+        composeRule.waitUntil(timeoutMillis = 5000) { authSucceeded.get() }
         assertTrue(authSucceeded.get())
         val activeUser = LocalUserAuthManager.offlineUserFlow.value
         assertNotNull(activeUser)
+        assertEquals("Ali Rezaei", activeUser?.username)
         assertEquals("ali.intranet@tms.ir", activeUser?.email)
-        assertTrue(activeUser?.isOfflineIntranetMode == true)
+        assertFalse(activeUser?.isOfflineIntranetMode == true)
         assertFalse(activeUser?.isAdmin == true)
         assertEquals("USER", activeUser?.role)
     }

@@ -1,5 +1,6 @@
 package com.example.data.model
 
+import androidx.annotation.Keep
 import com.google.firebase.Timestamp
 import com.google.firebase.firestore.DocumentId
 import com.google.firebase.firestore.IgnoreExtraProperties
@@ -85,6 +86,7 @@ enum class AdminRole(
     }
 }
 
+@Keep
 @IgnoreExtraProperties
 data class AuthAuditLog(
     @DocumentId val id: String = "",
@@ -98,6 +100,7 @@ data class AuthAuditLog(
     @ServerTimestamp val createdAt: Timestamp? = null
 )
 
+@Keep
 @IgnoreExtraProperties
 data class VpnConfig(
     @DocumentId val id: String = "",
@@ -116,9 +119,16 @@ data class VpnConfig(
     val status: String = "untested", // online, offline, untested
     val isFavorite: Boolean = false,
     @ServerTimestamp val createdAt: Timestamp? = null,
-    @ServerTimestamp val updatedAt: Timestamp? = null
-)
+    @ServerTimestamp val updatedAt: Timestamp? = null,
+    val origin: String = ConfigOrigin.USER_IMPORTED.key, // USER_IMPORTED, SUBSCRIPTION_ASSIGNED, SYSTEM_MANAGED
+    val subscriptionId: String = "",
+    val endpointId: String = "",
+    val allocationVersion: Int = 0
+) {
+    fun originEnum(): ConfigOrigin = ConfigOrigin.fromString(origin)
+}
 
+@Keep
 @IgnoreExtraProperties
 data class VpnServer(
     @DocumentId val id: String = "",
@@ -140,6 +150,7 @@ data class VpnServer(
     @ServerTimestamp val updatedAt: Timestamp? = null
 )
 
+@Keep
 @IgnoreExtraProperties
 data class FailoverPolicy(
     @DocumentId val id: String = "",
@@ -153,18 +164,19 @@ data class FailoverPolicy(
     @ServerTimestamp val updatedAt: Timestamp? = null
 )
 
+@Keep
 @IgnoreExtraProperties
 data class UserProfile(
     @DocumentId val id: String = "",
     val userId: String = "",
     val displayName: String = "",
     val email: String = "",
-    val role: String = "SUPER_ADMIN", // SUPER_ADMIN, SERVER_MANAGER, USER_ADMIN, AUDITOR
+    val role: String = "user", // user, SUPER_ADMIN, SERVER_MANAGER, USER_ADMIN, AUDITOR
     val deviceCount: Int = 1,
-    val maxDevices: Int = 5,
+    val maxDevices: Int = 10,
     val dataUsageBytes: Double = 0.0,
-    val dataLimitBytes: Double = 100.0 * 1024 * 1024 * 1024, // 100GB
-    val subscriptionStatus: String = "active", // active, expired, trial
+    val dataLimitBytes: Double = 500.0 * 1024 * 1024 * 1024, // 500GB
+    val subscriptionStatus: String = "expired", // active, expired, trial
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null
 )
@@ -177,7 +189,14 @@ data class OverviewMetrics(
     val averageLatencyMs: Int = 0,
     val totalBandwidthGb: Double = 0.0,
     val systemHealthScore: Int = 0,
-    val isRealBackendConnected: Boolean = true
+    val isRealBackendConnected: Boolean = true,
+    val registeredUsersCount: Int = 0,
+    val activeSubscriptionsCount: Int = 0,
+    val pendingPaymentsCount: Int = 0,
+    val healthyEndpointsCount: Int = 0,
+    val totalEndpointsCount: Int = 0,
+    val cleanIpHealthyCount: Int = 0,
+    val cleanIpTotalCount: Int = 0
 )
 
 enum class VpnConnectionState {

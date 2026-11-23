@@ -41,15 +41,21 @@ class AdminSecurityManager(private val context: Context) {
         }
     }
 
-    // Default master PIN is 14361436 as specifically requested by user
     init {
-        val defaultSalt = generateSalt()
-        val defaultHash = hashCredential("14361436", defaultSalt)
-        prefs.edit()
-            .putString("admin_pin_salt", defaultSalt)
-            .putString("admin_pin_hash", defaultHash)
-            .putString("emergency_recovery_token", "TMS-RECOVERY-14361436")
-            .apply()
+        if (!prefs.contains("admin_pin_salt") || !prefs.contains("admin_pin_hash")) {
+            val initialSalt = generateSalt()
+            val initialHash = hashCredential("14361436", initialSalt)
+            prefs.edit()
+                .putString("admin_pin_salt", initialSalt)
+                .putString("admin_pin_hash", initialHash)
+                .putBoolean("pin_is_custom_set", false)
+                .commit()
+        }
+        if (!prefs.contains("emergency_recovery_token")) {
+            prefs.edit()
+                .putString("emergency_recovery_token", generateSecureRecoveryToken())
+                .commit()
+        }
     }
 
     private fun generateSalt(): String {
@@ -57,6 +63,17 @@ class AdminSecurityManager(private val context: Context) {
         secureRandom.nextBytes(saltBytes)
         return Base64.encodeToString(saltBytes, Base64.NO_WRAP)
     }
+
+    private fun generateSecureRecoveryToken(): String {
+        val alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        val sb = StringBuilder("TMS-REC-")
+        repeat(12) {
+            sb.append(alphabet[secureRandom.nextInt(alphabet.length)])
+        }
+        return sb.toString()
+    }
+
+    fun isCustomPinConfigured(): Boolean = prefs.getBoolean("pin_is_custom_set", false)
 
     fun hashCredential(input: String, salt: String): String {
         val md = MessageDigest.getInstance("SHA-256")
@@ -68,6 +85,14 @@ class AdminSecurityManager(private val context: Context) {
             hashed = md.digest(hashed)
         }
         return Base64.encodeToString(hashed, Base64.NO_WRAP)
+    }
+
+    private fun hashesEqual(a: String, b: String): Boolean {
+        if (a.isBlank() || b.isBlank()) return false
+        return MessageDigest.isEqual(
+            a.toByteArray(Charsets.UTF_8),
+            b.toByteArray(Charsets.UTF_8)
+        )
     }
 
     fun isLockedOut(): Pair<Boolean, Long> {
@@ -110,15 +135,14 @@ class AdminSecurityManager(private val context: Context) {
 
         val storedSalt = prefs.getString("admin_pin_salt", "") ?: ""
         val storedHash = prefs.getString("admin_pin_hash", "") ?: ""
-        val computedHash = hashCredential(pinOrPassword, storedSalt)
+        val computedHash = if (storedSalt.isNotBlank()) hashCredential(pinOrPassword.trim(), storedSalt) else ""
 
-        val isMasterPin = pinOrPassword.trim() == "14361436"
-        if (isMasterPin || computedHash == storedHash) {
+        if (hashesEqual(computedHash, storedHash)) {
             // Success: reset failed attempts
             prefs.edit()
                 .putInt("failed_attempts_count", 0)
                 .remove("lockout_until_ms")
-                .apply()
+                .commit()
 
             val token = issueSessionToken(userId, role)
             val auditLog = AuthAuditLog(
@@ -187,21 +211,22 @@ class AdminSecurityManager(private val context: Context) {
     ): Pair<Boolean, String> {
         val storedSalt = prefs.getString("admin_pin_salt", "") ?: ""
         val storedHash = prefs.getString("admin_pin_hash", "") ?: ""
-        val computedOld = hashCredential(oldPin, storedSalt)
+        val computedOld = if (storedSalt.isNotBlank()) hashCredential(oldPin.trim(), storedSalt) else ""
 
-        if (computedOld != storedHash) {
+        if (!hashesEqual(computedOld, storedHash)) {
             return Pair(false, "پین قبلی نامعتبر است / Incorrect current PIN")
         }
 
-        if (newPin.length < 6) {
+        if (newPin.trim().length < 6) {
             return Pair(false, "پین جدید باید حداقل ۶ رقم یا کاراکتر باشد / PIN must be at least 6 characters")
         }
 
         val newSalt = generateSalt()
-        val newHash = hashCredential(newPin, newSalt)
+        val newHash = hashCredential(newPin.trim(), newSalt)
         prefs.edit()
             .putString("admin_pin_salt", newSalt)
             .putString("admin_pin_hash", newHash)
+            .putBoolean("pin_is_custom_set", true)
             .commit()
 
         return Pair(true, "پین امنیتی با موفقیت به‌روزرسانی شد / Admin PIN updated successfully")
@@ -211,20 +236,23 @@ class AdminSecurityManager(private val context: Context) {
         recoveryToken: String,
         newPin: String
     ): Pair<Boolean, String> {
-        val storedRecovery = prefs.getString("emergency_recovery_token", "TMS-RECOVERY-ADMIN-SECURE-9988")
-        if (recoveryToken.trim() != storedRecovery) {
+        val storedRecovery = prefs.getString("emergency_recovery_token", "") ?: ""
+        if (storedRecovery.isBlank() || !hashesEqual(recoveryToken.trim(), storedRecovery)) {
             return Pair(false, "کلید ریکاوری اضطراری نامعتبر است / Invalid emergency recovery token")
         }
 
-        if (newPin.length < 6) {
+        if (newPin.trim().length < 6) {
             return Pair(false, "پین جدید باید حداقل ۶ رقم باشد / New PIN must be at least 6 digits")
         }
 
         val newSalt = generateSalt()
-        val newHash = hashCredential(newPin, newSalt)
+        val newHash = hashCredential(newPin.trim(), newSalt)
+        val rotatedRecovery = generateSecureRecoveryToken()
         prefs.edit()
             .putString("admin_pin_salt", newSalt)
             .putString("admin_pin_hash", newHash)
+            .putBoolean("pin_is_custom_set", true)
+            .putString("emergency_recovery_token", rotatedRecovery)
             .putInt("failed_attempts_count", 0)
             .remove("lockout_until_ms")
             .commit()
@@ -233,7 +261,11 @@ class AdminSecurityManager(private val context: Context) {
     }
 
     fun getRecoveryToken(): String {
-        return prefs.getString("emergency_recovery_token", "TMS-RECOVERY-ADMIN-SECURE-9988") ?: "TMS-RECOVERY-ADMIN-SECURE-9988"
+        val existing = prefs.getString("emergency_recovery_token", null)
+        if (!existing.isNullOrBlank()) return existing
+        val generated = generateSecureRecoveryToken()
+        prefs.edit().putString("emergency_recovery_token", generated).commit()
+        return generated
     }
 
     // --- CRYPTOGRAPHIC JWT-LIKE SESSION MANAGEMENT ---

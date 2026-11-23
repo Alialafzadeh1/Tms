@@ -89,6 +89,15 @@ interface LocalVpnConfigDao {
     @Query("DELETE FROM local_vpn_configs WHERE id = :id")
     suspend fun deleteById(id: String)
 
+    @Query("DELETE FROM local_vpn_configs WHERE id IN (:ids)")
+    suspend fun deleteByIds(ids: List<String>)
+
+    @Query("DELETE FROM local_vpn_configs WHERE origin = :origin")
+    suspend fun deleteByOrigin(origin: String)
+
+    @Query("SELECT * FROM local_vpn_configs")
+    suspend fun getAllOnce(): List<LocalVpnConfigEntity>
+
     /**
      * Deletes a configuration entity.
      */

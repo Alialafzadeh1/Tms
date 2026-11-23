@@ -5,6 +5,7 @@ import android.util.Base64
 import android.util.Log
 import androidx.credentials.ClearCredentialStateRequest
 import androidx.credentials.CredentialManager
+import com.example.data.local.RegisteredUserEntity
 import com.google.firebase.Firebase
 import com.google.firebase.auth.auth
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -20,6 +21,9 @@ private const val PREFS_NAME = "tms_local_intranet_auth"
 private const val KEY_ACTIVE_EMAIL = "active_offline_email"
 private const val KEY_HASH_PREFIX = "pw_hash_"
 private const val KEY_SALT_PREFIX = "pw_salt_"
+private const val KEY_NAME_PREFIX = "display_name_"
+private const val KEY_CREATED_PREFIX = "created_at_"
+private const val KEY_REGISTERED_EMAILS = "registered_emails_index"
 
 private const val ADMIN_PW_SALT = "tms-admin-vault-salt-2026"
 private const val ADMIN_PW_HASH_B64 = "C6Xr4uUsQHB39tH0Oi4OQLCTKQSN1GeEbTbLz319cT4="
@@ -41,11 +45,11 @@ data class LocalEmailAuthResult(
 )
 
 /**
- * Manages active user authentication supporting:
- * 1) Online Firebase Google Sign-In via Jetpack Credential Manager.
- * 2) Salted local Email & Password vault authentication for Iran's National Intranet
- *    blackouts when Google / Firebase services are unreachable.
- * 3) Dedicated Super Admin authorization bound exclusively to ADMIN_EMAIL.
+ * Unified Email & Password Authentication Manager for TMS VPN / TMS NEXUS AI.
+ *
+ * - Authenticates both standard users and Super Admin (`alafzadehali@gmail.com`) via salted PBKDF2-HMAC-SHA256.
+ * - Maintains user display name, UID (`intranet_<hash>` for stable ID parity), and registered user index
+ *   so the Admin Panel sees every registered user immediately.
  */
 class LocalUserAuthManager(private val context: Context) {
 
@@ -66,7 +70,8 @@ class LocalUserAuthManager(private val context: Context) {
                 _offlineUserFlow.value = null
                 return null
             }
-            val restored = buildOfflineUser(savedEmail)
+            val storedName = prefs.getString("$KEY_NAME_PREFIX${sha256Hex(savedEmail)}", null).orEmpty()
+            val restored = buildEmailUser(savedEmail, storedName)
             _offlineUserFlow.value = restored
             return restored
         }
@@ -77,15 +82,45 @@ class LocalUserAuthManager(private val context: Context) {
             _offlineUserFlow.value = null
         }
 
-        private fun buildOfflineUser(normalizedEmail: String): AuthenticatedUser {
+        fun getAllRegisteredPrefProfiles(context: Context): List<RegisteredUserEntity> {
+            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val emails = (prefs.getStringSet(KEY_REGISTERED_EMAILS, emptySet()).orEmpty() +
+                listOfNotNull(prefs.getString(KEY_ACTIVE_EMAIL, null)))
+                .map { it.trim().lowercase() }
+                .filter { it.isNotBlank() }
+                .distinct()
+
+            val now = System.currentTimeMillis()
+            return emails.map { email ->
+                val emailKey = sha256Hex(email)
+                val user = buildEmailUser(email, prefs.getString("$KEY_NAME_PREFIX$emailKey", null).orEmpty())
+                val created = prefs.getLong("$KEY_CREATED_PREFIX$emailKey", now)
+                RegisteredUserEntity(
+                    userId = user.uid,
+                    displayName = user.username,
+                    email = user.email,
+                    role = user.role,
+                    maxDevices = 10,
+                    dataLimitBytes = 500.0 * 1024 * 1024 * 1024,
+                    subscriptionStatus = if (user.isAdmin) "active" else "expired",
+                    createdAtMs = created,
+                    updatedAtMs = now
+                )
+            }
+        }
+
+        private fun buildEmailUser(normalizedEmail: String, customName: String = ""): AuthenticatedUser {
             val uidSuffix = sha256Hex(normalizedEmail).take(16)
             val admin = isAdminEmail(normalizedEmail)
+            val resolvedName = customName.trim().ifBlank {
+                if (admin) "Super Admin" else normalizedEmail.substringBefore("@").ifBlank { "TMS User" }
+            }
             return AuthenticatedUser(
                 uid = "intranet_$uidSuffix",
-                username = normalizedEmail.substringBefore("@").ifBlank { "TMS User" },
+                username = resolvedName,
                 email = normalizedEmail,
                 role = if (admin) "SUPER_ADMIN" else "USER",
-                isOfflineIntranetMode = true,
+                isOfflineIntranetMode = false,
                 isAdmin = admin
             )
         }
@@ -97,7 +132,7 @@ class LocalUserAuthManager(private val context: Context) {
     }
 
     fun getActiveSessionUser(): AuthenticatedUser? {
-        val fbUser = Firebase.auth.currentUser
+        val fbUser = runCatching { Firebase.auth.currentUser }.getOrNull()
         if (fbUser != null) {
             val admin = isAdminEmail(fbUser.email)
             val displayName = fbUser.displayName?.takeIf { it.isNotBlank() }
@@ -117,10 +152,13 @@ class LocalUserAuthManager(private val context: Context) {
 
     fun signInOrRegisterOfflineEmail(
         rawEmail: String,
-        rawPassword: String
+        rawPassword: String,
+        rawDisplayName: String = "",
+        requireExplicitSignUp: Boolean? = null
     ): LocalEmailAuthResult {
         val email = rawEmail.trim().lowercase()
         val password = rawPassword.trim()
+        val displayName = rawDisplayName.trim()
 
         if (!isValidEmail(email)) {
             return LocalEmailAuthResult(
@@ -136,9 +174,17 @@ class LocalUserAuthManager(private val context: Context) {
         }
 
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val emailKey = sha256Hex(email)
+        val currentIndex = prefs.getStringSet(KEY_REGISTERED_EMAILS, emptySet()).orEmpty().toMutableSet()
 
         // Strict verification for the reserved Super Admin email (never permits arbitrary registration)
         if (isAdminEmail(email)) {
+            if (requireExplicitSignUp == true) {
+                return LocalEmailAuthResult(
+                    isSuccess = false,
+                    errorMessage = "حساب مدیریت ارشد از پیش ثبت شده است؛ لطفاً از بخش ورود اقدام کنید"
+                )
+            }
             val candidateDigest = pbkdf2HmacSha256(
                 password = password,
                 salt = ADMIN_PW_SALT.toByteArray(Charsets.UTF_8)
@@ -150,8 +196,16 @@ class LocalUserAuthManager(private val context: Context) {
                     errorMessage = "رمز عبور برای این ایمیل اشتباه است"
                 )
             }
-            prefs.edit().putString(KEY_ACTIVE_EMAIL, email).apply()
-            val adminUser = buildOfflineUser(email)
+            currentIndex.add(email)
+            val resolvedName = displayName.ifBlank {
+                prefs.getString("$KEY_NAME_PREFIX$emailKey", null) ?: "Super Admin"
+            }
+            prefs.edit()
+                .putString(KEY_ACTIVE_EMAIL, email)
+                .putString("$KEY_NAME_PREFIX$emailKey", resolvedName)
+                .putStringSet(KEY_REGISTERED_EMAILS, currentIndex)
+                .apply()
+            val adminUser = buildEmailUser(email, resolvedName)
             _offlineUserFlow.value = adminUser
             return LocalEmailAuthResult(
                 isSuccess = true,
@@ -161,12 +215,17 @@ class LocalUserAuthManager(private val context: Context) {
             )
         }
 
-        val emailKey = sha256Hex(email)
         val storedHash = prefs.getString("$KEY_HASH_PREFIX$emailKey", null)
         val storedSaltB64 = prefs.getString("$KEY_SALT_PREFIX$emailKey", null)
 
         val isNewAccount: Boolean
         if (storedHash != null && storedSaltB64 != null) {
+            if (requireExplicitSignUp == true) {
+                return LocalEmailAuthResult(
+                    isSuccess = false,
+                    errorMessage = "این ایمیل قبلاً ثبت‌نام شده است؛ از بخش ورود وارد شوید"
+                )
+            }
             val salt = Base64.decode(storedSaltB64, Base64.NO_WRAP)
             val candidateHash = hashPassword(password, salt)
             val expectedBytes = Base64.decode(storedHash, Base64.NO_WRAP)
@@ -179,18 +238,34 @@ class LocalUserAuthManager(private val context: Context) {
             }
             isNewAccount = false
         } else {
+            if (requireExplicitSignUp == false) {
+                return LocalEmailAuthResult(
+                    isSuccess = false,
+                    errorMessage = "حسابی با این ایمیل یافت نشد؛ لطفاً ابتدا ثبت‌نام کنید"
+                )
+            }
             val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
             val derivedHash = hashPassword(password, salt)
             val saltB64 = Base64.encodeToString(salt, Base64.NO_WRAP)
+            val nowMs = System.currentTimeMillis()
             prefs.edit()
                 .putString("$KEY_HASH_PREFIX$emailKey", derivedHash)
                 .putString("$KEY_SALT_PREFIX$emailKey", saltB64)
+                .putLong("$KEY_CREATED_PREFIX$emailKey", nowMs)
                 .apply()
             isNewAccount = true
         }
 
-        prefs.edit().putString(KEY_ACTIVE_EMAIL, email).apply()
-        val user = buildOfflineUser(email)
+        currentIndex.add(email)
+        val storedName = prefs.getString("$KEY_NAME_PREFIX$emailKey", null).orEmpty()
+        val effectiveName = displayName.ifBlank { storedName.ifBlank { email.substringBefore("@") } }
+        prefs.edit()
+            .putString(KEY_ACTIVE_EMAIL, email)
+            .putString("$KEY_NAME_PREFIX$emailKey", effectiveName)
+            .putStringSet(KEY_REGISTERED_EMAILS, currentIndex)
+            .apply()
+
+        val user = buildEmailUser(email, effectiveName)
         _offlineUserFlow.value = user
         return LocalEmailAuthResult(
             isSuccess = true,
@@ -207,7 +282,7 @@ class LocalUserAuthManager(private val context: Context) {
         } catch (e: Exception) {
             Log.w(TAG, "Failed to clear credential state on sign-out: ${e.message}")
         } finally {
-            Firebase.auth.signOut()
+            runCatching { Firebase.auth.signOut() }
         }
     }
 
@@ -222,9 +297,6 @@ class LocalUserAuthManager(private val context: Context) {
         return Base64.encodeToString(dk, Base64.NO_WRAP)
     }
 
-    /**
-     * Deterministic RFC 2898 PBKDF2-HMAC-SHA256 using javax.crypto.Mac (supported on all API 24+ & JVMs).
-     */
     private fun pbkdf2HmacSha256(
         password: String,
         salt: ByteArray,
@@ -262,3 +334,4 @@ class LocalUserAuthManager(private val context: Context) {
         return result.copyOf(keyLenBytes)
     }
 }
+

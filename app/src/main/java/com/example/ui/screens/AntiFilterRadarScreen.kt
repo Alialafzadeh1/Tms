@@ -88,7 +88,8 @@ fun AntiFilterRadarScreen(
     configs: List<VpnConfig>,
     isPersian: Boolean,
     onConnectVpn: (VpnConfig, Boolean) -> Unit,
-    onDisconnectVpn: () -> Unit
+    onDisconnectVpn: () -> Unit,
+    isAdminMode: Boolean = false
 ) {
     val coroutineScope = rememberCoroutineScope()
     var targets by remember { mutableStateOf(AntiFilterRadarEngine.getInitialTargets()) }
@@ -98,6 +99,7 @@ fun AntiFilterRadarScreen(
     val aiEngine = remember { VpnAiEngine() }
     var isAiAnalyzing by remember { mutableStateOf(false) }
     var aiAnalysisText by remember { mutableStateOf<String?>(null) }
+    var aiErrorText by remember { mutableStateOf<String?>(null) }
 
     fun runRadarScan() {
         coroutineScope.launch {
@@ -181,12 +183,19 @@ fun AntiFilterRadarScreen(
                     )
 
                     Text(
-                        text = if (vpnState == VpnConnectionState.CONNECTED)
-                            "تونل فعال است • ترافیک اینستاگرام، تلگرام و وب از فیلترینگ عبور می‌کند"
-                        else
-                            "برای باز شدن تلگرام و اینستاگرام، اتصال به کانفیگ را فعال کنید",
+                        text = when {
+                            isAdminMode -> if (isPersian) {
+                                "پایش وضعیت فیلترینگ زیرساخت و سلامت پلتفرم‌ها (فقط مدیریت)"
+                            } else {
+                                "Infrastructure Censorship & Platform Health Diagnostics (Management Only)"
+                            }
+                            vpnState == VpnConnectionState.CONNECTED ->
+                                "تونل فعال است • ترافیک اینستاگرام، تلگرام و وب از فیلترینگ عبور می‌کند"
+                            else ->
+                                "برای باز شدن تلگرام و اینستاگرام، اتصال به کانفیگ را فعال کنید"
+                        },
                         fontSize = 12.sp,
-                        color = if (vpnState == VpnConnectionState.CONNECTED) EmeraldGreen else TextGraySecondary,
+                        color = if (!isAdminMode && vpnState == VpnConnectionState.CONNECTED) EmeraldGreen else TextGraySecondary,
                         modifier = Modifier.padding(top = 4.dp)
                     )
 
@@ -226,48 +235,50 @@ fun AntiFilterRadarScreen(
                             }
                         }
 
-                        if (vpnState == VpnConnectionState.CONNECTED || vpnState == VpnConnectionState.CONNECTING) {
-                            Button(
-                                onClick = onDisconnectVpn,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(48.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = StatusOfflineRed),
-                                shape = RoundedCornerShape(12.dp)
-                            ) {
-                                Icon(imageVector = Icons.Default.PowerSettingsNew, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = if (vpnState == VpnConnectionState.CONNECTING) "در حال اتصال..." else "قطع اتصال",
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                        } else {
-                            val activeCandidate = configs.firstOrNull { it.status == "online" } ?: configs.firstOrNull()
-                            Button(
-                                onClick = {
-                                    if (activeCandidate != null) {
-                                        onConnectVpn(activeCandidate, antiDpiFragmentation)
-                                    }
-                                },
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(48.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = MetallicGold,
-                                    contentColor = Color(0xFF12141A)
-                                ),
-                                shape = RoundedCornerShape(12.dp),
-                                enabled = activeCandidate != null && vpnState != VpnConnectionState.DISCONNECTING
-                            ) {
-                                Icon(imageVector = Icons.Default.VpnKey, contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = if (vpnState == VpnConnectionState.DISCONNECTING) "در حال قطع اتصال..." else "اتصال امن سریع",
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
+                        if (!isAdminMode) {
+                            if (vpnState == VpnConnectionState.CONNECTED || vpnState == VpnConnectionState.CONNECTING) {
+                                Button(
+                                    onClick = onDisconnectVpn,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = StatusOfflineRed),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Icon(imageVector = Icons.Default.PowerSettingsNew, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = if (vpnState == VpnConnectionState.CONNECTING) "در حال اتصال..." else "قطع اتصال",
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            } else {
+                                val activeCandidate = configs.firstOrNull { it.status == "online" } ?: configs.firstOrNull()
+                                Button(
+                                    onClick = {
+                                        if (activeCandidate != null) {
+                                            onConnectVpn(activeCandidate, antiDpiFragmentation)
+                                        }
+                                    },
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = MetallicGold,
+                                        contentColor = Color(0xFF12141A)
+                                    ),
+                                    shape = RoundedCornerShape(12.dp),
+                                    enabled = activeCandidate != null && vpnState != VpnConnectionState.DISCONNECTING
+                                ) {
+                                    Icon(imageVector = Icons.Default.VpnKey, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = if (vpnState == VpnConnectionState.DISCONNECTING) "در حال قطع اتصال..." else "اتصال امن سریع",
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
                         }
                     }
@@ -352,7 +363,14 @@ fun AntiFilterRadarScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .border(
-                        BorderStroke(1.2.dp, if (aiAnalysisText != null) EmeraldGreen else BorderGoldHighlight),
+                        BorderStroke(
+                            1.2.dp,
+                            when {
+                                aiErrorText != null -> StatusOfflineRed
+                                aiAnalysisText != null -> EmeraldGreen
+                                else -> BorderGoldHighlight
+                            }
+                        ),
                         RoundedCornerShape(18.dp)
                     ),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF141924)),
@@ -403,6 +421,7 @@ fun AntiFilterRadarScreen(
                         onClick = {
                             coroutineScope.launch {
                                 isAiAnalyzing = true
+                                aiErrorText = null
                                 val report = AntiFilterRadarEngine.buildRadarReport(targets)
                                 val currentConfig = configs.firstOrNull { it.status == "online" }?.name ?: "VLESS Ultra Reality"
                                 val result = aiEngine.analyzeRadarAndAdaptNetwork(
@@ -412,9 +431,11 @@ fun AntiFilterRadarScreen(
                                 when (result) {
                                     is com.example.data.ai.AiResult.Success -> {
                                         aiAnalysisText = result.responseText
+                                        aiErrorText = null
                                     }
                                     is com.example.data.ai.AiResult.Error -> {
-                                        aiAnalysisText = result.message
+                                        aiAnalysisText = null
+                                        aiErrorText = result.message
                                     }
                                 }
                                 isAiAnalyzing = false
@@ -441,6 +462,25 @@ fun AntiFilterRadarScreen(
                             Icon(imageVector = Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(text = "⚡ تحلیل هوشمند وضعیت و تطبیق با هوش مصنوعی", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    if (aiErrorText != null) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(StatusOfflineRed.copy(alpha = 0.14f))
+                                .border(BorderStroke(0.9.dp, StatusOfflineRed.copy(alpha = 0.7f)), RoundedCornerShape(12.dp))
+                                .padding(12.dp)
+                        ) {
+                            Text(
+                                text = aiErrorText ?: "",
+                                color = StatusOfflineRed,
+                                fontSize = 12.sp,
+                                lineHeight = 18.sp
+                            )
                         }
                     }
 
