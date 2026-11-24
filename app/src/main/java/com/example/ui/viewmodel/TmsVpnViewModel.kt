@@ -1,9 +1,11 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
+import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
+import androidx.annotation.VisibleForTesting
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.ai.AiResult
@@ -19,12 +21,15 @@ import com.example.data.model.AllocatedEndpointRecord
 import com.example.data.model.AllocationHistoryRecord
 import com.example.data.model.AuthAuditLog
 import com.example.data.model.AppReleaseInfo
+import com.example.data.model.BackendErrorCategory
 import com.example.data.model.BackendResult
 import com.example.data.model.BackendSessionSync
+import com.example.data.model.BackgroundBackendError
 import com.example.data.model.ConfigOrigin
 import com.example.data.model.CryptoAsset
 import com.example.data.model.CryptoInvoiceStatus
 import com.example.data.model.CryptoPaymentInvoice
+import com.example.data.model.classifyBackgroundError
 import com.example.data.model.FailoverPolicy
 import com.example.data.model.FreeTrialStatus
 import com.example.data.model.InventoryShortageAlert
@@ -46,6 +51,7 @@ import com.example.data.model.UserProfile
 import com.example.data.model.UserSubscription
 import com.example.data.model.VpnConfig
 import com.example.data.model.VpnServer
+import com.example.data.network.ApkDownloadUrlValidator
 import com.example.data.network.NodeControlApiClient
 import com.example.data.network.RealPingEngine
 import com.example.data.network.SubscriptionImporter
@@ -139,13 +145,27 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     private val aiEngine = VpnAiEngine()
     private val securityManager = AdminSecurityManager(application)
     private val userAuthManager = LocalUserAuthManager(application)
-    private val backendClient = TmsBackendApiClient()
+    private var backendClient = TmsBackendApiClient()
+
+    @VisibleForTesting
+    internal var testAuthenticatedUid: String? = null
+
+    @VisibleForTesting
+    internal fun setBackendClientForTesting(client: TmsBackendApiClient) {
+        backendClient = client
+    }
 
     private fun safeFirebaseAuth(): FirebaseAuth? =
         runCatching { Firebase.auth }.getOrNull()
 
     private fun safeFirebaseUser(): FirebaseUser? =
         runCatching { Firebase.auth.currentUser }.getOrNull()
+
+    private fun hasAuthenticatedIdentity(): Boolean =
+        safeFirebaseUser() != null || !testAuthenticatedUid.isNullOrBlank()
+
+    private fun activeAuthenticatedUid(): String? =
+        safeFirebaseUser()?.uid ?: testAuthenticatedUid
 
     // --- REAL VPN ENGINE INTEGRATION ---
     val vpnConnectionState: StateFlow<VpnConnectionState> = VpnController.connectionState
@@ -248,10 +268,16 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     private val _isUnlocked = MutableStateFlow(false)
     val isUnlocked: StateFlow<Boolean> = _isUnlocked.asStateFlow()
 
+    private val _adminPinConfigured = MutableStateFlow(securityManager.hasConfiguredPin())
+    val adminPinConfigured: StateFlow<Boolean> = _adminPinConfigured.asStateFlow()
+
+    private val _showAdminPinPrompt = MutableStateFlow(false)
+    val showAdminPinPrompt: StateFlow<Boolean> = _showAdminPinPrompt.asStateFlow()
+
     private val _lockoutSeconds = MutableStateFlow(0L)
     val lockoutSeconds: StateFlow<Long> = _lockoutSeconds.asStateFlow()
 
-    // Distinct User Space vs Admin Control Center state (only enters after server-verified admin privilege)
+    // Distinct User Space vs Admin Control Center state (only enters after server-verified admin privilege + PIN unlock)
     private val _isInAdminSpace = MutableStateFlow(false)
     val isInAdminSpace: StateFlow<Boolean> = _isInAdminSpace.asStateFlow()
 
@@ -297,6 +323,17 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _releaseBusy = MutableStateFlow(false)
     val releaseBusy: StateFlow<Boolean> = _releaseBusy.asStateFlow()
+
+    private val _apkUploadProgress = MutableStateFlow<Float?>(null)
+    val apkUploadProgress: StateFlow<Float?> = _apkUploadProgress.asStateFlow()
+
+    private val _apkUploadError = MutableStateFlow<String?>(null)
+    val apkUploadError: StateFlow<String?> = _apkUploadError.asStateFlow()
+
+    private val _backgroundBackendError = MutableStateFlow<BackgroundBackendError?>(null)
+    val backgroundBackendError: StateFlow<BackgroundBackendError?> = _backgroundBackendError.asStateFlow()
+
+    private var _lastPendingReferralCode: String? = null
 
     private val _isEmailVerified = MutableStateFlow(false)
     val isEmailVerified: StateFlow<Boolean> = _isEmailVerified.asStateFlow()
@@ -390,7 +427,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     }.distinctUntilChanged()
 
     private fun currentActorUid(): String {
-        return safeFirebaseUser()?.uid ?: "local_user"
+        return activeAuthenticatedUid() ?: "local_user"
     }
 
     private fun currentActorEmail(): String {
@@ -429,40 +466,69 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun isCurrentUserAdmin(): Boolean {
-        return safeFirebaseUser() != null && _verifiedServerAdmin.value
+        return hasAuthenticatedIdentity() && _verifiedServerAdmin.value
+    }
+
+    fun isAdminSessionAuthorized(): Boolean {
+        if (!isCurrentUserAdmin()) return false
+        val pinRequired = securityManager.hasConfiguredPin()
+        _adminPinConfigured.value = pinRequired
+        if (!pinRequired) return true
+        if (!_isUnlocked.value) return false
+        val session = _activeSession.value ?: return false
+        val (valid, _) = securityManager.validateSessionToken(session.rawToken)
+        return valid
     }
 
     fun enterAdminSpace(pin: String = ""): Boolean {
-        val user = safeFirebaseUser()
-        if (user == null || !_verifiedServerAdmin.value) {
+        if (!isCurrentUserAdmin()) {
             _isInAdminSpace.value = false
             _isUnlocked.value = false
+            _activeSession.value = null
+            _showAdminPinPrompt.value = false
             return false
         }
         val role = _verifiedAdminRole.value ?: AdminRole.SUPER_ADMIN
-        if (!securityManager.hasConfiguredPin()) {
+        val pinConfigured = securityManager.hasConfiguredPin()
+        _adminPinConfigured.value = pinConfigured
+        if (!pinConfigured) {
             _isInAdminSpace.value = true
             _isUnlocked.value = true
+            _showAdminPinPrompt.value = false
             _selectedRole.value = role
             _lockoutSeconds.value = 0L
             return true
         }
         if (pin.isBlank()) {
-            _isInAdminSpace.value = true
-            _selectedRole.value = role
-            return true
+            // Never bypass configured Admin PIN on blank entry: require PIN challenge first.
+            _isInAdminSpace.value = false
+            _isUnlocked.value = false
+            _activeSession.value = null
+            _showAdminPinPrompt.value = true
+            return false
         }
         val verified = verifyAdminPin(pin)
         if (verified) {
+            _showAdminPinPrompt.value = false
             _isInAdminSpace.value = true
             _selectedRole.value = role
+        } else {
+            _isInAdminSpace.value = false
+            _isUnlocked.value = false
         }
         return verified
     }
 
+    fun dismissAdminPinPrompt() {
+        _showAdminPinPrompt.value = false
+    }
+
     fun exitAdminSpace() {
+        securityManager.revokeCurrentSession()
+        _activeSession.value = null
         _isInAdminSpace.value = false
         _isUnlocked.value = false
+        _showAdminPinPrompt.value = false
         _selectedRole.value = null
     }
 
@@ -1112,6 +1178,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                         }
 
                         // 3. Verify via Worker /api/app/session & sync D1 ecosystem state
+                        var sessionSyncError: BackgroundBackendError? = null
                         when (val syncRes = backendClient.syncSession()) {
                             is BackendResult.Success -> {
                                 val sync = syncRes.data
@@ -1129,7 +1196,9 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                                         ?: AdminRole.SUPER_ADMIN
                                 }
                             }
-                            else -> Unit
+                            else -> {
+                                sessionSyncError = classifyBackgroundError("session_sync", syncRes, isPersianLanguage.value)
+                            }
                         }
 
                         _verifiedServerAdmin.value = claimedAdmin
@@ -1137,11 +1206,14 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                         if (!claimedAdmin) {
                             _isInAdminSpace.value = false
                             _isUnlocked.value = false
+                            _activeSession.value = null
+                            _showAdminPinPrompt.value = false
                             _selectedRole.value = null
                         }
 
                         // Refresh public & authenticated ecosystem endpoints (trial, referrals, crypto, releases)
-                        refreshBackendEcosystemInternal(claimedAdmin)
+                        val ecosystemError = refreshBackendEcosystemInternal(claimedAdmin)
+                        _backgroundBackendError.value = selectHigherPriorityError(sessionSyncError, ecosystemError)
 
                         try {
                             repository.ensureUserProfile(
@@ -1163,13 +1235,15 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                             Log.d(TAG, "Firestore sync skipped/fallback: ${e.message}")
                         }
                     }
-                } else {
+                } else if (testAuthenticatedUid.isNullOrBlank()) {
                     VpnController.setActiveAccountId(null)
                     _verifiedServerAdmin.value = false
                     _verifiedAdminRole.value = null
                     _isEmailVerified.value = false
                     _isInAdminSpace.value = false
                     _isUnlocked.value = false
+                    _activeSession.value = null
+                    _showAdminPinPrompt.value = false
                     _selectedRole.value = null
                     _backendSessionSync.value = null
                     _cryptoInvoices.value = emptyList()
@@ -1177,6 +1251,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                     _freeTrialStatus.value = null
                     _adminRewardRequests.value = emptyList()
                     _adminReleases.value = emptyList()
+                    _backgroundBackendError.value = null
                     launch(Dispatchers.IO) {
                         runCatching {
                             _tombstonedConfigIds.value = localConfigRepository.getTombstonedIds(currentActorUid())
@@ -1223,6 +1298,12 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             _uiMessage.value = UiMessage.Error(if (isPersianLanguage.value) deniedMsgFa else deniedMsgEn)
             return false
         }
+        if (!isAdminSessionAuthorized()) {
+            val lockedMsgFa = "نشست مدیریت قفل است؛ ابتدا پین امنیتی مدیر را تایید کنید."
+            val lockedMsgEn = "Admin session is locked. Verify your administrator PIN first."
+            _uiMessage.value = UiMessage.Error(if (isPersianLanguage.value) lockedMsgFa else lockedMsgEn)
+            return false
+        }
         val role = currentRole.value
         if (!role.hasPermission(permission)) {
             val deniedMsgFa = "خطای سطح دسترسی: نقش فعلی (${role.titleFa}) اجازه $actionDescription را ندارد."
@@ -1257,20 +1338,30 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     // --- ADMINISTRATOR AUTHENTICATION & SECURITY ---
 
     fun verifyAdminPin(pin: String): Boolean {
-        val user = safeFirebaseUser() ?: return false
+        if (!isCurrentUserAdmin()) {
+            _isUnlocked.value = false
+            _activeSession.value = null
+            val deniedMsgFa = "دسترسی غیرمجاز: حساب کاربری شما مجوز مدیریت تاییدشده از سرور را ندارد."
+            val deniedMsgEn = "Unauthorized: Server-verified administrator privilege required."
+            _uiMessage.value = UiMessage.Error(if (isPersianLanguage.value) deniedMsgFa else deniedMsgEn)
+            return false
+        }
+        val actorUid = activeAuthenticatedUid() ?: return false
         val role = currentRole.value
         val (result, auditLog) = securityManager.verifyAdminCredential(
-            userId = user.uid,
+            userId = actorUid,
             role = role,
             pinOrPassword = pin,
             deviceInfo = getDeviceInfo()
         )
 
-        viewModelScope.launch {
-            try {
-                repository.addAuditLog(auditLog)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed logging audit attempt", e)
+        if (safeFirebaseUser() != null) {
+            viewModelScope.launch {
+                try {
+                    repository.addAuditLog(auditLog)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed logging audit attempt", e)
+                }
             }
         }
 
@@ -1278,6 +1369,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             is AuthAttemptResult.Success -> {
                 _activeSession.value = result.sessionToken
                 _isUnlocked.value = true
+                _showAdminPinPrompt.value = false
                 _lockoutSeconds.value = 0L
                 _uiMessage.value = UiMessage.Success(
                     if (isPersianLanguage.value) "هویت مدیر با موفقیت تایید شد / نشست امن صادر گردید" else "Admin PIN verified. Secure session established."
@@ -1285,6 +1377,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                 true
             }
             is AuthAttemptResult.InvalidCredentials -> {
+                _activeSession.value = null
                 _isUnlocked.value = false
                 _uiMessage.value = UiMessage.Error(
                     if (isPersianLanguage.value) result.messageFa else result.messageEn
@@ -1292,6 +1385,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                 false
             }
             is AuthAttemptResult.LockedOut -> {
+                _activeSession.value = null
                 _isUnlocked.value = false
                 _lockoutSeconds.value = result.remainingLockoutSeconds
                 startLockoutCountdown()
@@ -1313,7 +1407,8 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun changeAdminPin(oldPin: String, newPin: String) {
-        val user = safeFirebaseUser() ?: return
+        if (!checkPermission(AdminPermission.MANAGE_SETTINGS, "تغییر پین امنیتی مدیر")) return
+        val actorUid = activeAuthenticatedUid() ?: return
         val role = currentRole.value
 
         val validation = InputValidator.validateAdminPin(newPin)
@@ -1324,24 +1419,28 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
 
-        val (success, message) = securityManager.changeAdminPin(user.uid, role, oldPin, newPin)
+        val (success, message) = securityManager.changeAdminPin(actorUid, role, oldPin, newPin)
         if (success) {
+            _adminPinConfigured.value = true
+            _activeSession.value = securityManager.issueSessionToken(actorUid, role)
             _uiMessage.value = UiMessage.Success(message)
-            viewModelScope.launch {
-                try {
-                    repository.addAuditLog(
-                        AuthAuditLog(
-                            userId = user.uid,
-                            action = "ADMIN_PIN_CHANGED",
-                            role = role.id,
-                            module = "SecuritySettings",
-                            status = "SUCCESS",
-                            ipOrDevice = getDeviceInfo(),
-                            details = "پین امنیتی تغییر یافت / Master security PIN successfully rotated"
+            if (safeFirebaseUser() != null) {
+                viewModelScope.launch {
+                    try {
+                        repository.addAuditLog(
+                            AuthAuditLog(
+                                userId = actorUid,
+                                action = "ADMIN_PIN_CHANGED",
+                                role = role.id,
+                                module = "SecuritySettings",
+                                status = "SUCCESS",
+                                ipOrDevice = getDeviceInfo(),
+                                details = "پین امنیتی تغییر یافت / Master security PIN successfully rotated"
+                            )
                         )
-                    )
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed audit log for PIN change", e)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed audit log for PIN change", e)
+                    }
                 }
             }
         } else {
@@ -1350,7 +1449,13 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun emergencyResetPin(recoveryToken: String, newPin: String) {
-        val user = safeFirebaseUser() ?: return
+        if (!isCurrentUserAdmin()) {
+            val deniedMsgFa = "دسترسی غیرمجاز: بازیابی پین فقط برای مدیر تاییدشده از سرور مجاز است."
+            val deniedMsgEn = "Unauthorized: Server-verified administrator privilege required."
+            _uiMessage.value = UiMessage.Error(if (isPersianLanguage.value) deniedMsgFa else deniedMsgEn)
+            return
+        }
+        val actorUid = activeAuthenticatedUid() ?: return
         val role = currentRole.value
 
         val validation = InputValidator.validateAdminPin(newPin)
@@ -1364,55 +1469,67 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         val (success, message) = securityManager.emergencyResetPinWithRecoveryToken(recoveryToken, newPin)
         if (success) {
             _lockoutSeconds.value = 0L
+            _adminPinConfigured.value = true
+            _activeSession.value = securityManager.issueSessionToken(actorUid, role)
             _isUnlocked.value = true
+            _showAdminPinPrompt.value = false
             _uiMessage.value = UiMessage.Success(message)
-            viewModelScope.launch {
-                try {
-                    repository.addAuditLog(
-                        AuthAuditLog(
-                            userId = user.uid,
-                            action = "EMERGENCY_PIN_RECOVERY_SUCCESS",
-                            role = role.id,
-                            module = "SecuritySettings",
-                            status = "SUCCESS",
-                            ipOrDevice = getDeviceInfo(),
-                            details = "بازیابی اضطراری پین با توکن ریکاوری / Master PIN reset via emergency token"
+            if (safeFirebaseUser() != null) {
+                viewModelScope.launch {
+                    try {
+                        repository.addAuditLog(
+                            AuthAuditLog(
+                                userId = actorUid,
+                                action = "EMERGENCY_PIN_RECOVERY_SUCCESS",
+                                role = role.id,
+                                module = "SecuritySettings",
+                                status = "SUCCESS",
+                                ipOrDevice = getDeviceInfo(),
+                                details = "بازیابی اضطراری پین با توکن ریکاوری / Master PIN reset via emergency token"
+                            )
                         )
-                    )
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed emergency audit log", e)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed emergency audit log", e)
+                    }
                 }
             }
         } else {
             _uiMessage.value = UiMessage.Error(message)
-            viewModelScope.launch {
-                try {
-                    repository.addAuditLog(
-                        AuthAuditLog(
-                            userId = user.uid,
-                            action = "EMERGENCY_PIN_RECOVERY_FAILED",
-                            role = role.id,
-                            module = "SecuritySettings",
-                            status = "FAILED",
-                            ipOrDevice = getDeviceInfo(),
-                            details = "تلاش ناموفق برای بازیابی اضطراری با توکن نامعتبر"
+            if (safeFirebaseUser() != null) {
+                viewModelScope.launch {
+                    try {
+                        repository.addAuditLog(
+                            AuthAuditLog(
+                                userId = actorUid,
+                                action = "EMERGENCY_PIN_RECOVERY_FAILED",
+                                role = role.id,
+                                module = "SecuritySettings",
+                                status = "FAILED",
+                                ipOrDevice = getDeviceInfo(),
+                                details = "تلاش ناموفق برای بازیابی اضطراری با توکن نامعتبر"
+                            )
                         )
-                    )
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed recovery failure audit log", e)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed recovery failure audit log", e)
+                    }
                 }
             }
         }
     }
 
-    fun hasConfiguredAdminPin(): Boolean = securityManager.hasConfiguredPin()
+    fun hasConfiguredAdminPin(): Boolean {
+        val configured = securityManager.hasConfiguredPin()
+        _adminPinConfigured.value = configured
+        return configured
+    }
 
     fun configureInitialAdminPin(newPin: String) {
         if (!isCurrentUserAdmin()) {
             checkPermission(AdminPermission.MANAGE_SETTINGS, "تنظیم پین امنیتی مدیر")
             return
         }
-        val user = safeFirebaseUser() ?: return
+        val actorUid = activeAuthenticatedUid() ?: return
+        val role = currentRole.value
         val validation = InputValidator.validateAdminPin(newPin)
         if (validation is ValidationResult.Invalid) {
             _uiMessage.value = UiMessage.Error(
@@ -1420,9 +1537,12 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             )
             return
         }
-        val (ok, msg) = securityManager.configureInitialPin(user.uid, currentRole.value, newPin)
+        val (ok, msg) = securityManager.configureInitialPin(actorUid, role, newPin)
         if (ok) {
+            _adminPinConfigured.value = true
+            _activeSession.value = securityManager.issueSessionToken(actorUid, role)
             _isUnlocked.value = true
+            _showAdminPinPrompt.value = false
             _uiMessage.value = UiMessage.Success(msg)
         } else {
             _uiMessage.value = UiMessage.Error(msg)
@@ -1430,6 +1550,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun getRecoveryToken(): String {
+        if (!isCurrentUserAdmin()) return ""
         return securityManager.getRecoveryToken()
     }
 
@@ -1438,8 +1559,17 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             checkPermission(AdminPermission.MANAGE_SETTINGS, "تغییر نقش مدیریت")
             return
         }
+        if (!isAdminSessionAuthorized()) {
+            val lockedMsgFa = "ابتدا نشست مدیریت را با پین امنیتی باز کنید."
+            val lockedMsgEn = "Unlock the admin session with your PIN first."
+            _uiMessage.value = UiMessage.Error(if (isPersianLanguage.value) lockedMsgFa else lockedMsgEn)
+            return
+        }
         val uid = currentActorUid()
         _selectedRole.value = role
+        if (securityManager.hasConfiguredPin()) {
+            _activeSession.value = securityManager.issueSessionToken(uid, role)
+        }
 
         viewModelScope.launch {
             try {
@@ -4100,60 +4230,150 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
 
     // --- BACKEND ECOSYSTEM METHODS (CRYPTO PAYMENTS, REFERRALS, FREE TRIAL, APK RELEASES) ---
 
+    private fun selectHigherPriorityError(
+        first: BackgroundBackendError?,
+        second: BackgroundBackendError?
+    ): BackgroundBackendError? {
+        if (first == null) return second
+        if (second == null) return first
+        fun priority(cat: BackendErrorCategory): Int = when (cat) {
+            BackendErrorCategory.AUTHENTICATION -> 3
+            BackendErrorCategory.SERVER -> 2
+            BackendErrorCategory.NETWORK -> 1
+        }
+        return if (priority(first.category) >= priority(second.category)) first else second
+    }
+
+    fun clearBackgroundBackendError() {
+        _backgroundBackendError.value = null
+    }
+
+    fun retryBackendEcosystemSync() {
+        refreshBackendEcosystem(_lastPendingReferralCode)
+    }
+
+    fun reportInvalidApkDownloadUrl(errorMessage: String) {
+        _uiMessage.value = UiMessage.Error(errorMessage)
+    }
+
+    fun clearApkUploadError() {
+        _apkUploadError.value = null
+    }
+
     fun refreshBackendEcosystem(pendingReferralCode: String? = null) {
+        if (!pendingReferralCode.isNullOrBlank()) {
+            _lastPendingReferralCode = pendingReferralCode.trim()
+        }
         viewModelScope.launch(Dispatchers.IO) {
-            if (!pendingReferralCode.isNullOrBlank()) {
-                backendClient.qualifyReferralOnLogin(pendingReferralCode)
-            }
-            when (val syncRes = backendClient.syncSession()) {
-                is BackendResult.Success -> {
-                    val sync = syncRes.data
-                    _backendSessionSync.value = sync
-                    if (sync.serverTimeMs > 0L) {
-                        updateTrustedServerAnchor(sync.serverTimeMs)
-                    }
-                    if (sync.trialStatus != null) {
-                        _freeTrialStatus.value = sync.trialStatus
-                    }
-                    if (sync.isAdmin && !_verifiedServerAdmin.value) {
-                        _verifiedServerAdmin.value = true
-                        _verifiedAdminRole.value = AdminRole.fromVerifiedClaimOrNull(sync.verifiedRole)
-                            ?: AdminRole.SUPER_ADMIN
-                    }
-                }
-                else -> Unit
-            }
-            refreshBackendEcosystemInternal(isCurrentUserAdmin())
+            syncBackendEcosystemInternal(pendingReferralCode ?: _lastPendingReferralCode)
         }
     }
 
-    private suspend fun refreshBackendEcosystemInternal(isAdminUser: Boolean) {
+    @VisibleForTesting
+    internal suspend fun syncBackendEcosystemOnceForTest(pendingReferralCode: String? = null) {
+        if (!pendingReferralCode.isNullOrBlank()) {
+            _lastPendingReferralCode = pendingReferralCode.trim()
+        }
+        syncBackendEcosystemInternal(pendingReferralCode ?: _lastPendingReferralCode)
+    }
+
+    private suspend fun syncBackendEcosystemInternal(pendingReferralCode: String?) {
+        var accumulatedError: BackgroundBackendError? = null
+
+        if (!pendingReferralCode.isNullOrBlank()) {
+            val qualifyRes = backendClient.qualifyReferralOnLogin(pendingReferralCode)
+            if (qualifyRes is BackendResult.Success) {
+                _lastPendingReferralCode = null
+            } else {
+                val err = classifyBackgroundError("referral_qualify", qualifyRes, isPersianLanguage.value)
+                accumulatedError = selectHigherPriorityError(accumulatedError, err)
+                Log.w(TAG, "Background referral qualify failed: $err")
+            }
+        }
+
+        when (val syncRes = backendClient.syncSession()) {
+            is BackendResult.Success -> {
+                val sync = syncRes.data
+                _backendSessionSync.value = sync
+                if (sync.serverTimeMs > 0L) {
+                    updateTrustedServerAnchor(sync.serverTimeMs)
+                }
+                if (sync.trialStatus != null) {
+                    _freeTrialStatus.value = sync.trialStatus
+                }
+                if (sync.isAdmin && !_verifiedServerAdmin.value) {
+                    _verifiedServerAdmin.value = true
+                    _verifiedAdminRole.value = AdminRole.fromVerifiedClaimOrNull(sync.verifiedRole)
+                        ?: AdminRole.SUPER_ADMIN
+                }
+            }
+            else -> {
+                val err = classifyBackgroundError("session_sync", syncRes, isPersianLanguage.value)
+                accumulatedError = selectHigherPriorityError(accumulatedError, err)
+                Log.w(TAG, "Background session sync failed: $err")
+            }
+        }
+
+        val ecosystemError = refreshBackendEcosystemInternal(isCurrentUserAdmin())
+        _backgroundBackendError.value = selectHigherPriorityError(accumulatedError, ecosystemError)
+    }
+
+    private suspend fun refreshBackendEcosystemInternal(isAdminUser: Boolean): BackgroundBackendError? {
+        var accumulatedError: BackgroundBackendError? = null
+
         when (val trialRes = backendClient.getFreeTrialStatus()) {
             is BackendResult.Success -> _freeTrialStatus.value = trialRes.data
-            else -> Unit
+            else -> {
+                val err = classifyBackgroundError("trial_status", trialRes, isPersianLanguage.value)
+                accumulatedError = selectHigherPriorityError(accumulatedError, err)
+                Log.w(TAG, "Background trial status failed: $err")
+            }
         }
         when (val refRes = backendClient.getReferralDashboard()) {
             is BackendResult.Success -> _referralDashboard.value = refRes.data
-            else -> Unit
+            else -> {
+                val err = classifyBackgroundError("referral_dashboard", refRes, isPersianLanguage.value)
+                accumulatedError = selectHigherPriorityError(accumulatedError, err)
+                Log.w(TAG, "Background referral dashboard failed: $err")
+            }
         }
         when (val invRes = backendClient.listCryptoInvoices(isAdminScope = isAdminUser)) {
             is BackendResult.Success -> _cryptoInvoices.value = invRes.data
-            else -> Unit
+            else -> {
+                val err = classifyBackgroundError("crypto_invoices", invRes, isPersianLanguage.value)
+                accumulatedError = selectHigherPriorityError(accumulatedError, err)
+                Log.w(TAG, "Background crypto invoices failed: $err")
+            }
         }
         when (val relRes = backendClient.getLatestRelease()) {
             is BackendResult.Success -> _latestRelease.value = relRes.data
-            else -> Unit
+            else -> {
+                val err = classifyBackgroundError("latest_release", relRes, isPersianLanguage.value)
+                accumulatedError = selectHigherPriorityError(accumulatedError, err)
+                if (err != null) {
+                    Log.w(TAG, "Background latest release failed: $err")
+                }
+            }
         }
         if (isAdminUser) {
             when (val rewardRes = backendClient.adminListReferralRewardRequests()) {
                 is BackendResult.Success -> _adminRewardRequests.value = rewardRes.data
-                else -> Unit
+                else -> {
+                    val err = classifyBackgroundError("admin_referral_rewards", rewardRes, isPersianLanguage.value)
+                    accumulatedError = selectHigherPriorityError(accumulatedError, err)
+                    Log.w(TAG, "Background admin reward requests failed: $err")
+                }
             }
             when (val releasesRes = backendClient.adminListReleases()) {
                 is BackendResult.Success -> _adminReleases.value = releasesRes.data
-                else -> Unit
+                else -> {
+                    val err = classifyBackgroundError("admin_releases", releasesRes, isPersianLanguage.value)
+                    accumulatedError = selectHigherPriorityError(accumulatedError, err)
+                    Log.w(TAG, "Background admin releases failed: $err")
+                }
             }
         }
+        return accumulatedError
     }
 
     private fun describeBackendFailure(err: BackendResult<Any?>, fallbackFa: String): String {
@@ -4338,7 +4558,8 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     fun adminRefreshEcosystemData() {
         if (!checkPermission(AdminPermission.VIEW_USERS, "بارگذاری داده‌های اکوسیستم")) return
         viewModelScope.launch(Dispatchers.IO) {
-            refreshBackendEcosystemInternal(isAdminUser = true)
+            val err = refreshBackendEcosystemInternal(isAdminUser = true)
+            _backgroundBackendError.value = err
         }
     }
 
@@ -4372,6 +4593,67 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun adminUploadApkReleaseFromUri(
+        fileUri: Uri,
+        fileName: String,
+        fileSizeBytes: Long,
+        versionName: String,
+        versionCode: Int,
+        releaseNotes: String,
+        publishImmediately: Boolean
+    ) {
+        if (!checkPermission(AdminPermission.MANAGE_SETTINGS, "انتشار نسخه جدید APK")) return
+        if (_releaseBusy.value) return
+        if (fileSizeBytes == 0L) {
+            val emptyMsg = if (isPersianLanguage.value) "فایل APK انتخاب‌شده خالی است." else "Selected APK file is empty."
+            _apkUploadError.value = emptyMsg
+            _uiMessage.value = UiMessage.Error(emptyMsg)
+            return
+        }
+        if (fileSizeBytes > TmsBackendApiClient.MAX_APK_UPLOAD_BYTES) {
+            val maxMsg = if (isPersianLanguage.value) {
+                "حجم فایل APK از حد مجاز (۱۰۰ مگابایت) بیشتر است."
+            } else {
+                "APK file exceeds the 100 MB upload limit."
+            }
+            _apkUploadError.value = maxMsg
+            _uiMessage.value = UiMessage.Error(maxMsg)
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            _releaseBusy.value = true
+            _apkUploadError.value = null
+            _apkUploadProgress.value = 0f
+            try {
+                val resolver = getApplication<Application>().contentResolver
+                val res = backendClient.adminUploadApkReleaseStream(
+                    fileName = fileName,
+                    fileSizeBytes = fileSizeBytes,
+                    versionName = versionName,
+                    versionCode = versionCode,
+                    releaseNotes = releaseNotes,
+                    publishImmediately = publishImmediately,
+                    streamProvider = { resolver.openInputStream(fileUri) },
+                    onProgress = { uploaded, total ->
+                        if (total > 0L) {
+                            _apkUploadProgress.value = (uploaded.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+                        }
+                    }
+                )
+                handleApkUploadResult(res)
+            } catch (oom: OutOfMemoryError) {
+                Log.e(TAG, "OOM during APK upload", oom)
+                val msg = if (isPersianLanguage.value) "حافظه کافی برای بارگذاری فایل وجود ندارد." else "Out of memory while uploading APK."
+                _apkUploadError.value = msg
+                _uiMessage.value = UiMessage.Error(msg)
+            } finally {
+                _apkUploadProgress.value = null
+                _releaseBusy.value = false
+            }
+        }
+    }
+
     fun adminUploadApkRelease(
         fileName: String,
         apkBytes: ByteArray,
@@ -4382,39 +4664,53 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     ) {
         if (!checkPermission(AdminPermission.MANAGE_SETTINGS, "انتشار نسخه جدید APK")) return
         if (_releaseBusy.value) return
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             _releaseBusy.value = true
+            _apkUploadError.value = null
+            _apkUploadProgress.value = 0f
             try {
-                when (
-                    val res = backendClient.adminUploadApkRelease(
-                        fileName = fileName,
-                        apkBytes = apkBytes,
-                        versionName = versionName,
-                        versionCode = versionCode,
-                        releaseNotes = releaseNotes,
-                        publishImmediately = publishImmediately
-                    )
-                ) {
-                    is BackendResult.Success -> {
-                        val rel = res.data
-                        _adminReleases.update { list -> listOf(rel) + list.filterNot { it.releaseId == rel.releaseId } }
-                        if (rel.isPublished) {
-                            _latestRelease.value = rel
+                val res = backendClient.adminUploadApkRelease(
+                    fileName = fileName,
+                    apkBytes = apkBytes,
+                    versionName = versionName,
+                    versionCode = versionCode,
+                    releaseNotes = releaseNotes,
+                    publishImmediately = publishImmediately,
+                    onProgress = { uploaded, total ->
+                        if (total > 0L) {
+                            _apkUploadProgress.value = (uploaded.toFloat() / total.toFloat()).coerceIn(0f, 1f)
                         }
-                        _uiMessage.value = UiMessage.Success(
-                            if (isPersianLanguage.value) {
-                                "نسخه ${rel.versionName} با موفقیت روی سرور بارگذاری شد"
-                            } else {
-                                "Release ${rel.versionName} uploaded successfully"
-                            }
-                        )
                     }
-                    else -> {
-                        _uiMessage.value = UiMessage.Error(describeBackendFailure(res, "خطا در آپلود فایل APK"))
-                    }
-                }
+                )
+                handleApkUploadResult(res)
             } finally {
+                _apkUploadProgress.value = null
                 _releaseBusy.value = false
+            }
+        }
+    }
+
+    private fun handleApkUploadResult(res: BackendResult<AppReleaseInfo>) {
+        when (res) {
+            is BackendResult.Success -> {
+                val rel = res.data
+                _apkUploadError.value = null
+                _adminReleases.update { list -> listOf(rel) + list.filterNot { it.releaseId == rel.releaseId } }
+                if (rel.isPublished) {
+                    _latestRelease.value = rel
+                }
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) {
+                        "نسخه ${rel.versionName} با موفقیت روی سرور بارگذاری شد"
+                    } else {
+                        "Release ${rel.versionName} uploaded successfully"
+                    }
+                )
+            }
+            else -> {
+                val errMsg = describeBackendFailure(res, "خطا در آپلود فایل APK")
+                _apkUploadError.value = errMsg
+                _uiMessage.value = UiMessage.Error(errMsg)
             }
         }
     }
@@ -4451,10 +4747,21 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun recordApkDownload(releaseId: String) {
-        viewModelScope.launch {
+        val currentRelease = _latestRelease.value
+        if (currentRelease != null && currentRelease.releaseId == releaseId && !ApkDownloadUrlValidator.isValid(currentRelease.downloadUrl)) {
+            Log.w(TAG, "Skipped recording download for invalid release URL")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
             when (val res = backendClient.recordReleaseDownload(releaseId)) {
                 is BackendResult.Success -> _latestRelease.value = res.data
-                else -> Unit
+                else -> {
+                    val err = classifyBackgroundError("record_download", res, isPersianLanguage.value)
+                    if (err != null) {
+                        _backgroundBackendError.value = err
+                        Log.w(TAG, "Background record download failed: $err")
+                    }
+                }
             }
         }
     }

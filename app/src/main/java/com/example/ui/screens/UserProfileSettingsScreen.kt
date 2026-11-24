@@ -83,8 +83,11 @@ import androidx.compose.material.icons.filled.Password
 import androidx.compose.material.icons.filled.SystemUpdate
 import com.example.BuildConfig
 import com.example.data.model.AppReleaseInfo
+import com.example.data.model.BackgroundBackendError
 import com.example.data.model.UserProfile
+import com.example.data.network.ApkDownloadUrlValidator
 import com.example.data.subscription.ReferralAndCryptoCalculator
+import com.example.ui.components.BackgroundBackendErrorBanner
 import com.example.ui.components.CyberGlassCard
 import com.example.ui.theme.DeepGraphite
 import com.example.ui.theme.ElectricCyan
@@ -129,6 +132,10 @@ fun UserProfileSettingsScreen(
     onSendVerificationEmail: () -> Unit = {},
     onSendPasswordReset: () -> Unit = {},
     onDownloadApkRelease: (AppReleaseInfo) -> Unit = {},
+    onInvalidDownloadUrl: (String) -> Unit = {},
+    backgroundBackendError: BackgroundBackendError? = null,
+    onRetryBackgroundSync: () -> Unit = {},
+    onDismissBackgroundError: () -> Unit = {},
     onOpenAdminConsole: () -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -174,6 +181,15 @@ fun UserProfileSettingsScreen(
                 .widthIn(max = 600.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            if (backgroundBackendError != null) {
+                BackgroundBackendErrorBanner(
+                    error = backgroundBackendError,
+                    isPersian = isPersian,
+                    onRetry = onRetryBackgroundSync,
+                    onDismiss = onDismissBackgroundError
+                )
+            }
+
             // User Identity Header Card
             CyberGlassCard(
                 accentColor = ElectricCyan.copy(alpha = 0.55f),
@@ -396,17 +412,31 @@ fun UserProfileSettingsScreen(
                         )
                     }
                     Spacer(modifier = Modifier.height(10.dp))
+                    var downloadUrlError by remember(latestRelease.releaseId, latestRelease.downloadUrl) {
+                        mutableStateOf<String?>(null)
+                    }
                     Button(
                         onClick = {
-                            onDownloadApkRelease(latestRelease)
-                            if (latestRelease.downloadUrl.isNotBlank()) {
-                                runCatching {
-                                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(latestRelease.downloadUrl)).apply {
-                                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                            when (val validation = ApkDownloadUrlValidator.validate(latestRelease.downloadUrl)) {
+                                is ApkDownloadUrlValidator.ValidationResult.Invalid -> {
+                                    val msg = if (isPersian) validation.reasonFa else validation.reasonEn
+                                    downloadUrlError = msg
+                                    onInvalidDownloadUrl(msg)
+                                }
+                                is ApkDownloadUrlValidator.ValidationResult.Valid -> {
+                                    downloadUrlError = null
+                                    onDownloadApkRelease(latestRelease)
+                                    runCatching {
+                                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(validation.normalizedUrl)).apply {
+                                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                        }
+                                        context.startActivity(intent)
+                                    }.onFailure { err ->
+                                        val errMsg = err.localizedMessage
+                                            ?: if (isPersian) "برنامه‌ای برای باز کردن لینک دانلود یافت نشد." else "Unable to open download URL."
+                                        downloadUrlError = errMsg
+                                        onInvalidDownloadUrl(errMsg)
                                     }
-                                    context.startActivity(intent)
-                                }.onFailure { err ->
-                                    Toast.makeText(context, err.localizedMessage, Toast.LENGTH_SHORT).show()
                                 }
                             }
                         },
@@ -424,6 +454,15 @@ fun UserProfileSettingsScreen(
                             text = if (isPersian) "دانلود آخرین نسخه APK" else "Download Latest APK",
                             fontWeight = FontWeight.Bold,
                             fontSize = 12.sp
+                        )
+                    }
+                    downloadUrlError?.let { urlErr ->
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = urlErr,
+                            fontSize = 11.sp,
+                            color = StatusError,
+                            modifier = Modifier.testTag("profile_apk_url_error")
                         )
                     }
                 } else {

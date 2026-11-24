@@ -14,6 +14,78 @@ sealed interface BackendResult<out T> {
     data object Unauthenticated : BackendResult<Nothing>
 }
 
+enum class BackendErrorCategory {
+    AUTHENTICATION,
+    SERVER,
+    NETWORK
+}
+
+data class BackgroundBackendError(
+    val category: BackendErrorCategory,
+    val message: String,
+    val httpCode: Int? = null,
+    val operation: String = ""
+)
+
+fun classifyBackgroundError(
+    operation: String,
+    result: BackendResult<*>,
+    isPersian: Boolean
+): BackgroundBackendError? {
+    return when (result) {
+        is BackendResult.Success -> null
+        is BackendResult.Unauthenticated -> BackgroundBackendError(
+            category = BackendErrorCategory.AUTHENTICATION,
+            message = if (isPersian) {
+                "نشست حساب کاربری نیاز به ورود مجدد دارد."
+            } else {
+                "Authentication required. Please sign in again."
+            },
+            httpCode = 401,
+            operation = operation
+        )
+        is BackendResult.HttpError -> {
+            if (operation == "latest_release" && result.httpCode == 404) {
+                return null
+            }
+            when (result.httpCode) {
+                401, 403 -> BackgroundBackendError(
+                    category = BackendErrorCategory.AUTHENTICATION,
+                    message = if (isPersian) {
+                        "دسترسی یا نشست شما توسط سرور رد شد (HTTP ${result.httpCode})."
+                    } else {
+                        "Server rejected authorization (HTTP ${result.httpCode})."
+                    },
+                    httpCode = result.httpCode,
+                    operation = operation
+                )
+                else -> BackgroundBackendError(
+                    category = BackendErrorCategory.SERVER,
+                    message = result.message.takeIf { it.isNotBlank() }?.let { msg ->
+                        if (isPersian) "خطای سرور ($operation): $msg (HTTP ${result.httpCode})"
+                        else "Server error ($operation): $msg (HTTP ${result.httpCode})"
+                    } ?: if (isPersian) {
+                        "خطای سرور در همگام‌سازی ($operation - HTTP ${result.httpCode})"
+                    } else {
+                        "Server sync error ($operation - HTTP ${result.httpCode})"
+                    },
+                    httpCode = result.httpCode,
+                    operation = operation
+                )
+            }
+        }
+        is BackendResult.NetworkError -> BackgroundBackendError(
+            category = BackendErrorCategory.NETWORK,
+            message = if (isPersian) {
+                "عدم دسترسی به سرور یا وقفه شبکه: ${result.message}"
+            } else {
+                "Network or server timeout: ${result.message}"
+            },
+            operation = operation
+        )
+    }
+}
+
 data class BackendSessionSync(
     val uid: String = "",
     val email: String = "",

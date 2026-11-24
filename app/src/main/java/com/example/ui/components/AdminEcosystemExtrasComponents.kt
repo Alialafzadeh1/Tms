@@ -33,6 +33,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -40,9 +41,12 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -53,11 +57,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.AppReleaseInfo
+import com.example.data.model.BackgroundBackendError
 import com.example.data.model.CryptoInvoiceStatus
 import com.example.data.model.CryptoPaymentInvoice
 import com.example.data.model.ReferralRewardRequest
 import com.example.data.model.ReferralRewardStatus
+import com.example.data.network.TmsBackendApiClient
 import com.example.data.subscription.ReferralAndCryptoCalculator
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.example.ui.theme.BorderGoldHighlight
 import com.example.ui.theme.BorderGoldMuted
 import com.example.ui.theme.CardSurfaceDark
@@ -82,34 +91,87 @@ fun AdminEcosystemTabContent(
     onUploadApkRelease: (fileName: String, bytes: ByteArray, versionName: String, versionCode: Int, notes: String, publish: Boolean) -> Unit,
     onToggleReleasePublish: (releaseId: String, publish: Boolean) -> Unit,
     onRefreshEcosystem: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    apkUploadProgress: Float? = null,
+    apkUploadError: String? = null,
+    backgroundBackendError: BackgroundBackendError? = null,
+    onUploadApkReleaseUri: ((fileUri: Uri, fileName: String, fileSizeBytes: Long, versionName: String, versionCode: Int, notes: String, publish: Boolean) -> Unit)? = null,
+    onRetryBackgroundSync: () -> Unit = {},
+    onDismissBackgroundError: () -> Unit = {}
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var rewardNote by remember { mutableStateOf("") }
 
+    var pickedApkUri by remember { mutableStateOf<Uri?>(null) }
     var pickedFileName by remember { mutableStateOf("") }
-    var pickedApkBytes by remember { mutableStateOf<ByteArray?>(null) }
+    var pickedFileSizeBytes by remember { mutableLongStateOf(-1L) }
+    var localPickerError by remember { mutableStateOf<String?>(null) }
     var versionNameInput by remember { mutableStateOf("") }
     var versionCodeInput by remember { mutableStateOf("") }
     var releaseNotesInput by remember { mutableStateOf("") }
     var publishImmediately by remember { mutableStateOf(true) }
 
+    LaunchedEffect(pickedApkUri) {
+        val uri = pickedApkUri ?: return@LaunchedEffect
+        localPickerError = null
+        val metadata = withContext(Dispatchers.IO) {
+            runCatching {
+                val resolver = context.contentResolver
+                var name = "tms-vpn.apk"
+                var size = -1L
+                resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (nameIdx >= 0) {
+                            cursor.getString(nameIdx)?.takeIf { it.isNotBlank() }?.let { name = it }
+                        }
+                        val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                        if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) {
+                            size = cursor.getLong(sizeIdx)
+                        }
+                    }
+                }
+                if (size < 0L) {
+                    size = resolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: -1L
+                }
+                Triple(name, size, null as String?)
+            }.getOrElse { err ->
+                Triple("", -1L, err.localizedMessage ?: "Unable to inspect selected APK file")
+            }
+        }
+        val (name, size, inspectErr) = metadata
+        if (inspectErr != null) {
+            pickedApkUri = null
+            pickedFileName = ""
+            pickedFileSizeBytes = -1L
+            localPickerError = inspectErr
+        } else if (size == 0L) {
+            pickedApkUri = null
+            pickedFileName = ""
+            pickedFileSizeBytes = -1L
+            localPickerError = if (isPersian) "فایل انتخاب‌شده خالی است." else "Selected file is empty."
+        } else if (size > TmsBackendApiClient.MAX_APK_UPLOAD_BYTES) {
+            pickedApkUri = null
+            pickedFileName = ""
+            pickedFileSizeBytes = -1L
+            localPickerError = if (isPersian) {
+                "حجم فایل (${ReferralAndCryptoCalculator.formatFileSize(size)}) بیشتر از حد مجاز ۱۰۰ مگابایت است."
+            } else {
+                "File size (${ReferralAndCryptoCalculator.formatFileSize(size)}) exceeds the 100 MB upload limit."
+            }
+        } else {
+            pickedFileName = name
+            pickedFileSizeBytes = size
+            localPickerError = null
+        }
+    }
+
     val apkPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         if (uri != null) {
-            runCatching {
-                val resolver = context.contentResolver
-                val name = resolver.query(uri, null, null, null, null)?.use { cursor ->
-                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (cursor.moveToFirst() && nameIdx >= 0) cursor.getString(nameIdx) else "tms-vpn.apk"
-                } ?: "tms-vpn.apk"
-                val bytes = resolver.openInputStream(uri)?.use { it.readBytes() }
-                if (bytes != null && bytes.isNotEmpty()) {
-                    pickedFileName = name
-                    pickedApkBytes = bytes
-                }
-            }
+            pickedApkUri = uri
         }
     }
 
@@ -117,6 +179,14 @@ fun AdminEcosystemTabContent(
         modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        if (backgroundBackendError != null) {
+            BackgroundBackendErrorBanner(
+                error = backgroundBackendError,
+                isPersian = isPersian,
+                onRetry = onRetryBackgroundSync,
+                onDismiss = onDismissBackgroundError
+            )
+        }
         // Refresh Header
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -288,7 +358,12 @@ fun AdminEcosystemTabContent(
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
                         text = if (pickedFileName.isNotBlank()) {
-                            "$pickedFileName (${ReferralAndCryptoCalculator.formatFileSize(pickedApkBytes?.size?.toLong() ?: 0L)})"
+                            val sizeLabel = if (pickedFileSizeBytes > 0L) {
+                                ReferralAndCryptoCalculator.formatFileSize(pickedFileSizeBytes)
+                            } else {
+                                if (isPersian) "اندازه نامشخص" else "Unknown size"
+                            }
+                            "$pickedFileName ($sizeLabel)"
                         } else {
                             if (isPersian) "انتخاب فایل .apk از حافظه" else "Select .apk File"
                         },
@@ -359,23 +434,96 @@ fun AdminEcosystemTabContent(
                     )
                 }
 
+                val displayedUploadError = localPickerError ?: apkUploadError
+                if (!displayedUploadError.isNullOrBlank()) {
+                    Text(
+                        text = displayedUploadError,
+                        fontSize = 11.sp,
+                        color = StatusOfflineRed,
+                        modifier = Modifier.testTag("admin_apk_upload_error")
+                    )
+                }
+
+                if (releaseBusy) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF131823), RoundedCornerShape(10.dp))
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        val progressValue = apkUploadProgress
+                        val pctText = if (progressValue != null) "${(progressValue * 100).toInt()}%" else "..."
+                        Text(
+                            text = if (isPersian) "در حال ارسال استریمی فایل APK به سرور ($pctText)" else "Streaming APK to server ($pctText)",
+                            fontSize = 11.sp,
+                            color = ElectricCyan,
+                            fontWeight = FontWeight.Bold
+                        )
+                        if (progressValue != null) {
+                            LinearProgressIndicator(
+                                progress = { progressValue.coerceIn(0f, 1f) },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(6.dp)
+                                    .testTag("admin_apk_upload_progress"),
+                                color = MetallicGold,
+                                trackColor = Color(0xFF1F2937)
+                            )
+                        } else {
+                            LinearProgressIndicator(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(6.dp)
+                                    .testTag("admin_apk_upload_progress"),
+                                color = MetallicGold,
+                                trackColor = Color(0xFF1F2937)
+                            )
+                        }
+                    }
+                }
+
                 Button(
                     onClick = {
-                        val bytes = pickedApkBytes ?: return@Button
+                        val uri = pickedApkUri ?: return@Button
                         val vName = versionNameInput.trim()
                         val vCode = versionCodeInput.trim().toIntOrNull() ?: 1
                         if (vName.isNotBlank()) {
-                            onUploadApkRelease(
-                                pickedFileName.ifBlank { "tms-vpn-$vName.apk" },
-                                bytes,
-                                vName,
-                                vCode,
-                                releaseNotesInput.trim(),
-                                publishImmediately
-                            )
+                            val resolvedName = pickedFileName.ifBlank { "tms-vpn-$vName.apk" }
+                            if (onUploadApkReleaseUri != null) {
+                                onUploadApkReleaseUri(
+                                    uri,
+                                    resolvedName,
+                                    pickedFileSizeBytes,
+                                    vName,
+                                    vCode,
+                                    releaseNotesInput.trim(),
+                                    publishImmediately
+                                )
+                            } else {
+                                scope.launch {
+                                    val bytes = withContext(Dispatchers.IO) {
+                                        runCatching {
+                                            context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                                        }.getOrNull()
+                                    }
+                                    if (bytes != null && bytes.isNotEmpty()) {
+                                        onUploadApkRelease(
+                                            resolvedName,
+                                            bytes,
+                                            vName,
+                                            vCode,
+                                            releaseNotesInput.trim(),
+                                            publishImmediately
+                                        )
+                                    } else {
+                                        localPickerError = if (isPersian) "خواندن فایل APK ناموفق بود." else "Failed reading APK file."
+                                    }
+                                }
+                            }
                         }
                     },
-                    enabled = !releaseBusy && pickedApkBytes != null && versionNameInput.isNotBlank(),
+                    enabled = !releaseBusy && pickedApkUri != null && versionNameInput.isNotBlank(),
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(48.dp)

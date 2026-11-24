@@ -28,8 +28,10 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AdminPanelSettings
@@ -37,6 +39,9 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.ExitToApp
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.material.icons.filled.LockReset
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Psychology
@@ -59,6 +64,7 @@ import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.NavigationRailItemDefaults
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -200,6 +206,8 @@ fun TmsVpnApp(
 
     val currentRole by viewModel.currentRole.collectAsStateWithLifecycle()
     val isUnlocked by viewModel.isUnlocked.collectAsStateWithLifecycle()
+    val adminPinConfigured by viewModel.adminPinConfigured.collectAsStateWithLifecycle()
+    val showAdminPinPrompt by viewModel.showAdminPinPrompt.collectAsStateWithLifecycle()
     val lockoutSeconds by viewModel.lockoutSeconds.collectAsStateWithLifecycle()
     val auditLogs by viewModel.auditLogs.collectAsStateWithLifecycle()
 
@@ -254,6 +262,9 @@ fun TmsVpnApp(
     val latestRelease by viewModel.latestRelease.collectAsStateWithLifecycle()
     val adminReleases by viewModel.adminReleases.collectAsStateWithLifecycle()
     val releaseBusy by viewModel.releaseBusy.collectAsStateWithLifecycle()
+    val apkUploadProgress by viewModel.apkUploadProgress.collectAsStateWithLifecycle()
+    val apkUploadError by viewModel.apkUploadError.collectAsStateWithLifecycle()
+    val backgroundBackendError by viewModel.backgroundBackendError.collectAsStateWithLifecycle()
 
     val isInAdminSpace by viewModel.isInAdminSpace.collectAsStateWithLifecycle()
     var showRadarInUserMode by remember { mutableStateOf(false) }
@@ -653,7 +664,9 @@ fun TmsVpnApp(
                                                     onClaimReferralReward = { threshold ->
                                                         viewModel.claimReferralReward(threshold)
                                                     },
-                                                    onRefreshBackend = { viewModel.refreshBackendEcosystem() }
+                                                    onRefreshBackend = { viewModel.retryBackendEcosystemSync() },
+                                                    backgroundBackendError = backgroundBackendError,
+                                                    onDismissBackgroundError = { viewModel.clearBackgroundBackendError() }
                                                 )
                                             }
                                             UserTabDestination.PROFILE -> {
@@ -674,6 +687,10 @@ fun TmsVpnApp(
                                                     onSendVerificationEmail = { viewModel.sendVerificationEmail() },
                                                     onSendPasswordReset = { viewModel.sendPasswordResetEmailFromProfile() },
                                                     onDownloadApkRelease = { rel -> viewModel.recordApkDownload(rel.releaseId) },
+                                                    onInvalidDownloadUrl = { err -> viewModel.reportInvalidApkDownloadUrl(err) },
+                                                    backgroundBackendError = backgroundBackendError,
+                                                    onRetryBackgroundSync = { viewModel.retryBackendEcosystemSync() },
+                                                    onDismissBackgroundError = { viewModel.clearBackgroundBackendError() },
                                                     onOpenAdminConsole = { viewModel.enterAdminSpace() }
                                                 )
                                             }
@@ -688,6 +705,8 @@ fun TmsVpnApp(
                 // ======================================================
                 // ADMIN SPACE: PRESERVED CONTROL CENTER (CYBER THEME)
                 // ======================================================
+                val isAdminAuthorized = isVerifiedAdmin && (!adminPinConfigured || isUnlocked)
+
                 Scaffold(
                     containerColor = DeepGraphite,
                     contentWindowInsets = WindowInsets.safeDrawing,
@@ -751,7 +770,7 @@ fun TmsVpnApp(
                                 }
                             },
                             actions = {
-                                if (isVerifiedAdmin) {
+                                if (isAdminAuthorized) {
                                     Row(
                                         modifier = Modifier
                                             .background(ElevatedSurface, RoundedCornerShape(8.dp))
@@ -763,16 +782,16 @@ fun TmsVpnApp(
                                         Icon(
                                             imageVector = Icons.Default.AdminPanelSettings,
                                             contentDescription = null,
-                                        tint = MetallicGold,
-                                        modifier = Modifier.size(13.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(3.dp))
-                                    Text(
-                                        text = currentRole.id.replace("_", " "),
-                                        color = MetallicGold,
-                                        fontSize = 9.sp,
-                                        fontWeight = FontWeight.Bold
-                                    )
+                                            tint = MetallicGold,
+                                            modifier = Modifier.size(13.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(3.dp))
+                                        Text(
+                                            text = currentRole.id.replace("_", " "),
+                                            color = MetallicGold,
+                                            fontSize = 9.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
                                     }
                                 }
 
@@ -800,7 +819,7 @@ fun TmsVpnApp(
                         )
                     },
                     bottomBar = {
-                        if (!isWideScreen) {
+                        if (!isWideScreen && isAdminAuthorized) {
                             NavigationBar(
                                 containerColor = ObsidianSurface,
                                 tonalElevation = 8.dp
@@ -848,6 +867,19 @@ fun TmsVpnApp(
                         }
                     }
                 ) { innerPadding ->
+                    if (!isAdminAuthorized) {
+                        BackHandler { viewModel.exitAdminSpace() }
+                        AdminLockedGateScreen(
+                            isPersian = isPersian,
+                            lockoutSeconds = lockoutSeconds,
+                            onVerifyPin = { viewModel.verifyAdminPin(it) },
+                            onEmergencyResetPin = { token, newPin -> viewModel.emergencyResetPin(token, newPin) },
+                            onExitToUserSpace = { viewModel.exitAdminSpace() },
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(innerPadding)
+                        )
+                    } else {
                     Row(
                         modifier = Modifier
                             .fillMaxSize()
@@ -1116,61 +1148,78 @@ fun TmsVpnApp(
                                                 onReviewReferralReward = { reqId, approve, note ->
                                                     viewModel.adminReviewReferralReward(reqId, approve, note)
                                                 },
-                                                onUploadApkRelease = { fileName, bytes, vName, vCode, notes, pub ->
-                                                    viewModel.adminUploadApkRelease(fileName, bytes, vName, vCode, notes, pub)
-                                                },
-                                                onToggleReleasePublish = { relId, pub ->
-                                                    viewModel.adminToggleReleasePublish(relId, pub)
-                                                },
-                                                onRefreshEcosystem = { viewModel.adminRefreshEcosystemData() }
-                                            )
-                                        } else {
-                                            UserManagementScreen(
-                                                profile = userProfile,
-                                                currentRole = currentRole,
-                                                auditLogs = auditLogs,
-                                                isPersian = isPersian,
-                                                onSwitchRole = { viewModel.switchRole(it) },
-                                                onUpdateQuota = { count, max, limit ->
-                                                    viewModel.updateUserQuota(count, max, limit)
-                                                },
-                                                registeredUsers = registeredUsers,
-                                                subscriptions = allSubscriptionsAdmin,
-                                                onAssignSubscriptionForUser = { user ->
-                                                    prefillGrantUid = user.userId
-                                                    prefillGrantEmail = user.email
-                                                    grantModalTrigger++
-                                                    adminUsersSubTab = "SUBSCRIPTIONS"
-                                                },
-                                                onUpdateQuotaForUser = { uid, max, limit ->
-                                                    viewModel.updateUserQuota(1, max, limit, targetUserId = uid)
-                                                }
-                                            )
-                                        }
-                                    }
-                                }
-                                TmsDestination.SETTINGS -> {
-                                    SystemSettingsScreen(
-                                        currentRole = currentRole,
-                                        isPersian = isPersian,
-                                        isUnlocked = isUnlocked,
-                                        lockoutSeconds = lockoutSeconds,
-                                        onToggleLanguage = { viewModel.toggleLanguage() },
-                                        onChangePin = { oldPin, newPin -> viewModel.changeAdminPin(oldPin, newPin) },
-                                        onEmergencyResetPin = { token, newPin -> viewModel.emergencyResetPin(token, newPin) },
-                                        onLockSession = { viewModel.lockAdminSession() },
-                                        onVerifyPin = { viewModel.verifyAdminPin(it) },
-                                        getRecoveryToken = { viewModel.getRecoveryToken() },
-                                        onSignOutComplete = onSignOut,
-                                        hasConfiguredPin = viewModel.hasConfiguredAdminPin(),
-                                        onConfigureInitialPin = { viewModel.configureInitialAdminPin(it) }
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+                                                 onUploadApkRelease = { fileName, bytes, vName, vCode, notes, pub ->
+                                                     viewModel.adminUploadApkRelease(fileName, bytes, vName, vCode, notes, pub)
+                                                 },
+                                                 onToggleReleasePublish = { relId, pub ->
+                                                     viewModel.adminToggleReleasePublish(relId, pub)
+                                                 },
+                                                 onRefreshEcosystem = { viewModel.adminRefreshEcosystemData() },
+                                                 apkUploadProgress = apkUploadProgress,
+                                                 apkUploadError = apkUploadError,
+                                                 backgroundBackendError = backgroundBackendError,
+                                                 onUploadApkReleaseUri = { uri, fileName, fileSize, vName, vCode, notes, pub ->
+                                                     viewModel.adminUploadApkReleaseFromUri(
+                                                         fileUri = uri,
+                                                         fileName = fileName,
+                                                         fileSizeBytes = fileSize,
+                                                         versionName = vName,
+                                                         versionCode = vCode,
+                                                         releaseNotes = notes,
+                                                         publishImmediately = pub
+                                                     )
+                                                 },
+                                                 onRetryBackgroundSync = { viewModel.retryBackendEcosystemSync() },
+                                                 onDismissBackgroundError = { viewModel.clearBackgroundBackendError() }
+                                             )
+                                         } else {
+                                             UserManagementScreen(
+                                                 profile = userProfile,
+                                                 currentRole = currentRole,
+                                                 auditLogs = auditLogs,
+                                                 isPersian = isPersian,
+                                                 onSwitchRole = { viewModel.switchRole(it) },
+                                                 onUpdateQuota = { count, max, limit ->
+                                                     viewModel.updateUserQuota(count, max, limit)
+                                                 },
+                                                 registeredUsers = registeredUsers,
+                                                 subscriptions = allSubscriptionsAdmin,
+                                                 onAssignSubscriptionForUser = { user ->
+                                                     prefillGrantUid = user.userId
+                                                     prefillGrantEmail = user.email
+                                                     grantModalTrigger++
+                                                     adminUsersSubTab = "SUBSCRIPTIONS"
+                                                 },
+                                                 onUpdateQuotaForUser = { uid, max, limit ->
+                                                     viewModel.updateUserQuota(1, max, limit, targetUserId = uid)
+                                                 }
+                                             )
+                                         }
+                                     }
+                                 }
+                                 TmsDestination.SETTINGS -> {
+                                     SystemSettingsScreen(
+                                         currentRole = currentRole,
+                                         isPersian = isPersian,
+                                         isUnlocked = isUnlocked,
+                                         lockoutSeconds = lockoutSeconds,
+                                         onToggleLanguage = { viewModel.toggleLanguage() },
+                                         onChangePin = { oldPin, newPin -> viewModel.changeAdminPin(oldPin, newPin) },
+                                         onEmergencyResetPin = { token, newPin -> viewModel.emergencyResetPin(token, newPin) },
+                                         onLockSession = { viewModel.lockAdminSession() },
+                                         onVerifyPin = { viewModel.verifyAdminPin(it) },
+                                         getRecoveryToken = { viewModel.getRecoveryToken() },
+                                         onSignOutComplete = onSignOut,
+                                         hasConfiguredPin = adminPinConfigured,
+                                         onConfigureInitialPin = { viewModel.configureInitialAdminPin(it) }
+                                     )
+                                 }
+                             }
+                         }
+                     }
+                     }
+                 }
+             }
 
             // Notifications / Real Audit Events Modal
             if (showNotificationsDialog) {
@@ -1234,8 +1283,96 @@ fun TmsVpnApp(
                 )
             }
 
-            // Quick Role Switcher Modal (Admin Space Only)
-            if (showQuickRoleSwitcher && isVerifiedAdmin && isInAdminSpace) {
+            // Admin Entry PIN Challenge Modal (when entering Admin Space with configured PIN)
+            if (showAdminPinPrompt && isVerifiedAdmin && !isInAdminSpace) {
+                var entryPinInput by remember { mutableStateOf("") }
+                AlertDialog(
+                    onDismissRequest = { viewModel.dismissAdminPinPrompt() },
+                    containerColor = CardSurfaceDark,
+                    modifier = Modifier.testTag("admin_entry_pin_dialog"),
+                    title = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(imageVector = Icons.Default.Lock, contentDescription = null, tint = MetallicGold)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = if (isPersian) "تایید پین امنیتی مدیر" else "Administrator PIN Required",
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MetallicGold
+                            )
+                        }
+                    },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(
+                                text = if (isPersian) {
+                                    "برای ورود به کنسول مدیریت، پین امنیتی مدیر را وارد کنید."
+                                } else {
+                                    "Enter your configured administrator security PIN to access the Admin Console."
+                                },
+                                fontSize = 12.sp,
+                                color = TextWhitePrimary
+                            )
+                            if (lockoutSeconds > 0) {
+                                Text(
+                                    text = if (isPersian) {
+                                        "قفل امنیتی فعال است ($lockoutSeconds ثانیه باقی‌مانده)."
+                                    } else {
+                                        "Locked out for $lockoutSeconds seconds."
+                                    },
+                                    fontSize = 11.sp,
+                                    color = StatusOfflineRed
+                                )
+                            }
+                            OutlinedTextField(
+                                value = entryPinInput,
+                                onValueChange = { entryPinInput = it },
+                                label = { Text(if (isPersian) "پین امنیتی" else "Security PIN") },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("admin_entry_pin_input"),
+                                visualTransformation = PasswordVisualTransformation(),
+                                singleLine = true,
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = MetallicGold,
+                                    unfocusedBorderColor = BorderGoldMuted,
+                                    focusedTextColor = TextWhitePrimary,
+                                    unfocusedTextColor = TextWhitePrimary
+                                )
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        Button(
+                            onClick = {
+                                val entered = viewModel.enterAdminSpace(entryPinInput)
+                                if (entered) {
+                                    entryPinInput = ""
+                                }
+                            },
+                            enabled = entryPinInput.isNotBlank() && lockoutSeconds == 0L,
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("admin_entry_pin_submit"),
+                            colors = ButtonDefaults.buttonColors(containerColor = MetallicGold, contentColor = Color(0xFF1E1700)),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(text = if (isPersian) "تایید و ورود" else "Verify & Enter", fontWeight = FontWeight.Bold)
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(
+                            onClick = { viewModel.dismissAdminPinPrompt() },
+                            modifier = Modifier.testTag("admin_entry_pin_dismiss")
+                        ) {
+                            Text(text = if (isPersian) "انصراف" else "Cancel", color = TextGraySecondary)
+                        }
+                    }
+                )
+            }
+
+            // Quick Role Switcher Modal (Admin Space Only, Unlocked)
+            if (showQuickRoleSwitcher && isVerifiedAdmin && isInAdminSpace && (!adminPinConfigured || isUnlocked)) {
                 AlertDialog(
                     onDismissRequest = { showQuickRoleSwitcher = false },
                     containerColor = CardSurfaceDark,
@@ -1398,3 +1535,214 @@ fun TmsVpnApp(
             }
         }
     }
+
+@Composable
+fun AdminLockedGateScreen(
+    isPersian: Boolean,
+    lockoutSeconds: Long,
+    onVerifyPin: (String) -> Boolean,
+    onEmergencyResetPin: (token: String, newPin: String) -> Unit,
+    onExitToUserSpace: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var pinInput by remember { mutableStateOf("") }
+    var showRecovery by remember { mutableStateOf(false) }
+    var recoveryTokenInput by remember { mutableStateOf("") }
+    var recoveryNewPinInput by remember { mutableStateOf("") }
+
+    Box(
+        modifier = modifier
+            .background(DeepGraphite)
+            .padding(20.dp)
+            .testTag("admin_locked_gate_screen"),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(BorderStroke(1.2.dp, MetallicGold), RoundedCornerShape(18.dp)),
+            colors = CardDefaults.cardColors(containerColor = CardSurfaceDark),
+            shape = RoundedCornerShape(18.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(56.dp)
+                        .background(GoldContainer, CircleShape)
+                        .border(BorderStroke(1.2.dp, MetallicGold), CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Lock,
+                        contentDescription = if (isPersian) "قفل پنل مدیریت" else "Admin Locked",
+                        tint = MetallicGold,
+                        modifier = Modifier.size(28.dp)
+                    )
+                }
+
+                Text(
+                    text = if (isPersian) "کنسول مدیریت قفل است" else "Admin Console Locked",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MetallicGold
+                )
+
+                Text(
+                    text = if (isPersian) {
+                        "برای دسترسی به نمای کلی، کاربران، سرورها، کانفیگ‌ها و تنظیمات، پین امنیتی مدیر را تایید کنید."
+                    } else {
+                        "Verify your administrator PIN before accessing Overview, Users, Servers, Configs, or Settings."
+                    },
+                    fontSize = 12.sp,
+                    color = TextGraySecondary
+                )
+
+                if (lockoutSeconds > 0) {
+                    Text(
+                        text = if (isPersian) {
+                            "قفل امنیتی فعال است: $lockoutSeconds ثانیه باقی‌مانده"
+                        } else {
+                            "Brute-force lockout active: $lockoutSeconds seconds remaining"
+                        },
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = StatusOfflineRed
+                    )
+                }
+
+                if (!showRecovery) {
+                    OutlinedTextField(
+                        value = pinInput,
+                        onValueChange = { pinInput = it },
+                        label = { Text(if (isPersian) "پین امنیتی مدیر" else "Administrator PIN") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("admin_gate_pin_input"),
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MetallicGold,
+                            unfocusedBorderColor = BorderGoldMuted,
+                            focusedTextColor = TextWhitePrimary,
+                            unfocusedTextColor = TextWhitePrimary
+                        )
+                    )
+
+                    Button(
+                        onClick = {
+                            if (onVerifyPin(pinInput)) {
+                                pinInput = ""
+                            }
+                        },
+                        enabled = pinInput.isNotBlank() && lockoutSeconds == 0L,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("admin_gate_unlock_button"),
+                        colors = ButtonDefaults.buttonColors(containerColor = MetallicGold, contentColor = Color(0xFF1E1700)),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.LockOpen, contentDescription = null, modifier = Modifier.size(17.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(text = if (isPersian) "بازکردن قفل مدیریت" else "Unlock Admin Console", fontWeight = FontWeight.Bold)
+                    }
+                } else {
+                    OutlinedTextField(
+                        value = recoveryTokenInput,
+                        onValueChange = { recoveryTokenInput = it },
+                        label = { Text(if (isPersian) "کلید ریکاوری اضطراری" else "Emergency Recovery Token") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("admin_gate_recovery_token_input"),
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MetallicGold,
+                            unfocusedBorderColor = BorderGoldMuted,
+                            focusedTextColor = TextWhitePrimary,
+                            unfocusedTextColor = TextWhitePrimary
+                        )
+                    )
+                    OutlinedTextField(
+                        value = recoveryNewPinInput,
+                        onValueChange = { recoveryNewPinInput = it },
+                        label = { Text(if (isPersian) "پین جدید (حداقل ۶ رقم)" else "New PIN (6+ chars)") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("admin_gate_recovery_new_pin_input"),
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MetallicGold,
+                            unfocusedBorderColor = BorderGoldMuted,
+                            focusedTextColor = TextWhitePrimary,
+                            unfocusedTextColor = TextWhitePrimary
+                        )
+                    )
+                    Button(
+                        onClick = {
+                            onEmergencyResetPin(recoveryTokenInput, recoveryNewPinInput)
+                            recoveryTokenInput = ""
+                            recoveryNewPinInput = ""
+                        },
+                        enabled = recoveryTokenInput.isNotBlank() && recoveryNewPinInput.length >= 6,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("admin_gate_recovery_submit_button"),
+                        colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen, contentColor = Color(0xFF021B10)),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.LockReset, contentDescription = null, modifier = Modifier.size(17.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(text = if (isPersian) "بازیابی و بازکردن" else "Reset PIN & Unlock", fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    TextButton(
+                        onClick = { showRecovery = !showRecovery },
+                        modifier = Modifier
+                            .weight(1f)
+                            .minimumInteractiveComponentSize()
+                            .testTag("admin_gate_recovery_toggle")
+                    ) {
+                        Text(
+                            text = if (showRecovery) {
+                                if (isPersian) "ورود با پین" else "Use PIN"
+                            } else {
+                                if (isPersian) "بازیابی اضطراری" else "Emergency Reset"
+                            },
+                            color = ElectricCyan,
+                            fontSize = 11.sp
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = onExitToUserSpace,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("admin_gate_exit_button"),
+                        border = BorderStroke(1.dp, BorderGoldMuted),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text(
+                            text = if (isPersian) "بازگشت به برنامه" else "Back to App",
+                            color = TextWhitePrimary,
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+            }
+        }
+    }
+}

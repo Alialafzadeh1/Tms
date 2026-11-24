@@ -103,12 +103,14 @@ import java.util.Locale
 
 import androidx.compose.material.icons.filled.CurrencyBitcoin
 import androidx.compose.material.icons.filled.QrCodeScanner
+import com.example.data.model.BackgroundBackendError
 import com.example.data.model.CryptoAsset
 import com.example.data.model.CryptoPaymentInvoice
 import com.example.data.model.FreeTrialStatus
 import com.example.data.model.ReferralDashboardData
 import com.example.data.subscription.ActivationQrCodeBox
 import com.example.data.subscription.SubscriptionActivationLinkEngine
+import com.example.ui.components.BackgroundBackendErrorBanner
 import com.example.ui.components.CryptoInvoicesHistoryCard
 import com.example.ui.components.CryptoPaymentSheetDialog
 import com.example.ui.components.FreeTrialCard
@@ -144,7 +146,9 @@ fun UserSubscriptionScreen(
     onSelectCryptoInvoice: (CryptoPaymentInvoice) -> Unit = {},
     onDismissCryptoInvoice: () -> Unit = {},
     onClaimReferralReward: (Int) -> Unit = {},
-    onRefreshBackend: () -> Unit = {}
+    onRefreshBackend: () -> Unit = {},
+    backgroundBackendError: BackgroundBackendError? = null,
+    onDismissBackgroundError: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var pendingPlanModal by remember { mutableStateOf<Pair<SubscriptionPlanId, String>?>(null) }
@@ -479,6 +483,15 @@ fun UserSubscriptionScreen(
                         )
                     }
                 }
+            }
+
+            if (backgroundBackendError != null) {
+                BackgroundBackendErrorBanner(
+                    error = backgroundBackendError,
+                    isPersian = isPersian,
+                    onRetry = onRefreshBackend,
+                    onDismiss = onDismissBackgroundError
+                )
             }
 
             // 1-Day Free Trial (7-Day Server-Enforced Cooldown)

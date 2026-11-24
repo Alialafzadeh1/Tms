@@ -29,10 +29,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.CardMembership
+import androidx.compose.material.icons.filled.CloudOff
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Public
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.outlined.Analytics
 import androidx.compose.material.icons.outlined.CardMembership
 import androidx.compose.material.icons.outlined.Home
@@ -43,6 +48,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
@@ -68,6 +74,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.model.BackendErrorCategory
+import com.example.data.model.BackgroundBackendError
 import com.example.data.model.VpnConnectionState
 import com.example.ui.theme.DeepGraphite
 import com.example.ui.theme.ElectricCyan
@@ -647,6 +655,111 @@ fun CyberBottomNavBar(
                         color = itemColor,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun BackgroundBackendErrorBanner(
+    error: BackgroundBackendError,
+    isPersian: Boolean,
+    onRetry: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val accent = when (error.category) {
+        BackendErrorCategory.AUTHENTICATION -> StatusError
+        BackendErrorCategory.SERVER -> StatusConnecting
+        BackendErrorCategory.NETWORK -> StatusConnecting
+    }
+    val icon = when (error.category) {
+        BackendErrorCategory.AUTHENTICATION -> Icons.Filled.Lock
+        BackendErrorCategory.SERVER -> Icons.Filled.Warning
+        BackendErrorCategory.NETWORK -> Icons.Filled.CloudOff
+    }
+    val header = when (error.category) {
+        BackendErrorCategory.AUTHENTICATION ->
+            if (isPersian) "نیاز به تایید هویت سرور" else "Authentication Sync Issue"
+        BackendErrorCategory.SERVER ->
+            if (isPersian) "خطای پاسخ سرور" else "Backend Server Error"
+        BackendErrorCategory.NETWORK ->
+            if (isPersian) "اختلال اتصال به سرور" else "Backend Sync Offline"
+    }
+
+    CyberGlassCard(
+        accentColor = accent,
+        contentPadding = 12.dp,
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag("backend_sync_error_banner")
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = header,
+                    tint = accent,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Column {
+                    Text(
+                        text = header,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = accent
+                    )
+                    Text(
+                        text = error.message,
+                        fontSize = 11.sp,
+                        color = TextCyberPrimary,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(
+                    onClick = onRetry,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("backend_sync_retry_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Refresh,
+                        contentDescription = if (isPersian) "تلاش مجدد" else "Retry",
+                        tint = ElectricCyan,
+                        modifier = Modifier.size(15.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = if (isPersian) "تلاش مجدد" else "Retry",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = ElectricCyan
+                    )
+                }
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("backend_sync_dismiss_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Close,
+                        contentDescription = if (isPersian) "بستن" else "Dismiss",
+                        tint = TextCyberSecondary,
+                        modifier = Modifier.size(16.dp)
                     )
                 }
             }

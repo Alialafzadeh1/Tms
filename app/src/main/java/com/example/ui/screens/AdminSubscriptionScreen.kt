@@ -72,6 +72,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import android.content.Intent
+import android.net.Uri
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.Share
@@ -82,6 +83,7 @@ import com.example.data.local.CleanIpEntity
 import com.example.data.local.CleanIpHealthStatus
 import com.example.data.model.AllocationHistoryRecord
 import com.example.data.model.AppReleaseInfo
+import com.example.data.model.BackgroundBackendError
 import com.example.data.model.CryptoPaymentInvoice
 import com.example.data.model.InventoryShortageAlert
 import com.example.data.model.ManagedEndpoint
@@ -95,6 +97,7 @@ import com.example.data.model.UserProfile
 import com.example.data.model.UserSubscription
 import com.example.data.subscription.SubscriptionLifecycleEngine
 import com.example.ui.components.AdminEcosystemTabContent
+import com.example.ui.components.BackgroundBackendErrorBanner
 import com.example.ui.theme.BorderGoldHighlight
 import com.example.ui.theme.BorderGoldMuted
 import com.example.ui.theme.CardSurfaceDark
@@ -168,7 +171,13 @@ fun AdminSubscriptionScreen(
     onReviewReferralReward: (requestId: String, approve: Boolean, note: String) -> Unit = { _, _, _ -> },
     onUploadApkRelease: (fileName: String, bytes: ByteArray, versionName: String, versionCode: Int, notes: String, publish: Boolean) -> Unit = { _, _, _, _, _, _ -> },
     onToggleReleasePublish: (releaseId: String, publish: Boolean) -> Unit = { _, _ -> },
-    onRefreshEcosystem: () -> Unit = {}
+    onRefreshEcosystem: () -> Unit = {},
+    apkUploadProgress: Float? = null,
+    apkUploadError: String? = null,
+    backgroundBackendError: BackgroundBackendError? = null,
+    onUploadApkReleaseUri: ((fileUri: Uri, fileName: String, fileSizeBytes: Long, versionName: String, versionCode: Int, notes: String, publish: Boolean) -> Unit)? = null,
+    onRetryBackgroundSync: () -> Unit = {},
+    onDismissBackgroundError: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
@@ -214,6 +223,17 @@ fun AdminSubscriptionScreen(
         contentPadding = PaddingValues(top = 12.dp, bottom = 96.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        if (backgroundBackendError != null) {
+            item {
+                BackgroundBackendErrorBanner(
+                    error = backgroundBackendError,
+                    isPersian = isPersian,
+                    onRetry = onRetryBackgroundSync,
+                    onDismiss = onDismissBackgroundError
+                )
+            }
+        }
+
         // Section Selector Bar
         item {
             Row(
@@ -1107,7 +1127,13 @@ fun AdminSubscriptionScreen(
                         onReviewReferralReward = onReviewReferralReward,
                         onUploadApkRelease = onUploadApkRelease,
                         onToggleReleasePublish = onToggleReleasePublish,
-                        onRefreshEcosystem = onRefreshEcosystem
+                        onRefreshEcosystem = onRefreshEcosystem,
+                        apkUploadProgress = apkUploadProgress,
+                        apkUploadError = apkUploadError,
+                        backgroundBackendError = null,
+                        onUploadApkReleaseUri = onUploadApkReleaseUri,
+                        onRetryBackgroundSync = onRetryBackgroundSync,
+                        onDismissBackgroundError = onDismissBackgroundError
                     )
                 }
             }

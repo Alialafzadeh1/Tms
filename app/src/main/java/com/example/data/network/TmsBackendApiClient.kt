@@ -17,15 +17,104 @@ import com.google.firebase.auth.auth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.BufferedSink
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.io.InputStream
+import java.net.URI
 import java.util.concurrent.TimeUnit
+
+object ApkDownloadUrlValidator {
+    const val APPROVED_DOWNLOAD_HOST = "tms-vpn-bot-core.24z1qne0u9xs.workers.dev"
+
+    sealed interface ValidationResult {
+        data class Valid(val normalizedUrl: String) : ValidationResult
+        data class Invalid(val reasonFa: String, val reasonEn: String) : ValidationResult
+    }
+
+    fun validate(rawUrl: String?): ValidationResult {
+        val trimmed = rawUrl?.trim().orEmpty()
+        if (trimmed.isEmpty()) {
+            return ValidationResult.Invalid(
+                reasonFa = "آدرس دانلود فایل APK نامعتبر یا خالی است.",
+                reasonEn = "APK download URL is missing or empty."
+            )
+        }
+        if (trimmed.any { it.isWhitespace() || it.code < 0x20 || it.code == 0x7F }) {
+            return ValidationResult.Invalid(
+                reasonFa = "آدرس دانلود فایل APK دارای کاراکترهای نامعتبر است.",
+                reasonEn = "APK download URL contains invalid characters."
+            )
+        }
+        val uri = try {
+            URI(trimmed)
+        } catch (_: Exception) {
+            return ValidationResult.Invalid(
+                reasonFa = "ساختار آدرس دانلود فایل APK نامعتبر است.",
+                reasonEn = "Malformed APK download URL."
+            )
+        }
+
+        val scheme = uri.scheme?.lowercase()
+        if (scheme != "https") {
+            return ValidationResult.Invalid(
+                reasonFa = "فقط لینک‌های امن HTTPS برای دانلود APK مجاز هستند.",
+                reasonEn = "Only HTTPS URLs are permitted for APK downloads."
+            )
+        }
+
+        if (!uri.rawUserInfo.isNullOrEmpty() || uri.rawAuthority?.contains("@") == true) {
+            return ValidationResult.Invalid(
+                reasonFa = "آدرس دانلود نامعتبر است (اطلاعات کاربری در URL مجاز نیست).",
+                reasonEn = "Untrusted APK download URL format."
+            )
+        }
+
+        val host = uri.host?.lowercase()
+        if (host != APPROVED_DOWNLOAD_HOST) {
+            return ValidationResult.Invalid(
+                reasonFa = "دامنه لینک دانلود معتبر نیست. فقط سرور رسمی برنامه مجاز است.",
+                reasonEn = "Untrusted APK download host. Only the official backend host is permitted."
+            )
+        }
+
+        if (uri.port != -1 && uri.port != 443) {
+            return ValidationResult.Invalid(
+                reasonFa = "پورت آدرس دانلود مجاز نیست.",
+                reasonEn = "Non-standard port is not permitted for APK download URLs."
+            )
+        }
+
+        val path = uri.rawPath
+        if (path.isNullOrBlank() || !path.startsWith("/")) {
+            return ValidationResult.Invalid(
+                reasonFa = "مسیر فایل در لینک دانلود نامعتبر است.",
+                reasonEn = "APK download URL path is invalid."
+            )
+        }
+
+        return try {
+            uri.toURL()
+            ValidationResult.Valid(uri.toASCIIString())
+        } catch (_: Exception) {
+            ValidationResult.Invalid(
+                reasonFa = "ساختار آدرس دانلود فایل APK نامعتبر است.",
+                reasonEn = "Malformed APK download URL."
+            )
+        }
+    }
+
+    fun isValid(rawUrl: String?): Boolean = validate(rawUrl) is ValidationResult.Valid
+}
 
 /**
  * Production HTTP client communicating with TMS Cloudflare Worker (`tms-vpn-bot-core`)
@@ -45,13 +134,15 @@ class TmsBackendApiClient(
 
     companion object {
         const val DEFAULT_BASE_URL = "https://tms-vpn-bot-core.24z1qne0u9xs.workers.dev"
+        const val MAX_APK_UPLOAD_BYTES = 100L * 1024L * 1024L
+        private const val UPLOAD_CHUNK_BYTES = 64 * 1024
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val APK_MEDIA_TYPE = "application/vnd.android.package-archive".toMediaType()
 
         fun defaultOkHttpClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .writeTimeout(120, TimeUnit.SECONDS)
+            .readTimeout(45, TimeUnit.SECONDS)
+            .writeTimeout(180, TimeUnit.SECONDS)
             .build()
 
         fun defaultFirebaseTokenProvider(): suspend (Boolean) -> String? = { forceRefresh ->
@@ -321,14 +412,76 @@ class TmsBackendApiClient(
         versionName: String,
         versionCode: Int,
         releaseNotes: String,
-        publishImmediately: Boolean
+        publishImmediately: Boolean,
+        onProgress: (bytesUploaded: Long, totalBytes: Long) -> Unit = { _, _ -> }
     ): BackendResult<AppReleaseInfo> {
         if (apkBytes.isEmpty()) {
             return BackendResult.HttpError(400, "EMPTY_APK", "فایل APK خالی است")
         }
-        val token = tokenProvider(false) ?: return BackendResult.Unauthenticated
+        return adminUploadApkReleaseStream(
+            fileName = fileName,
+            fileSizeBytes = apkBytes.size.toLong(),
+            versionName = versionName,
+            versionCode = versionCode,
+            releaseNotes = releaseNotes,
+            publishImmediately = publishImmediately,
+            streamProvider = { ByteArrayInputStream(apkBytes) },
+            onProgress = onProgress
+        )
+    }
+
+    suspend fun adminUploadApkReleaseStream(
+        fileName: String,
+        fileSizeBytes: Long,
+        versionName: String,
+        versionCode: Int,
+        releaseNotes: String,
+        publishImmediately: Boolean,
+        streamProvider: () -> InputStream?,
+        onProgress: (bytesUploaded: Long, totalBytes: Long) -> Unit = { _, _ -> }
+    ): BackendResult<AppReleaseInfo> = withContext(Dispatchers.IO) {
+        if (fileSizeBytes == 0L) {
+            return@withContext BackendResult.HttpError(400, "EMPTY_APK", "فایل APK خالی است")
+        }
+        if (fileSizeBytes > MAX_APK_UPLOAD_BYTES) {
+            return@withContext BackendResult.HttpError(
+                413,
+                "PAYLOAD_TOO_LARGE",
+                "حجم فایل APK بیش از حد مجاز (۱۰۰ مگابایت) است."
+            )
+        }
+        val token = tokenProvider(false) ?: return@withContext BackendResult.Unauthenticated
 
         suspend fun doUpload(authToken: String): BackendResult<AppReleaseInfo> {
+            val streamingBody = object : RequestBody() {
+                override fun contentType(): MediaType = APK_MEDIA_TYPE
+
+                override fun contentLength(): Long = if (fileSizeBytes > 0L) fileSizeBytes else -1L
+
+                override fun writeTo(sink: BufferedSink) {
+                    val input = streamProvider()
+                        ?: throw IOException("Unable to open APK file stream")
+                    input.use { stream ->
+                        val buffer = ByteArray(UPLOAD_CHUNK_BYTES)
+                        var uploaded = 0L
+                        while (true) {
+                            val read = stream.read(buffer)
+                            if (read == -1) break
+                            uploaded += read
+                            if (uploaded > MAX_APK_UPLOAD_BYTES) {
+                                throw IOException("APK file exceeds maximum allowed upload limit (100 MB)")
+                            }
+                            sink.write(buffer, 0, read)
+                            onProgress(uploaded, fileSizeBytes)
+                        }
+                        if (uploaded == 0L) {
+                            throw IOException("Selected APK stream is empty")
+                        }
+                        sink.flush()
+                    }
+                }
+            }
+
             val multipart = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
                 .addFormDataPart("versionName", versionName.trim())
@@ -338,7 +491,7 @@ class TmsBackendApiClient(
                 .addFormDataPart(
                     "file",
                     fileName.ifBlank { "tms-vpn.apk" },
-                    apkBytes.toRequestBody(APK_MEDIA_TYPE)
+                    streamingBody
                 )
                 .build()
 
@@ -348,17 +501,26 @@ class TmsBackendApiClient(
                 .post(multipart)
                 .build()
 
-            return executeAndParse(request) { json ->
+            val result = executeAndParse(request) { json ->
                 parseReleaseInfo(json.optJSONObject("release") ?: json.optJSONObject("data") ?: json)
+            }
+            return if (result is BackendResult.HttpError && result.httpCode == 413) {
+                BackendResult.HttpError(
+                    httpCode = 413,
+                    errorCode = result.errorCode,
+                    message = "حجم فایل APK از حد مجاز سرور بیشتر است (HTTP 413)."
+                )
+            } else {
+                result
             }
         }
 
         val first = doUpload(token)
         if (first is BackendResult.HttpError && first.httpCode == 401) {
-            val refreshed = tokenProvider(true) ?: return BackendResult.Unauthenticated
-            return doUpload(refreshed)
+            val refreshed = tokenProvider(true) ?: return@withContext BackendResult.Unauthenticated
+            return@withContext doUpload(refreshed)
         }
-        return first
+        return@withContext first
     }
 
     // --- CORE REQUEST EXECUTION & 401 TOKEN REFRESH ---
