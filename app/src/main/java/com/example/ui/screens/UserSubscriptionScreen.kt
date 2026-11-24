@@ -101,9 +101,18 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+import androidx.compose.material.icons.filled.CurrencyBitcoin
 import androidx.compose.material.icons.filled.QrCodeScanner
+import com.example.data.model.CryptoAsset
+import com.example.data.model.CryptoPaymentInvoice
+import com.example.data.model.FreeTrialStatus
+import com.example.data.model.ReferralDashboardData
 import com.example.data.subscription.ActivationQrCodeBox
 import com.example.data.subscription.SubscriptionActivationLinkEngine
+import com.example.ui.components.CryptoInvoicesHistoryCard
+import com.example.ui.components.CryptoPaymentSheetDialog
+import com.example.ui.components.FreeTrialCard
+import com.example.ui.components.ReferralDashboardCard
 
 @Composable
 fun UserSubscriptionScreen(
@@ -120,7 +129,22 @@ fun UserSubscriptionScreen(
     isBusy: Boolean = false,
     onSubmitPlanRequest: (plan: SubscriptionPlanId, actionType: String, referenceCode: String, note: String) -> Unit = { _, _, _, _ -> },
     onConnectEndpoint: (AllocatedEndpointRecord) -> Unit = {},
-    onActivateByLink: (String) -> Unit = {}
+    onActivateByLink: (String) -> Unit = {},
+    freeTrialStatus: FreeTrialStatus? = null,
+    trialBusy: Boolean = false,
+    cryptoInvoices: List<CryptoPaymentInvoice> = emptyList(),
+    activeCryptoInvoice: CryptoPaymentInvoice? = null,
+    cryptoBusy: Boolean = false,
+    referralDashboard: ReferralDashboardData? = null,
+    referralBusy: Boolean = false,
+    telegramLinked: Boolean = false,
+    onActivateFreeTrial: () -> Unit = {},
+    onCreateCryptoInvoice: (SubscriptionPlanId, CryptoAsset) -> Unit = { _, _ -> },
+    onVerifyCryptoInvoice: (invoiceId: String, txHash: String) -> Unit = { _, _ -> },
+    onSelectCryptoInvoice: (CryptoPaymentInvoice) -> Unit = {},
+    onDismissCryptoInvoice: () -> Unit = {},
+    onClaimReferralReward: (Int) -> Unit = {},
+    onRefreshBackend: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var pendingPlanModal by remember { mutableStateOf<Pair<SubscriptionPlanId, String>?>(null) }
@@ -128,6 +152,8 @@ fun UserSubscriptionScreen(
     var paymentNote by remember { mutableStateOf("") }
     var showLinkActivationModal by remember { mutableStateOf(false) }
     var activationLinkInput by remember { mutableStateOf("") }
+    var showCryptoDialog by remember { mutableStateOf(false) }
+    var cryptoInitialPlan by remember { mutableStateOf(SubscriptionPlanId.ONE_MONTH) }
 
     val isEntitled = SubscriptionLifecycleEngine.isEntitled(subscription, trustedNowMs)
     val remainingDays = SubscriptionLifecycleEngine.remainingDays(subscription, trustedNowMs)
@@ -455,6 +481,15 @@ fun UserSubscriptionScreen(
                 }
             }
 
+            // 1-Day Free Trial (7-Day Server-Enforced Cooldown)
+            FreeTrialCard(
+                trialStatus = freeTrialStatus,
+                trustedNowMs = trustedNowMs,
+                isBusy = trialBusy,
+                isPersian = isPersian,
+                onActivateFreeTrial = onActivateFreeTrial
+            )
+
             // Pending Server Verification Notice (Only shown when unconfirmed payment request exists)
             if (latestPendingRequest != null) {
                 val reqPlan = SubscriptionPlanId.fromId(latestPendingRequest.planId)
@@ -537,6 +572,31 @@ fun UserSubscriptionScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
+                OutlinedButton(
+                    onClick = {
+                        cryptoInitialPlan = activePlan ?: SubscriptionPlanId.ONE_MONTH
+                        showCryptoDialog = true
+                    },
+                    enabled = !isBusy && !cryptoBusy,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("crypto_pay_open_button"),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, com.example.ui.theme.MetallicGold),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = com.example.ui.theme.MetallicGold)
+                ) {
+                    Icon(imageVector = Icons.Filled.CurrencyBitcoin, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (isPersian) "پرداخت رمزارزی (USDT TRC20 / TRX)" else "Pay with Crypto (USDT TRC20 / TRX)",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -580,7 +640,7 @@ fun UserSubscriptionScreen(
                 }
             }
 
-            // Premium Plan Cards (1 Month / 3 Months / 1 Year — NO INVENTED PRICES!)
+            // Premium Plan Cards (1 Month: 300k / 3 Months: 650k / 1 Year: 1,700k Toman)
             CyberGlassCard(contentPadding = 14.dp) {
                 Text(
                     text = if (isPersian) "پلن‌های اشتراک IP اختصاصی" else "Dedicated IP Subscription Plans",
@@ -589,9 +649,9 @@ fun UserSubscriptionScreen(
                 )
                 Text(
                     text = if (isPersian) {
-                        "تخصیص ایزوله و چرخش روزانه خودکار بر اساس پلن • بدون قیمت‌گذاری نمایشی"
+                        "تخصیص ایزوله و چرخش روزانه خودکار • پرداخت مستقیم، ربات تلگرام یا رمزارز"
                     } else {
-                        "Daily isolated IP rotation quota per plan • Pricing & confirmation handled by trusted gateway"
+                        "Daily isolated IP rotation quota per plan • Official Toman & Crypto checkout"
                     },
                     fontSize = 11.sp,
                     color = TextCyberSecondary
@@ -667,39 +727,67 @@ fun UserSubscriptionScreen(
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Text(
-                                        text = if (isPersian) {
-                                            "مدت: ${plan.durationDays} روز • اولویت: ${plan.priorityLabelFa}"
-                                        } else {
-                                            "Duration: ${plan.durationDays} days • Priority: ${plan.priorityLabelEn}"
-                                        },
-                                        fontSize = 11.sp,
-                                        color = MetallicSilver
-                                    )
-
-                                    Button(
-                                        onClick = { pendingPlanModal = plan to actionType },
-                                        enabled = !isBusy,
-                                        modifier = Modifier
-                                            .height(48.dp)
-                                            .testTag("select_plan_button_${plan.id}"),
-                                        colors = ButtonDefaults.buttonColors(
-                                            containerColor = if (isCurrentActive) SecondarySurface else accent,
-                                            contentColor = if (isCurrentActive) accent else DeepGraphite
-                                        ),
-                                        shape = RoundedCornerShape(10.dp),
-                                        contentPadding = PaddingValues(horizontal = 12.dp)
-                                    ) {
+                                    Column {
                                         Text(
-                                            text = when (actionType) {
-                                                "RENEW" -> if (isPersian) "درخواست تمدید" else "Request Renew"
-                                                "UPGRADE" -> if (isPersian) "درخواست ارتقا" else "Upgrade"
-                                                "DOWNGRADE" -> if (isPersian) "تغییر پلن" else "Downgrade"
-                                                else -> if (isPersian) "ثبت درخواست" else "Request Plan"
-                                            },
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.Bold
+                                            text = if (isPersian) plan.formattedPriceTomanFa else plan.formattedPriceTomanEn,
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = com.example.ui.theme.MetallicGold,
+                                            modifier = Modifier.testTag("plan_price_${plan.id}")
                                         )
+                                        Text(
+                                            text = if (isPersian) {
+                                                "مدت: ${plan.durationDays} روز • ${plan.priorityLabelFa}"
+                                            } else {
+                                                "Duration: ${plan.durationDays}d • ${plan.priorityLabelEn}"
+                                            },
+                                            fontSize = 10.sp,
+                                            color = MetallicSilver
+                                        )
+                                    }
+
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        OutlinedButton(
+                                            onClick = {
+                                                cryptoInitialPlan = plan
+                                                showCryptoDialog = true
+                                            },
+                                            enabled = !isBusy && !cryptoBusy,
+                                            modifier = Modifier
+                                                .height(48.dp)
+                                                .testTag("crypto_plan_button_${plan.id}"),
+                                            border = BorderStroke(1.dp, com.example.ui.theme.MetallicGold.copy(alpha = 0.7f)),
+                                            colors = ButtonDefaults.outlinedButtonColors(contentColor = com.example.ui.theme.MetallicGold),
+                                            shape = RoundedCornerShape(10.dp),
+                                            contentPadding = PaddingValues(horizontal = 8.dp)
+                                        ) {
+                                            Text(text = "USDT/TRX", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                        }
+
+                                        Button(
+                                            onClick = { pendingPlanModal = plan to actionType },
+                                            enabled = !isBusy,
+                                            modifier = Modifier
+                                                .height(48.dp)
+                                                .testTag("select_plan_button_${plan.id}"),
+                                            colors = ButtonDefaults.buttonColors(
+                                                containerColor = if (isCurrentActive) SecondarySurface else accent,
+                                                contentColor = if (isCurrentActive) accent else DeepGraphite
+                                            ),
+                                            shape = RoundedCornerShape(10.dp),
+                                            contentPadding = PaddingValues(horizontal = 12.dp)
+                                        ) {
+                                            Text(
+                                                text = when (actionType) {
+                                                    "RENEW" -> if (isPersian) "تمدید" else "Renew"
+                                                    "UPGRADE" -> if (isPersian) "ارتقا" else "Upgrade"
+                                                    "DOWNGRADE" -> if (isPersian) "تغییر پلن" else "Downgrade"
+                                                    else -> if (isPersian) "ثبت درخواست" else "Request Plan"
+                                                },
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -813,6 +901,26 @@ fun UserSubscriptionScreen(
                     }
                 }
             }
+
+            // Recent Crypto Invoices History
+            CryptoInvoicesHistoryCard(
+                invoices = cryptoInvoices,
+                isPersian = isPersian,
+                onSelectInvoice = { inv ->
+                    onSelectCryptoInvoice(inv)
+                    showCryptoDialog = true
+                }
+            )
+
+            // Referral Program & Cumulative Data Rewards
+            ReferralDashboardCard(
+                dashboard = referralDashboard,
+                telegramLinked = telegramLinked,
+                isBusy = referralBusy,
+                isPersian = isPersian,
+                onClaimMilestone = onClaimReferralReward,
+                onRefresh = onRefreshBackend
+            )
 
             // Subscription History Timeline
             CyberGlassCard(
@@ -1230,6 +1338,22 @@ fun UserSubscriptionScreen(
                 TextButton(onClick = { showLinkActivationModal = false }) {
                     Text(text = if (isPersian) "انصراف" else "Cancel", color = MetallicSilver)
                 }
+            }
+        )
+    }
+
+    if (showCryptoDialog || activeCryptoInvoice != null) {
+        CryptoPaymentSheetDialog(
+            initialPlan = cryptoInitialPlan,
+            activeInvoice = activeCryptoInvoice,
+            trustedNowMs = trustedNowMs,
+            isBusy = cryptoBusy,
+            isPersian = isPersian,
+            onCreateInvoice = onCreateCryptoInvoice,
+            onVerifyInvoice = onVerifyCryptoInvoice,
+            onDismiss = {
+                showCryptoDialog = false
+                onDismissCryptoInvoice()
             }
         )
     }

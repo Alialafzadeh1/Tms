@@ -17,6 +17,7 @@ import com.example.data.subscription.SubscriptionLifecycleEngine
 import com.example.data.subscription.UserRotationOutcome
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import java.util.UUID
@@ -67,6 +68,14 @@ class LocalVpnConfigRepository(
 
     suspend fun getAllOnce(): List<VpnConfig> = withContext(Dispatchers.IO) {
         dao.getAllOnce().map { it.toDomainModel() }
+    }
+
+    suspend fun getAllConfigEntitiesOnce(): List<LocalVpnConfigEntity> = withContext(Dispatchers.IO) {
+        dao.getAllOnce()
+    }
+
+    suspend fun saveConfigEntity(entity: LocalVpnConfigEntity) = withContext(Dispatchers.IO) {
+        dao.insert(entity)
     }
 
     suspend fun saveConfig(config: VpnConfig, notes: String = "") = withContext(Dispatchers.IO) {
@@ -245,6 +254,10 @@ class LocalVpnConfigRepository(
 
     fun observeCachedSubscription(userId: String): Flow<UserSubscription?>? =
         subscriptionDao?.observeSubscription(userId)?.map { it?.toDomainModel() }
+
+    suspend fun getCachedSubscriptionOnce(userId: String): UserSubscription? = withContext(Dispatchers.IO) {
+        observeCachedSubscription(userId)?.firstOrNull()
+    }
 
     fun observeAllCachedSubscriptions(): Flow<List<UserSubscription>>? =
         subscriptionDao?.observeAllSubscriptions()?.map { list -> list.map { it.toDomainModel() } }

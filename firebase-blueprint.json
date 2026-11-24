@@ -327,6 +327,68 @@
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["ticketId", "userId", "senderUid", "senderRole", "message", "createdAt"]
+    },
+    "CryptoPaymentInvoice": {
+      "title": "Crypto Payment Invoice",
+      "description": "Server-generated TRC20 USDT or native TRX payment invoice verified on-chain",
+      "type": "object",
+      "properties": {
+        "invoiceId": { "type": "string" },
+        "userId": { "type": "string" },
+        "planId": { "type": "string" },
+        "asset": { "type": "string" },
+        "depositAddress": { "type": "string" },
+        "expectedAmountCrypto": { "type": "string" },
+        "expectedAmountToman": { "type": "integer" },
+        "lockedRateToman": { "type": "integer" },
+        "status": { "type": "string" },
+        "txHash": { "type": "string" },
+        "expiresAtMs": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["invoiceId", "userId", "planId", "asset", "depositAddress", "expectedAmountCrypto", "status", "createdAt"]
+    },
+    "TrialGrant": {
+      "title": "1-Day Free Trial Grant",
+      "description": "Server-enforced once-per-7-days 24h free trial cooldown record",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "activatedAtMs": { "type": "integer" },
+        "expiresAtMs": { "type": "integer" },
+        "nextEligibleAtMs": { "type": "integer" }
+      },
+      "required": ["userId", "activatedAtMs", "expiresAtMs", "nextEligibleAtMs"]
+    },
+    "ReferralRewardRequest": {
+      "title": "Referral Reward Claim Request",
+      "description": "User claim for cumulative referral milestone (2=1GB, 4=1.5GB, 10=10GB) reviewed by admin",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "milestoneThreshold": { "type": "integer" },
+        "rewardGb": { "type": "number" },
+        "status": { "type": "string" },
+        "adminNote": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "milestoneThreshold", "rewardGb", "status", "createdAt"]
+    },
+    "AppRelease": {
+      "title": "Published APK Release Metadata",
+      "description": "Latest R2 APK package version, release notes, and download counter",
+      "type": "object",
+      "properties": {
+        "releaseId": { "type": "string" },
+        "versionName": { "type": "string" },
+        "versionCode": { "type": "integer" },
+        "releaseNotes": { "type": "string" },
+        "fileSizeBytes": { "type": "integer" },
+        "downloadCount": { "type": "integer" },
+        "downloadUrl": { "type": "string" },
+        "isPublished": { "type": "boolean" }
+      },
+      "required": ["releaseId", "versionName", "versionCode", "downloadUrl", "isPublished"]
     }
   },
   "firestore": {
@@ -393,6 +455,22 @@
     "/support_tickets/{ticketId}/replies/{replyId}": {
       "schema": "SupportTicketReply",
       "description": "Immutable replies within a support ticket thread"
+    },
+    "/crypto_invoices/{invoiceId}": {
+      "schema": "CryptoPaymentInvoice",
+      "description": "Crypto payment invoices generated and verified strictly by backend"
+    },
+    "/trial_grants/{userId}": {
+      "schema": "TrialGrant",
+      "description": "1-day free trial grants with 7-day server-enforced cooldown"
+    },
+    "/referral_reward_requests/{requestId}": {
+      "schema": "ReferralRewardRequest",
+      "description": "Referral milestone reward claim requests reviewed by admin"
+    },
+    "/app_releases/{releaseId}": {
+      "schema": "AppRelease",
+      "description": "Published APK release metadata hosted on R2"
     }
   }
 }

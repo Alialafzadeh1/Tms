@@ -39,9 +39,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,6 +50,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
@@ -90,22 +91,17 @@ fun AuthScreen(
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
-    val localAuthManager = remember(context) { LocalUserAuthManager(context) }
+    val firebaseAuthManager = remember(context) { LocalUserAuthManager(context) }
 
     var isSignUpMode by remember { mutableStateOf(false) }
     var isSubmitting by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var statusMessage by remember { mutableStateOf<String?>(null) }
 
     var displayNameInput by remember { mutableStateOf("") }
     var emailInput by remember { mutableStateOf("") }
     var passwordInput by remember { mutableStateOf("") }
     var passwordVisible by remember { mutableStateOf(false) }
-
-    LaunchedEffect(Unit) {
-        if (LocalUserAuthManager.restoreOfflineSession(context) != null) {
-            onAuthSuccess()
-        }
-    }
 
     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
         CyberAmbientBackdrop(accentColor = ElectricCyan) {
@@ -145,7 +141,7 @@ fun AuthScreen(
                         )
 
                         Text(
-                            text = "TMS NEXUS AI • QUANTUM TUNNEL",
+                            text = "TMS NEXUS AI • CLOUD VERIFIED",
                             fontFamily = JetBrainsMonoFontFamily,
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
@@ -156,7 +152,7 @@ fun AuthScreen(
                         Spacer(modifier = Modifier.height(10.dp))
 
                         Text(
-                            text = if (isSignUpMode) "ایجاد حساب کاربری TMS VPN" else "ورود با ایمیل و رمز عبور",
+                            text = if (isSignUpMode) "ایجاد حساب کاربری ابری TMS VPN" else "ورود امن با ایمیل و رمز عبور",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = TextCyberPrimary,
@@ -166,7 +162,7 @@ fun AuthScreen(
                         Spacer(modifier = Modifier.height(6.dp))
 
                         Text(
-                            text = "احراز هویت امن، یکپارچه و پرسرعت بدون نیاز به حساب گوگل — تمامی اشتراک‌ها و نودهای اختصاصی آلمان/ترکیه بلافاصله فعال می‌شوند.",
+                            text = "احراز هویت واقعی ابری برای همگام‌سازی اشتراک‌ها، رفرال، تست رایگان و نودهای اختصاصی آلمان و ترکیه.",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextCyberSecondary,
                             textAlign = TextAlign.Center,
@@ -193,16 +189,17 @@ fun AuthScreen(
                                         .clip(RoundedCornerShape(10.dp))
                                         .background(
                                             if (selected) ElectricCyan.copy(alpha = 0.22f)
-                                            else androidx.compose.ui.graphics.Color.Transparent
+                                            else Color.Transparent
                                         )
                                         .border(
                                             width = if (selected) 1.dp else 0.dp,
-                                            color = if (selected) ElectricCyan else androidx.compose.ui.graphics.Color.Transparent,
+                                            color = if (selected) ElectricCyan else Color.Transparent,
                                             shape = RoundedCornerShape(10.dp)
                                         )
                                         .clickable {
                                             isSignUpMode = signUpFlag
                                             errorMessage = null
+                                            statusMessage = null
                                         }
                                         .padding(vertical = 10.dp)
                                         .testTag(if (signUpFlag) "auth_mode_register_tab" else "auth_mode_login_tab"),
@@ -297,8 +294,44 @@ fun AuthScreen(
                             shape = RoundedCornerShape(12.dp)
                         )
 
+                        if (!isSignUpMode) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 4.dp),
+                                horizontalArrangement = Arrangement.End
+                            ) {
+                                TextButton(
+                                    onClick = {
+                                        if (isSubmitting) return@TextButton
+                                        errorMessage = null
+                                        statusMessage = null
+                                        coroutineScope.launch {
+                                            isSubmitting = true
+                                            val resetResult = firebaseAuthManager.sendPasswordReset(emailInput)
+                                            isSubmitting = false
+                                            if (resetResult.isSuccess) {
+                                                statusMessage = "لینک بازیابی رمز عبور به ایمیل شما ارسال شد."
+                                            } else {
+                                                errorMessage = resetResult.exceptionOrNull()?.localizedMessage
+                                                    ?: "خطا در ارسال ایمیل بازیابی رمز عبور"
+                                            }
+                                        }
+                                    },
+                                    modifier = Modifier.testTag("auth_forgot_password_button")
+                                ) {
+                                    Text(
+                                        text = "فراموشی رمز عبور؟",
+                                        color = ElectricCyan,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                }
+                            }
+                        }
+
                         if (errorMessage != null) {
-                            Spacer(modifier = Modifier.height(10.dp))
+                            Spacer(modifier = Modifier.height(6.dp))
                             Text(
                                 text = errorMessage.orEmpty(),
                                 color = StatusError,
@@ -308,34 +341,57 @@ fun AuthScreen(
                             )
                         }
 
-                        Spacer(modifier = Modifier.height(16.dp))
+                        if (statusMessage != null) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = statusMessage.orEmpty(),
+                                color = StatusConnected,
+                                style = MaterialTheme.typography.bodySmall,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.testTag("auth_status_text")
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(14.dp))
 
                         Button(
                             onClick = {
+                                if (isSubmitting) return@Button
                                 errorMessage = null
-                                isSubmitting = true
-                                val res = localAuthManager.signInOrRegisterOfflineEmail(
-                                    rawEmail = emailInput,
-                                    rawPassword = passwordInput,
-                                    rawDisplayName = displayNameInput,
-                                    requireExplicitSignUp = isSignUpMode
-                                )
-                                val signedUser = res.user
-                                if (res.isSuccess && signedUser != null) {
-                                    coroutineScope.launch {
+                                statusMessage = null
+                                coroutineScope.launch {
+                                    isSubmitting = true
+                                    val res = if (isSignUpMode) {
+                                        firebaseAuthManager.registerWithFirebaseEmail(
+                                            rawDisplayName = displayNameInput,
+                                            rawEmail = emailInput,
+                                            rawPassword = passwordInput
+                                        )
+                                    } else {
+                                        firebaseAuthManager.signInWithFirebaseEmail(
+                                            rawEmail = emailInput,
+                                            rawPassword = passwordInput
+                                        )
+                                    }
+                                    val fbUser = res.user
+                                    if (res.isSuccess && fbUser != null) {
                                         val now = System.currentTimeMillis()
+                                        val resolvedName = fbUser.displayName?.takeIf { it.isNotBlank() }
+                                            ?: displayNameInput.trim().ifBlank {
+                                                fbUser.email?.substringBefore("@").orEmpty().ifBlank { "TMS User" }
+                                            }
                                         withContext(Dispatchers.IO) {
                                             runCatching {
                                                 LocalVpnConfigRepository(context.applicationContext)
                                                     .upsertRegisteredUser(
                                                         RegisteredUserEntity(
-                                                            userId = signedUser.uid,
-                                                            displayName = signedUser.username,
-                                                            email = signedUser.email,
-                                                            role = signedUser.role,
+                                                            userId = fbUser.uid,
+                                                            displayName = resolvedName,
+                                                            email = fbUser.email.orEmpty(),
+                                                            role = "USER",
                                                             maxDevices = 10,
                                                             dataLimitBytes = 500.0 * 1024 * 1024 * 1024,
-                                                            subscriptionStatus = if (signedUser.isAdmin) "active" else "expired",
+                                                            subscriptionStatus = "expired",
                                                             createdAtMs = now,
                                                             updatedAtMs = now
                                                         )
@@ -344,10 +400,10 @@ fun AuthScreen(
                                         }
                                         isSubmitting = false
                                         onAuthSuccess()
+                                    } else {
+                                        isSubmitting = false
+                                        errorMessage = res.errorMessageFa ?: "خطا در احراز هویت"
                                     }
-                                } else {
-                                    isSubmitting = false
-                                    errorMessage = res.errorMessage
                                 }
                             },
                             modifier = Modifier
@@ -370,7 +426,7 @@ fun AuthScreen(
                                 Spacer(modifier = Modifier.width(8.dp))
                             }
                             Text(
-                                text = if (isSignUpMode) "ثبت‌نام و ورود به برنامه" else "ورود با ایمیل و رمز عبور",
+                                text = if (isSignUpMode) "ثبت‌نام ابری و ورود" else "ورود به حساب ابری",
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 14.sp
                             )
@@ -396,7 +452,7 @@ fun AuthScreen(
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = "اتصال مستقیم ایمیل و رمز عبور با رمزنگاری PBKDF2-SHA256",
+                                    text = "احراز هویت ابری Firebase Auth با توکن JWT و نشست پایدار",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = TextCyberPrimary
                                 )
@@ -410,7 +466,7 @@ fun AuthScreen(
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = "پشتیبانی کامل از مخزن IP تمیز (۳۳۰+ IP)، نودهای آلمان/ترکیه و اشتراک‌ها",
+                                    text = "همگام‌سازی اشتراک، پرداخت رمزارزی (TRC20/TRX)، تست رایگان و نودهای آلمان/ترکیه",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = TextCyberSecondary
                                 )
@@ -422,4 +478,3 @@ fun AuthScreen(
         }
     }
 }
-

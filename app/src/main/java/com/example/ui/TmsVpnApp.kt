@@ -159,6 +159,8 @@ fun TmsVpnApp(
     currentUserId: String,
     pendingActivationLink: String? = null,
     onActivationLinkConsumed: () -> Unit = {},
+    pendingReferralCode: String? = null,
+    onReferralCodeConsumed: () -> Unit = {},
     onSignOut: () -> Unit,
     onRequestVpnPermission: ((() -> Unit)) -> Unit = { it() },
     viewModel: TmsVpnViewModel = viewModel()
@@ -237,6 +239,22 @@ fun TmsVpnApp(
     val adminTickets by viewModel.adminTickets.collectAsStateWithLifecycle()
     val ticketBusy by viewModel.ticketBusy.collectAsStateWithLifecycle()
 
+    val isVerifiedAdmin by viewModel.isVerifiedAdmin.collectAsStateWithLifecycle()
+    val isEmailVerified by viewModel.isEmailVerified.collectAsStateWithLifecycle()
+    val backendSessionSync by viewModel.backendSessionSync.collectAsStateWithLifecycle()
+    val cryptoInvoices by viewModel.cryptoInvoices.collectAsStateWithLifecycle()
+    val activeCryptoInvoice by viewModel.activeCryptoInvoice.collectAsStateWithLifecycle()
+    val cryptoBusy by viewModel.cryptoBusy.collectAsStateWithLifecycle()
+    val referralDashboard by viewModel.referralDashboard.collectAsStateWithLifecycle()
+    val referralBusy by viewModel.referralBusy.collectAsStateWithLifecycle()
+    val adminRewardRequests by viewModel.adminRewardRequests.collectAsStateWithLifecycle()
+    val freeTrialStatus by viewModel.freeTrialStatus.collectAsStateWithLifecycle()
+    val trialBusy by viewModel.trialBusy.collectAsStateWithLifecycle()
+    val trialGrantedBanner by viewModel.trialGrantedBanner.collectAsStateWithLifecycle()
+    val latestRelease by viewModel.latestRelease.collectAsStateWithLifecycle()
+    val adminReleases by viewModel.adminReleases.collectAsStateWithLifecycle()
+    val releaseBusy by viewModel.releaseBusy.collectAsStateWithLifecycle()
+
     val isInAdminSpace by viewModel.isInAdminSpace.collectAsStateWithLifecycle()
     var showRadarInUserMode by remember { mutableStateOf(false) }
     var showNexusAssistant by remember { mutableStateOf(false) }
@@ -268,6 +286,13 @@ fun TmsVpnApp(
         if (!link.isNullOrBlank()) {
             viewModel.handleActivationDeepLink(link)
             onActivationLinkConsumed()
+        }
+    }
+
+    LaunchedEffect(currentUserId, pendingReferralCode) {
+        viewModel.refreshBackendEcosystem(pendingReferralCode)
+        if (!pendingReferralCode.isNullOrBlank()) {
+            onReferralCodeConsumed()
         }
     }
 
@@ -607,7 +632,28 @@ fun TmsVpnApp(
                                                     },
                                                     onActivateByLink = { link ->
                                                         viewModel.handleActivationDeepLink(link)
-                                                    }
+                                                    },
+                                                    freeTrialStatus = freeTrialStatus,
+                                                    trialBusy = trialBusy,
+                                                    cryptoInvoices = cryptoInvoices,
+                                                    activeCryptoInvoice = activeCryptoInvoice,
+                                                    cryptoBusy = cryptoBusy,
+                                                    referralDashboard = referralDashboard,
+                                                    referralBusy = referralBusy,
+                                                    telegramLinked = backendSessionSync?.telegramLinked == true,
+                                                    onActivateFreeTrial = { viewModel.activateFreeTrial() },
+                                                    onCreateCryptoInvoice = { plan, asset ->
+                                                        viewModel.createCryptoInvoice(plan, asset)
+                                                    },
+                                                    onVerifyCryptoInvoice = { invoiceId, txHash ->
+                                                        viewModel.verifyCryptoInvoice(invoiceId, txHash)
+                                                    },
+                                                    onSelectCryptoInvoice = { viewModel.selectCryptoInvoice(it) },
+                                                    onDismissCryptoInvoice = { viewModel.dismissActiveCryptoInvoice() },
+                                                    onClaimReferralReward = { threshold ->
+                                                        viewModel.claimReferralReward(threshold)
+                                                    },
+                                                    onRefreshBackend = { viewModel.refreshBackendEcosystem() }
                                                 )
                                             }
                                             UserTabDestination.PROFILE -> {
@@ -618,7 +664,17 @@ fun TmsVpnApp(
                                                     onToggleLanguage = { viewModel.toggleLanguage() },
                                                     onOpenRadar = { showRadarInUserMode = true },
                                                     onSignOut = onSignOut,
-                                                    onOpenNexusAssistant = { showNexusAssistant = true }
+                                                    onOpenNexusAssistant = { showNexusAssistant = true },
+                                                    isEmailVerified = isEmailVerified,
+                                                    isVerifiedAdmin = isVerifiedAdmin,
+                                                    telegramLinked = backendSessionSync?.telegramLinked == true,
+                                                    telegramUsername = backendSessionSync?.telegramUsername,
+                                                    latestRelease = latestRelease,
+                                                    releaseBusy = releaseBusy,
+                                                    onSendVerificationEmail = { viewModel.sendVerificationEmail() },
+                                                    onSendPasswordReset = { viewModel.sendPasswordResetEmailFromProfile() },
+                                                    onDownloadApkRelease = { rel -> viewModel.recordApkDownload(rel.releaseId) },
+                                                    onOpenAdminConsole = { viewModel.enterAdminSpace() }
                                                 )
                                             }
                                         }
@@ -695,17 +751,18 @@ fun TmsVpnApp(
                                 }
                             },
                             actions = {
-                                Row(
-                                    modifier = Modifier
-                                        .background(ElevatedSurface, RoundedCornerShape(8.dp))
-                                        .border(BorderStroke(0.8.dp, BorderGoldMuted), RoundedCornerShape(8.dp))
-                                        .clickable { showQuickRoleSwitcher = true }
-                                        .padding(horizontal = 7.dp, vertical = 5.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.AdminPanelSettings,
-                                        contentDescription = null,
+                                if (isVerifiedAdmin) {
+                                    Row(
+                                        modifier = Modifier
+                                            .background(ElevatedSurface, RoundedCornerShape(8.dp))
+                                            .border(BorderStroke(0.8.dp, BorderGoldMuted), RoundedCornerShape(8.dp))
+                                            .clickable { showQuickRoleSwitcher = true }
+                                            .padding(horizontal = 7.dp, vertical = 5.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.AdminPanelSettings,
+                                            contentDescription = null,
                                         tint = MetallicGold,
                                         modifier = Modifier.size(13.dp)
                                     )
@@ -716,6 +773,7 @@ fun TmsVpnApp(
                                         fontSize = 9.sp,
                                         fontWeight = FontWeight.Bold
                                     )
+                                    }
                                 }
 
                                 Spacer(modifier = Modifier.width(4.dp))
@@ -1049,7 +1107,22 @@ fun TmsVpnApp(
                                                 onAddIpOnlyEndpoints = { raw -> viewModel.addIpOnlyEndpoints(raw) },
                                                 preselectedGrantUid = prefillGrantUid,
                                                 preselectedGrantEmail = prefillGrantEmail,
-                                                openGrantTrigger = grantModalTrigger
+                                                openGrantTrigger = grantModalTrigger,
+                                                adminRewardRequests = adminRewardRequests,
+                                                adminReleases = adminReleases,
+                                                adminCryptoInvoices = cryptoInvoices,
+                                                referralBusy = referralBusy,
+                                                releaseBusy = releaseBusy,
+                                                onReviewReferralReward = { reqId, approve, note ->
+                                                    viewModel.adminReviewReferralReward(reqId, approve, note)
+                                                },
+                                                onUploadApkRelease = { fileName, bytes, vName, vCode, notes, pub ->
+                                                    viewModel.adminUploadApkRelease(fileName, bytes, vName, vCode, notes, pub)
+                                                },
+                                                onToggleReleasePublish = { relId, pub ->
+                                                    viewModel.adminToggleReleasePublish(relId, pub)
+                                                },
+                                                onRefreshEcosystem = { viewModel.adminRefreshEcosystemData() }
                                             )
                                         } else {
                                             UserManagementScreen(
@@ -1088,7 +1161,9 @@ fun TmsVpnApp(
                                         onLockSession = { viewModel.lockAdminSession() },
                                         onVerifyPin = { viewModel.verifyAdminPin(it) },
                                         getRecoveryToken = { viewModel.getRecoveryToken() },
-                                        onSignOutComplete = onSignOut
+                                        onSignOutComplete = onSignOut,
+                                        hasConfiguredPin = viewModel.hasConfiguredAdminPin(),
+                                        onConfigureInitialPin = { viewModel.configureInitialAdminPin(it) }
                                     )
                                 }
                             }
@@ -1159,8 +1234,8 @@ fun TmsVpnApp(
                 )
             }
 
-            // Quick Role Switcher Modal (Admin Space)
-            if (showQuickRoleSwitcher) {
+            // Quick Role Switcher Modal (Admin Space Only)
+            if (showQuickRoleSwitcher && isVerifiedAdmin && isInAdminSpace) {
                 AlertDialog(
                     onDismissRequest = { showQuickRoleSwitcher = false },
                     containerColor = CardSurfaceDark,
@@ -1276,6 +1351,48 @@ fun TmsVpnApp(
                             viewModel.replyToTicket(ticket, msg, asAdmin = false)
                         },
                         onDismiss = { showNexusAssistant = false }
+                    )
+                }
+
+                // 24-Hour Free Trial Granted Celebration Dialog
+                trialGrantedBanner?.let { banner ->
+                    AlertDialog(
+                        onDismissRequest = { viewModel.dismissTrialGrantedBanner() },
+                        containerColor = SecondarySurface,
+                        modifier = Modifier.testTag("trial_granted_banner_dialog"),
+                        title = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null, tint = StatusConnected)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = if (isPersian) "تست رایگان ۲۴ ساعته فعال شد" else "24-Hour Free Trial Activated",
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = StatusConnected
+                                )
+                            }
+                        },
+                        text = {
+                            val remainSec = banner.expiresAtMs?.let { ((it - trustedNowMs) / 1000L).coerceAtLeast(0L) } ?: 86400L
+                            val countdown = com.example.data.subscription.ReferralAndCryptoCalculator.formatDurationCountdown(remainSec, isPersian)
+                            Text(
+                                text = if (isPersian) {
+                                    "دسترسی ۲۴ ساعته تست رایگان با تایید سرور فعال گردید ($countdown باقی‌مانده). استفاده مجدد هر ۷ روز یکبار مجاز است."
+                                } else {
+                                    "Your server-verified 24-hour free trial is active ($countdown remaining). Re-eligible once every 7 days."
+                                },
+                                fontSize = 12.sp,
+                                color = TextCyberPrimary
+                            )
+                        },
+                        confirmButton = {
+                            Button(
+                                onClick = { viewModel.dismissTrialGrantedBanner() },
+                                colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan, contentColor = DeepGraphite)
+                            ) {
+                                Text(text = if (isPersian) "متوجه شدم" else "Got It", fontWeight = FontWeight.Bold)
+                            }
+                        }
                     )
                 }
             }

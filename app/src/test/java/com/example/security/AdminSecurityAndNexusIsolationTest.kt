@@ -46,7 +46,7 @@ class AdminSecurityAndNexusIsolationTest {
     val composeRule = createComposeRule()
 
     @Test
-    fun `admin security manager persists changed pin across restarts and rejects default bypass`() {
+    fun `admin security manager requires explicit initial pin setup with no hardcoded default`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         context.getSharedPreferences("tms_admin_security_prefs", Context.MODE_PRIVATE).edit().clear().commit()
 
@@ -54,23 +54,32 @@ class AdminSecurityAndNexusIsolationTest {
         val initialToken = manager1.getRecoveryToken()
         assertTrue(initialToken.startsWith("TMS-REC-"))
         assertNotEquals("TMS-RECOVERY-2026-ALPHA-99", initialToken)
+        assertFalse(manager1.hasConfiguredPin())
         assertFalse(manager1.isCustomPinConfigured())
 
-        // Initial default PIN works once
-        val (initialVerify, _) = manager1.verifyAdminCredential("admin_1", AdminRole.SUPER_ADMIN, "14361436", "TestDevice")
+        // Without configured PIN, no hardcoded fallback (e.g. 123456 or 14361436) is accepted
+        val (unconfiguredAttempt, _) = manager1.verifyAdminCredential("admin_1", AdminRole.SUPER_ADMIN, "123456", "TestDevice")
+        assertTrue(unconfiguredAttempt is AuthAttemptResult.InvalidCredentials)
+
+        // Configure explicit initial PIN
+        val (setupOk, _) = manager1.configureInitialPin("admin_1", AdminRole.SUPER_ADMIN, "24681357")
+        assertTrue(setupOk)
+        assertTrue(manager1.hasConfiguredPin())
+
+        val (initialVerify, _) = manager1.verifyAdminCredential("admin_1", AdminRole.SUPER_ADMIN, "24681357", "TestDevice")
         assertTrue(initialVerify is AuthAttemptResult.Success)
 
         // Change PIN
-        val (changed, _) = manager1.changeAdminPin("admin_1", AdminRole.SUPER_ADMIN, "14361436", "98765432")
+        val (changed, _) = manager1.changeAdminPin("admin_1", AdminRole.SUPER_ADMIN, "24681357", "98765432")
         assertTrue(changed)
 
         // Re-instantiate AdminSecurityManager (simulates cold app restart)
         val manager2 = AdminSecurityManager(context)
         assertTrue(manager2.isCustomPinConfigured())
 
-        // Old/default 14361436 MUST NOT bypass after custom PIN is saved
-        val (bypassAttempt, _) = manager2.verifyAdminCredential("admin_1", AdminRole.SUPER_ADMIN, "14361436", "TestDevice")
-        assertTrue(bypassAttempt is AuthAttemptResult.InvalidCredentials)
+        // Previous PIN must fail after rotation
+        val (oldAttempt, _) = manager2.verifyAdminCredential("admin_1", AdminRole.SUPER_ADMIN, "24681357", "TestDevice")
+        assertTrue(oldAttempt is AuthAttemptResult.InvalidCredentials)
 
         // New custom PIN succeeds
         val (newPinAttempt, _) = manager2.verifyAdminCredential("admin_1", AdminRole.SUPER_ADMIN, "98765432", "TestDevice")
@@ -88,6 +97,8 @@ class AdminSecurityAndNexusIsolationTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         context.getSharedPreferences("tms_admin_security_prefs", Context.MODE_PRIVATE).edit().clear().commit()
         val manager = AdminSecurityManager(context)
+        val (setupOk, _) = manager.configureInitialPin("admin_1", AdminRole.SUPER_ADMIN, "73918246")
+        assertTrue(setupOk)
 
         repeat(4) {
             val (res, _) = manager.verifyAdminCredential("admin_1", AdminRole.SUPER_ADMIN, "00000000", "TestDevice")

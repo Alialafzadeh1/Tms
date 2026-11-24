@@ -42,15 +42,6 @@ class AdminSecurityManager(private val context: Context) {
     }
 
     init {
-        if (!prefs.contains("admin_pin_salt") || !prefs.contains("admin_pin_hash")) {
-            val initialSalt = generateSalt()
-            val initialHash = hashCredential("14361436", initialSalt)
-            prefs.edit()
-                .putString("admin_pin_salt", initialSalt)
-                .putString("admin_pin_hash", initialHash)
-                .putBoolean("pin_is_custom_set", false)
-                .commit()
-        }
         if (!prefs.contains("emergency_recovery_token")) {
             prefs.edit()
                 .putString("emergency_recovery_token", generateSecureRecoveryToken())
@@ -73,7 +64,37 @@ class AdminSecurityManager(private val context: Context) {
         return sb.toString()
     }
 
-    fun isCustomPinConfigured(): Boolean = prefs.getBoolean("pin_is_custom_set", false)
+    fun hasConfiguredPin(): Boolean {
+        val salt = prefs.getString("admin_pin_salt", "").orEmpty()
+        val hash = prefs.getString("admin_pin_hash", "").orEmpty()
+        return salt.isNotBlank() && hash.isNotBlank()
+    }
+
+    fun isCustomPinConfigured(): Boolean = prefs.getBoolean("pin_is_custom_set", false) && hasConfiguredPin()
+
+    fun configureInitialPin(
+        userId: String,
+        role: AdminRole,
+        newPin: String
+    ): Pair<Boolean, String> {
+        if (hasConfiguredPin()) {
+            return Pair(false, "پین امنیتی از قبل تنظیم شده است / Security PIN is already configured")
+        }
+        val trimmed = newPin.trim()
+        if (trimmed.length < 6) {
+            return Pair(false, "پین جدید باید حداقل ۶ رقم یا کاراکتر باشد / PIN must be at least 6 characters")
+        }
+        val newSalt = generateSalt()
+        val newHash = hashCredential(trimmed, newSalt)
+        prefs.edit()
+            .putString("admin_pin_salt", newSalt)
+            .putString("admin_pin_hash", newHash)
+            .putBoolean("pin_is_custom_set", true)
+            .putInt("failed_attempts_count", 0)
+            .remove("lockout_until_ms")
+            .commit()
+        return Pair(true, "پین امنیتی اختصاصی با موفقیت ثبت شد / Custom admin PIN configured")
+    }
 
     fun hashCredential(input: String, salt: String): String {
         val md = MessageDigest.getInstance("SHA-256")
@@ -135,7 +156,27 @@ class AdminSecurityManager(private val context: Context) {
 
         val storedSalt = prefs.getString("admin_pin_salt", "") ?: ""
         val storedHash = prefs.getString("admin_pin_hash", "") ?: ""
-        val computedHash = if (storedSalt.isNotBlank()) hashCredential(pinOrPassword.trim(), storedSalt) else ""
+        if (storedSalt.isBlank() || storedHash.isBlank()) {
+            val auditLog = AuthAuditLog(
+                userId = userId,
+                action = "ADMIN_PIN_NOT_CONFIGURED",
+                role = role.id,
+                module = "Authentication",
+                status = "FAILED",
+                ipOrDevice = deviceInfo,
+                details = "پین امنیتی هنوز تنظیم نشده است / Security PIN not configured yet"
+            )
+            return Pair(
+                AuthAttemptResult.InvalidCredentials(
+                    remainingAttempts = 5,
+                    messageFa = "پین امنیتی هنوز تنظیم نشده است؛ ابتدا یک پین جدید تعریف کنید یا از کلید ریکاوری استفاده کنید.",
+                    messageEn = "No admin PIN configured yet. Set a custom PIN or use your recovery key."
+                ),
+                auditLog
+            )
+        }
+
+        val computedHash = hashCredential(pinOrPassword.trim(), storedSalt)
 
         if (hashesEqual(computedHash, storedHash)) {
             // Success: reset failed attempts

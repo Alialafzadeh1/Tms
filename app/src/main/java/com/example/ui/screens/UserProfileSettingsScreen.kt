@@ -75,9 +75,16 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.material.icons.filled.AdminPanelSettings
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.MarkEmailRead
+import androidx.compose.material.icons.filled.Password
+import androidx.compose.material.icons.filled.SystemUpdate
 import com.example.BuildConfig
+import com.example.data.model.AppReleaseInfo
 import com.example.data.model.UserProfile
-import com.example.data.security.LocalUserAuthManager
+import com.example.data.subscription.ReferralAndCryptoCalculator
 import com.example.ui.components.CyberGlassCard
 import com.example.ui.theme.DeepGraphite
 import com.example.ui.theme.ElectricCyan
@@ -86,10 +93,12 @@ import com.example.ui.theme.GlassBorderCyan
 import com.example.ui.theme.GlassBorderMetallic
 import com.example.ui.theme.GlassBorderSubtle
 import com.example.ui.theme.JetBrainsMonoFontFamily
+import com.example.ui.theme.MetallicGold
 import com.example.ui.theme.MetallicSilver
 import com.example.ui.theme.PremiumTeal
 import com.example.ui.theme.SpaceGroteskFontFamily
 import com.example.ui.theme.StatusConnected
+import com.example.ui.theme.StatusConnecting
 import com.example.ui.theme.StatusError
 import com.example.ui.theme.TextCyberPrimary
 import com.example.ui.theme.TextCyberSecondary
@@ -97,6 +106,8 @@ import com.example.vpn.InstalledAppItem
 import com.example.vpn.SplitTunnelManager
 import com.example.vpn.VpnController
 import com.example.vpn.engine.DynamicIpDnsRotator
+import com.google.firebase.Firebase
+import com.google.firebase.auth.auth
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -108,7 +119,17 @@ fun UserProfileSettingsScreen(
     onOpenRadar: () -> Unit,
     onSignOut: () -> Unit,
     modifier: Modifier = Modifier,
-    onOpenNexusAssistant: () -> Unit = {}
+    onOpenNexusAssistant: () -> Unit = {},
+    isEmailVerified: Boolean = false,
+    isVerifiedAdmin: Boolean = false,
+    telegramLinked: Boolean = false,
+    telegramUsername: String? = null,
+    latestRelease: AppReleaseInfo? = null,
+    releaseBusy: Boolean = false,
+    onSendVerificationEmail: () -> Unit = {},
+    onSendPasswordReset: () -> Unit = {},
+    onDownloadApkRelease: (AppReleaseInfo) -> Unit = {},
+    onOpenAdminConsole: () -> Unit = {}
 ) {
     val context = LocalContext.current
     LaunchedEffect(Unit) {
@@ -128,14 +149,17 @@ fun UserProfileSettingsScreen(
     var appSearchQuery by remember { mutableStateOf("") }
     var launchableApps by remember { mutableStateOf<List<InstalledAppItem>>(emptyList()) }
 
-    val offlineUser by LocalUserAuthManager.offlineUserFlow.collectAsStateWithLifecycle()
+    val firebaseUser = remember(currentUserId) {
+        runCatching { Firebase.auth.currentUser }.getOrNull()
+    }
+    val effectiveEmailVerified = isEmailVerified || (firebaseUser?.isEmailVerified == true)
 
-    val displayName = userProfile?.displayName?.ifBlank { offlineUser?.username ?: "TMS User" }
-        ?: offlineUser?.username
-        ?: "TMS User"
-    val email = userProfile?.email?.ifBlank { offlineUser?.email ?: currentUserId }
-        ?: offlineUser?.email
-        ?: currentUserId
+    val displayName = userProfile?.displayName?.ifBlank {
+        firebaseUser?.displayName?.takeIf { it.isNotBlank() } ?: "TMS User"
+    } ?: firebaseUser?.displayName?.takeIf { it.isNotBlank() } ?: "TMS User"
+    val email = userProfile?.email?.ifBlank {
+        firebaseUser?.email?.takeIf { it.isNotBlank() } ?: currentUserId
+    } ?: firebaseUser?.email?.takeIf { it.isNotBlank() } ?: currentUserId
 
     Column(
         modifier = modifier
@@ -233,6 +257,187 @@ fun UserProfileSettingsScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = PremiumTeal
                 )
+            }
+
+            // Account Security, Email Verification & Telegram Sync
+            CyberGlassCard(
+                accentColor = if (effectiveEmailVerified) StatusConnected.copy(alpha = 0.45f) else StatusConnecting.copy(alpha = 0.45f),
+                contentPadding = 16.dp,
+                modifier = Modifier.testTag("profile_account_security_card")
+            ) {
+                SectionLabel(
+                    icon = Icons.Filled.MarkEmailRead,
+                    title = if (isPersian) "امنیت حساب و همگام‌سازی تلگرام" else "Account Security & Telegram Sync"
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (effectiveEmailVerified) {
+                            if (isPersian) "ایمیل حساب تایید شده است" else "Email Verified"
+                        } else {
+                            if (isPersian) "ایمیل هنوز تایید نشده است" else "Email Pending Verification"
+                        },
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (effectiveEmailVerified) StatusConnected else StatusConnecting
+                    )
+                    if (effectiveEmailVerified) {
+                        Icon(imageVector = Icons.Filled.CheckCircle, contentDescription = "Verified", tint = StatusConnected, modifier = Modifier.size(18.dp))
+                    }
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = if (telegramLinked) {
+                        val tgLabel = telegramUsername?.let { "@$it" } ?: "Linked"
+                        if (isPersian) "ربات تلگرام متصل است ($tgLabel)" else "Telegram Linked ($tgLabel)"
+                    } else {
+                        if (isPersian) "اتصال به ربات @TMS_TIME_BOT برای همگام‌سازی دعوت و اشتراک" else "Link @TMS_TIME_BOT to sync referrals & subscription"
+                    },
+                    fontSize = 11.sp,
+                    color = TextCyberSecondary
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (!effectiveEmailVerified) {
+                        OutlinedButton(
+                            onClick = onSendVerificationEmail,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                                .testTag("profile_verify_email_button"),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, StatusConnecting)
+                        ) {
+                            Icon(imageVector = Icons.Filled.MarkEmailRead, contentDescription = null, tint = StatusConnecting, modifier = Modifier.size(15.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(text = if (isPersian) "ارسال ایمیل تایید" else "Verify Email", color = StatusConnecting, fontSize = 11.sp)
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = onSendPasswordReset,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("profile_reset_password_button"),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, GlassBorderCyan)
+                    ) {
+                        Icon(imageVector = Icons.Filled.Password, contentDescription = null, tint = ElectricCyan, modifier = Modifier.size(15.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(text = if (isPersian) "تغییر رمز عبور" else "Reset Password", color = ElectricCyan, fontSize = 11.sp)
+                    }
+                }
+
+                if (isVerifiedAdmin) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Button(
+                        onClick = onOpenAdminConsole,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("profile_admin_portal_button"),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MetallicGold, contentColor = DeepGraphite)
+                    ) {
+                        Icon(imageVector = Icons.Filled.AdminPanelSettings, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (isPersian) "ورود به کنسول مدیریت" else "Open Admin Console",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+
+            // Official APK Release & Update Card
+            CyberGlassCard(
+                accentColor = ElectricCyan.copy(alpha = 0.5f),
+                contentPadding = 16.dp,
+                modifier = Modifier.testTag("profile_apk_update_card")
+            ) {
+                SectionLabel(
+                    icon = Icons.Filled.SystemUpdate,
+                    title = if (isPersian) "به‌روزرسانی و دانلود آخرین نسخه برنامه" else "App Updates & Official APK Download"
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = if (isPersian) "نسخه فعلی نصب‌شده: v${BuildConfig.VERSION_NAME}" else "Installed Version: v${BuildConfig.VERSION_NAME}",
+                    fontFamily = JetBrainsMonoFontFamily,
+                    fontSize = 11.sp,
+                    color = MetallicSilver
+                )
+                if (latestRelease != null) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = if (isPersian) {
+                            "آخرین نسخه سرور: v${latestRelease.versionName} • حجم: ${ReferralAndCryptoCalculator.formatFileSize(latestRelease.fileSizeBytes)} • دانلود: ${latestRelease.downloadCount}"
+                        } else {
+                            "Latest Release: v${latestRelease.versionName} • Size: ${ReferralAndCryptoCalculator.formatFileSize(latestRelease.fileSizeBytes)} • Downloads: ${latestRelease.downloadCount}"
+                        },
+                        fontFamily = JetBrainsMonoFontFamily,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = ElectricCyan
+                    )
+                    if (latestRelease.releaseNotes.isNotBlank()) {
+                        Text(
+                            text = latestRelease.releaseNotes,
+                            fontSize = 11.sp,
+                            color = TextCyberSecondary,
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Button(
+                        onClick = {
+                            onDownloadApkRelease(latestRelease)
+                            if (latestRelease.downloadUrl.isNotBlank()) {
+                                runCatching {
+                                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(latestRelease.downloadUrl)).apply {
+                                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                    }
+                                    context.startActivity(intent)
+                                }.onFailure { err ->
+                                    Toast.makeText(context, err.localizedMessage, Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        },
+                        enabled = !releaseBusy && latestRelease.downloadUrl.isNotBlank(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("profile_apk_download_button"),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan, contentColor = DeepGraphite)
+                    ) {
+                        Icon(imageVector = Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (isPersian) "دانلود آخرین نسخه APK" else "Download Latest APK",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp
+                        )
+                    }
+                } else {
+                    Text(
+                        text = if (isPersian) {
+                            "نسخه منتشرشده جدیدی از سرور دریافت نشد."
+                        } else {
+                            "No newer APK release fetched from server yet."
+                        },
+                        fontSize = 11.sp,
+                        color = TextCyberSecondary,
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
+                }
             }
 
             // Connection Preferences

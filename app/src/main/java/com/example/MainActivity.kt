@@ -2,13 +2,11 @@ package com.example
 
 import android.Manifest
 import android.app.Activity
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
-import androidx.core.content.ContextCompat
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -27,8 +25,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.credentials.ClearCredentialStateRequest
-import androidx.credentials.CredentialManager
+import androidx.core.content.ContextCompat
 import com.example.data.security.LocalUserAuthManager
 import com.example.ui.TmsVpnApp
 import com.example.ui.screens.AuthScreen
@@ -39,7 +36,6 @@ import com.google.firebase.Firebase
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.auth.auth
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
@@ -47,18 +43,20 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     private val pendingActivationLinkState = mutableStateOf<String?>(null)
+    private val pendingReferralCodeState = mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         // Mandatory App Check configuration with launch intent before UI or Firebase operations
         configureAppCheck(this, intent)
-        captureActivationIntent(intent)
+        captureDeepLinkIntent(intent)
 
         enableEdgeToEdge()
 
         setContent {
             val pendingActivationLink by pendingActivationLinkState
+            val pendingReferralCode by pendingReferralCodeState
             TmsVpnTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
@@ -66,7 +64,9 @@ class MainActivity : ComponentActivity() {
                 ) {
                     AppContent(
                         pendingActivationLink = pendingActivationLink,
-                        onActivationLinkConsumed = { pendingActivationLinkState.value = null }
+                        onActivationLinkConsumed = { pendingActivationLinkState.value = null },
+                        pendingReferralCode = pendingReferralCode,
+                        onReferralCodeConsumed = { pendingReferralCodeState.value = null }
                     )
                 }
             }
@@ -76,13 +76,19 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        captureActivationIntent(intent)
+        captureDeepLinkIntent(intent)
     }
 
-    private fun captureActivationIntent(intent: Intent?) {
+    private fun captureDeepLinkIntent(intent: Intent?) {
+        val uri = intent?.data
         val data = intent?.dataString?.trim()
         if (!data.isNullOrBlank() && data.startsWith("tmsvpn://activate", ignoreCase = true)) {
             pendingActivationLinkState.value = data
+        }
+        val refCode = uri?.getQueryParameter("ref")?.trim()
+            ?.takeIf { it.isNotBlank() }
+        if (!refCode.isNullOrBlank()) {
+            pendingReferralCodeState.value = refCode
         }
     }
 }
@@ -93,12 +99,14 @@ private fun safeCurrentFirebaseUser(): FirebaseUser? =
 @Composable
 fun AppContent(
     pendingActivationLink: String? = null,
-    onActivationLinkConsumed: () -> Unit = {}
+    onActivationLinkConsumed: () -> Unit = {},
+    pendingReferralCode: String? = null,
+    onReferralCodeConsumed: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
+    val authManager = remember(context) { LocalUserAuthManager(context) }
     var currentUser by remember { mutableStateOf(safeCurrentFirebaseUser()) }
-    val offlineUser by LocalUserAuthManager.offlineUserFlow.collectAsStateWithLifecycle()
     var pendingVpnAction by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
@@ -122,7 +130,6 @@ fun AppContent(
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
 
     LaunchedEffect(Unit) {
-        runCatching { LocalUserAuthManager.restoreOfflineSession(context) }
         runCatching { com.example.vpn.VpnController.syncWithService(context) }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val hasNotificationPerm = ContextCompat.checkSelfPermission(
@@ -135,13 +142,6 @@ fun AppContent(
         }
         withContext(Dispatchers.IO) {
             runCatching { com.example.vpn.CleanIpRefreshScheduler.schedulePeriodicRefresh(context) }
-            runCatching {
-                val savedProfiles = LocalUserAuthManager.getAllRegisteredPrefProfiles(context)
-                if (savedProfiles.isNotEmpty()) {
-                    com.example.data.local.LocalVpnConfigRepository(context.applicationContext)
-                        .upsertRegisteredUsers(savedProfiles)
-                }
-            }
         }
     }
 
@@ -168,7 +168,7 @@ fun AppContent(
         }
     }
 
-    val activeUid = currentUser?.uid ?: offlineUser?.uid
+    val activeUid = currentUser?.uid
     if (activeUid == null) {
         AuthScreen(
             onAuthSuccess = {
@@ -181,16 +181,13 @@ fun AppContent(
                 currentUserId = activeUid,
                 pendingActivationLink = pendingActivationLink,
                 onActivationLinkConsumed = onActivationLinkConsumed,
+                pendingReferralCode = pendingReferralCode,
+                onReferralCodeConsumed = onReferralCodeConsumed,
                 onSignOut = {
                     coroutineScope.launch {
                         withContext(NonCancellable) {
-                            runCatching { LocalUserAuthManager.clearOfflineSession(context) }
-                            try {
-                                Firebase.auth.signOut()
-                            } catch (_: Throwable) {
-                            } finally {
-                                currentUser = null
-                            }
+                            runCatching { authManager.logout() }
+                            currentUser = null
                         }
                     }
                 },

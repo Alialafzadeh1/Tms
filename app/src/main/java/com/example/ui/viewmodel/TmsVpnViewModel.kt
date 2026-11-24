@@ -18,12 +18,21 @@ import com.example.data.model.AdminRole
 import com.example.data.model.AllocatedEndpointRecord
 import com.example.data.model.AllocationHistoryRecord
 import com.example.data.model.AuthAuditLog
+import com.example.data.model.AppReleaseInfo
+import com.example.data.model.BackendResult
+import com.example.data.model.BackendSessionSync
 import com.example.data.model.ConfigOrigin
+import com.example.data.model.CryptoAsset
+import com.example.data.model.CryptoInvoiceStatus
+import com.example.data.model.CryptoPaymentInvoice
 import com.example.data.model.FailoverPolicy
+import com.example.data.model.FreeTrialStatus
 import com.example.data.model.InventoryShortageAlert
 import com.example.data.model.ManagedEndpoint
 import com.example.data.model.OverviewMetrics
 import com.example.data.model.PaymentRequestRecord
+import com.example.data.model.ReferralDashboardData
+import com.example.data.model.ReferralRewardRequest
 import com.example.data.model.RotationAuditLog
 import com.example.data.model.SubscriptionHistoryEvent
 import com.example.data.model.SubscriptionPlanId
@@ -40,6 +49,7 @@ import com.example.data.model.VpnServer
 import com.example.data.network.NodeControlApiClient
 import com.example.data.network.RealPingEngine
 import com.example.data.network.SubscriptionImporter
+import com.example.data.network.TmsBackendApiClient
 import com.example.data.network.UbuntuNodeHealthResult
 import com.example.data.parser.VpnConfigParser
 import com.example.data.repository.SubscriptionRepository
@@ -53,10 +63,12 @@ import com.example.data.subscription.BulkDeletionPlan
 import com.example.data.subscription.ConfigDeletionContext
 import com.example.data.subscription.ConfigDeletionPolicy
 import com.example.data.subscription.DedicatedIpAllocationEngine
+import com.example.data.subscription.ReferralAndCryptoCalculator
 import com.example.data.subscription.SubscriptionLifecycleEngine
 import com.example.data.local.CleanIpAddressType
 import com.example.data.local.CleanIpEntity
 import com.example.data.local.CleanIpHealthStatus
+import com.example.data.local.LegacyAccountMigrationHelper
 import com.example.data.local.LocalVpnConfigEntity
 import com.example.data.local.LocalVpnConfigRepository
 import com.example.data.local.RegisteredUserEntity
@@ -126,6 +138,8 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     private val localConfigRepository = LocalVpnConfigRepository(application)
     private val aiEngine = VpnAiEngine()
     private val securityManager = AdminSecurityManager(application)
+    private val userAuthManager = LocalUserAuthManager(application)
+    private val backendClient = TmsBackendApiClient()
 
     private fun safeFirebaseAuth(): FirebaseAuth? =
         runCatching { Firebase.auth }.getOrNull()
@@ -221,29 +235,71 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     private val _ticketBusy = MutableStateFlow(false)
     val ticketBusy: StateFlow<Boolean> = _ticketBusy.asStateFlow()
 
-    // --- RBAC & SECURITY STATE ---
+    // --- RBAC & SERVER-VERIFIED ADMIN SECURITY STATE ---
 
     private val _activeSession = MutableStateFlow<SessionToken?>(null)
     val activeSession: StateFlow<SessionToken?> = _activeSession.asStateFlow()
 
-    private val initialAdminSnapshot: Boolean = LocalUserAuthManager.isAdminEmail(
-        safeFirebaseUser()?.email ?: LocalUserAuthManager.offlineUserFlow.value?.email
-    )
+    private val _verifiedServerAdmin = MutableStateFlow(false)
+    val isVerifiedAdmin: StateFlow<Boolean> = _verifiedServerAdmin.asStateFlow()
 
-    private val _isUnlocked = MutableStateFlow(initialAdminSnapshot)
+    private val _verifiedAdminRole = MutableStateFlow<AdminRole?>(null)
+
+    private val _isUnlocked = MutableStateFlow(false)
     val isUnlocked: StateFlow<Boolean> = _isUnlocked.asStateFlow()
 
     private val _lockoutSeconds = MutableStateFlow(0L)
     val lockoutSeconds: StateFlow<Long> = _lockoutSeconds.asStateFlow()
 
-    // Distinct User Space vs Admin Control Center state (opens automatically only for ADMIN_EMAIL)
-    private val _isInAdminSpace = MutableStateFlow(initialAdminSnapshot)
+    // Distinct User Space vs Admin Control Center state (only enters after server-verified admin privilege)
+    private val _isInAdminSpace = MutableStateFlow(false)
     val isInAdminSpace: StateFlow<Boolean> = _isInAdminSpace.asStateFlow()
 
-    // Explicit role override (allows switching between Super Admin, Server Manager, User Admin, and Auditor in the UI)
-    private val _selectedRole = MutableStateFlow<AdminRole?>(
-        if (initialAdminSnapshot) AdminRole.SUPER_ADMIN else null
-    )
+    private val _selectedRole = MutableStateFlow<AdminRole?>(null)
+
+    // --- BACKEND ECOSYSTEM STATE (CRYPTO, REFERRALS, FREE TRIAL, RELEASES) ---
+
+    private val _backendSessionSync = MutableStateFlow<BackendSessionSync?>(null)
+    val backendSessionSync: StateFlow<BackendSessionSync?> = _backendSessionSync.asStateFlow()
+
+    private val _cryptoInvoices = MutableStateFlow<List<CryptoPaymentInvoice>>(emptyList())
+    val cryptoInvoices: StateFlow<List<CryptoPaymentInvoice>> = _cryptoInvoices.asStateFlow()
+
+    private val _activeCryptoInvoice = MutableStateFlow<CryptoPaymentInvoice?>(null)
+    val activeCryptoInvoice: StateFlow<CryptoPaymentInvoice?> = _activeCryptoInvoice.asStateFlow()
+
+    private val _cryptoBusy = MutableStateFlow(false)
+    val cryptoBusy: StateFlow<Boolean> = _cryptoBusy.asStateFlow()
+
+    private val _referralDashboard = MutableStateFlow<ReferralDashboardData?>(null)
+    val referralDashboard: StateFlow<ReferralDashboardData?> = _referralDashboard.asStateFlow()
+
+    private val _referralBusy = MutableStateFlow(false)
+    val referralBusy: StateFlow<Boolean> = _referralBusy.asStateFlow()
+
+    private val _adminRewardRequests = MutableStateFlow<List<ReferralRewardRequest>>(emptyList())
+    val adminRewardRequests: StateFlow<List<ReferralRewardRequest>> = _adminRewardRequests.asStateFlow()
+
+    private val _freeTrialStatus = MutableStateFlow<FreeTrialStatus?>(null)
+    val freeTrialStatus: StateFlow<FreeTrialStatus?> = _freeTrialStatus.asStateFlow()
+
+    private val _trialBusy = MutableStateFlow(false)
+    val trialBusy: StateFlow<Boolean> = _trialBusy.asStateFlow()
+
+    private val _trialGrantedBanner = MutableStateFlow<FreeTrialStatus?>(null)
+    val trialGrantedBanner: StateFlow<FreeTrialStatus?> = _trialGrantedBanner.asStateFlow()
+
+    private val _latestRelease = MutableStateFlow<AppReleaseInfo?>(null)
+    val latestRelease: StateFlow<AppReleaseInfo?> = _latestRelease.asStateFlow()
+
+    private val _adminReleases = MutableStateFlow<List<AppReleaseInfo>>(emptyList())
+    val adminReleases: StateFlow<List<AppReleaseInfo>> = _adminReleases.asStateFlow()
+
+    private val _releaseBusy = MutableStateFlow(false)
+    val releaseBusy: StateFlow<Boolean> = _releaseBusy.asStateFlow()
+
+    private val _isEmailVerified = MutableStateFlow(false)
+    val isEmailVerified: StateFlow<Boolean> = _isEmailVerified.asStateFlow()
 
     // --- BULK CONFIG MANAGEMENT & TOMBSTONES ---
     private val _selectedConfigIds = MutableStateFlow<Set<String>>(emptySet())
@@ -315,43 +371,30 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
 
     private val activeAuthIdentityFlow: Flow<SessionIdentity?> = combine(
         authStateFlow,
-        LocalUserAuthManager.offlineUserFlow
-    ) { fbUser, emailUser ->
-        when {
-            fbUser != null -> {
-                val em = fbUser.email.orEmpty()
-                val name = fbUser.displayName?.takeIf { it.isNotBlank() }
-                    ?: em.substringBefore("@").ifBlank { "TMS User" }
-                SessionIdentity(
-                    uid = fbUser.uid,
-                    email = em,
-                    displayName = name,
-                    isFirebaseUser = true,
-                    isAdmin = LocalUserAuthManager.isAdminEmail(em)
-                )
-            }
-            emailUser != null -> {
-                SessionIdentity(
-                    uid = emailUser.uid,
-                    email = emailUser.email,
-                    displayName = emailUser.username,
-                    isFirebaseUser = false,
-                    isAdmin = emailUser.isAdmin || LocalUserAuthManager.isAdminEmail(emailUser.email)
-                )
-            }
-            else -> null
+        _verifiedServerAdmin
+    ) { fbUser, serverAdmin ->
+        if (fbUser != null) {
+            val em = fbUser.email.orEmpty()
+            val name = fbUser.displayName?.takeIf { it.isNotBlank() }
+                ?: em.substringBefore("@").ifBlank { "TMS User" }
+            SessionIdentity(
+                uid = fbUser.uid,
+                email = em,
+                displayName = name,
+                isFirebaseUser = true,
+                isAdmin = serverAdmin
+            )
+        } else {
+            null
         }
     }.distinctUntilChanged()
 
     private fun currentActorUid(): String {
-        return safeFirebaseUser()?.uid
-            ?: LocalUserAuthManager.offlineUserFlow.value?.uid
-            ?: "local_user"
+        return safeFirebaseUser()?.uid ?: "local_user"
     }
 
     private fun currentActorEmail(): String {
         return safeFirebaseUser()?.email
-            ?: LocalUserAuthManager.offlineUserFlow.value?.email
             ?: userProfile.value?.email
             ?: ""
     }
@@ -386,22 +429,35 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun isCurrentUserAdmin(): Boolean {
-        val activeEmail = safeFirebaseUser()?.email ?: LocalUserAuthManager.offlineUserFlow.value?.email
-        return LocalUserAuthManager.isAdminEmail(activeEmail)
+        return safeFirebaseUser() != null && _verifiedServerAdmin.value
     }
 
-    fun enterAdminSpace(pin: String): Boolean {
-        return if (isCurrentUserAdmin()) {
-            _isInAdminSpace.value = true
-            _isUnlocked.value = true
-            _selectedRole.value = AdminRole.SUPER_ADMIN
-            _lockoutSeconds.value = 0L
-            true
-        } else {
+    fun enterAdminSpace(pin: String = ""): Boolean {
+        val user = safeFirebaseUser()
+        if (user == null || !_verifiedServerAdmin.value) {
             _isInAdminSpace.value = false
             _isUnlocked.value = false
-            false
+            return false
         }
+        val role = _verifiedAdminRole.value ?: AdminRole.SUPER_ADMIN
+        if (!securityManager.hasConfiguredPin()) {
+            _isInAdminSpace.value = true
+            _isUnlocked.value = true
+            _selectedRole.value = role
+            _lockoutSeconds.value = 0L
+            return true
+        }
+        if (pin.isBlank()) {
+            _isInAdminSpace.value = true
+            _selectedRole.value = role
+            return true
+        }
+        val verified = verifyAdminPin(pin)
+        if (verified) {
+            _isInAdminSpace.value = true
+            _selectedRole.value = role
+        }
+        return verified
     }
 
     fun exitAdminSpace() {
@@ -533,12 +589,20 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         initialValue = emptyList()
     )
 
-    val currentRole: StateFlow<AdminRole> = combine(_selectedRole, userProfile) { selected, profile ->
-        selected ?: AdminRole.fromString(profile?.role ?: "SUPER_ADMIN")
+    val currentRole: StateFlow<AdminRole> = combine(
+        _selectedRole,
+        _verifiedAdminRole,
+        _verifiedServerAdmin
+    ) { selected, verifiedRole, isServerAdmin ->
+        if (!isServerAdmin) {
+            AdminRole.AUDITOR
+        } else {
+            selected ?: verifiedRole ?: AdminRole.SUPER_ADMIN
+        }
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000L),
-        initialValue = AdminRole.SUPER_ADMIN
+        initialValue = AdminRole.AUDITOR
     )
 
     // --- USER SUBSCRIPTION & DEDICATED IP ALLOCATIONS (UNIFIED ROOM + FIRESTORE, ZERO CHURN) ---
@@ -957,10 +1021,6 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                 localConfigRepository.prepopulateDefaultsIfEmpty(uid)
                 localConfigRepository.seedCleanIpPoolIfNeeded()
                 localConfigRepository.prepopulateEndpointInventoryIfNeeded()
-                val prefProfiles = LocalUserAuthManager.getAllRegisteredPrefProfiles(getApplication())
-                if (prefProfiles.isNotEmpty()) {
-                    localConfigRepository.upsertRegisteredUsers(prefProfiles)
-                }
                 val healthyIpv4s = localConfigRepository.getCleanIpPoolOnce()
                     .filter {
                         it.isAvailable &&
@@ -993,69 +1053,130 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
 
-        // Unified session observer for both Email+Password & Firebase sessions
+        // Unified Firebase Authentication & Server-Verified Admin / Migration Sync
         viewModelScope.launch {
-            activeAuthIdentityFlow.collect { identity ->
-                if (identity != null) {
-                    VpnController.setActiveAccountId(identity.uid)
-                    if (identity.isAdmin) {
-                        _isInAdminSpace.value = true
-                        _isUnlocked.value = true
-                        _selectedRole.value = AdminRole.SUPER_ADMIN
-                        _lockoutSeconds.value = 0L
-                    } else {
-                        _isInAdminSpace.value = false
-                        _isUnlocked.value = false
-                        _selectedRole.value = null
-                    }
+            authStateFlow.collect { fbUser ->
+                if (fbUser != null) {
+                    val uid = fbUser.uid
+                    val email = fbUser.email.orEmpty()
+                    val displayName = fbUser.displayName?.takeIf { it.isNotBlank() }
+                        ?: email.substringBefore("@").ifBlank { "TMS User" }
+                    _isEmailVerified.value = fbUser.isEmailVerified
+                    VpnController.setActiveAccountId(uid)
 
                     launch(Dispatchers.IO) {
+                        runCatching {
+                            LegacyAccountMigrationHelper.migrateLegacyLocalDataIfNeeded(
+                                context = getApplication(),
+                                localRepo = localConfigRepository,
+                                firebaseUid = uid,
+                                email = email
+                            )
+                        }
                         try {
                             localConfigRepository.upsertRegisteredUser(
                                 RegisteredUserEntity(
-                                    userId = identity.uid,
-                                    displayName = identity.displayName,
-                                    email = identity.email,
-                                    role = if (identity.isAdmin) "SUPER_ADMIN" else "USER",
+                                    userId = uid,
+                                    displayName = displayName,
+                                    email = email,
+                                    role = "USER",
                                     maxDevices = 10,
                                     dataLimitBytes = 500.0 * 1024 * 1024 * 1024,
-                                    subscriptionStatus = if (identity.isAdmin) "active" else "expired"
+                                    subscriptionStatus = "expired"
                                 )
                             )
-                            _tombstonedConfigIds.value = localConfigRepository.getTombstonedIds(identity.uid)
+                            _tombstonedConfigIds.value = localConfigRepository.getTombstonedIds(uid)
                         } catch (e: Exception) {
                             Log.d(TAG, "Local registered user sync failed: ${e.message}")
                         }
                     }
 
-                    if (identity.isFirebaseUser) {
-                        launch(Dispatchers.IO) {
-                            try {
-                                repository.ensureUserProfile(
-                                    displayName = identity.displayName,
-                                    email = identity.email
-                                )
-                                syncPendingConfigDeletes(identity.uid)
-                                val serverMs = subscriptionRepository.fetchTrustedServerEpochMs(currentTrustedNowMs())
-                                updateTrustedServerAnchor(serverMs)
-                                repository.observeConfigs().catch { }.collect { remoteConfigs ->
-                                    val tombstones = localConfigRepository.getTombstonedIds(identity.uid)
-                                    _tombstonedConfigIds.value = tombstones
-                                    val validRemote = remoteConfigs.filter { it.id !in tombstones }
-                                    if (validRemote.isNotEmpty()) {
-                                        localConfigRepository.saveAllConfigs(validRemote, activeUserId = identity.uid)
-                                    }
-                                }
-                            } catch (e: Exception) {
-                                Log.d(TAG, "Firestore sync skipped/fallback: ${e.message}")
+                    launch(Dispatchers.IO) {
+                        var claimedAdmin = false
+                        var claimedRole: AdminRole? = null
+
+                        // 1. Check verified Firebase ID token custom claims
+                        val verifiedSession = userAuthManager.getVerifiedFirebaseSession(fbUser, forceRefresh = false)
+                        if (verifiedSession != null && verifiedSession.isServerAdmin) {
+                            claimedAdmin = true
+                            claimedRole = verifiedSession.verifiedAdminRole ?: AdminRole.SUPER_ADMIN
+                        }
+
+                        // 2. Check /admins/{uid} authoritative Firestore doc
+                        if (!claimedAdmin) {
+                            val hasAdminDoc = repository.verifyAdminDocumentExists(uid)
+                            if (hasAdminDoc) {
+                                claimedAdmin = true
+                                claimedRole = AdminRole.SUPER_ADMIN
                             }
+                        }
+
+                        // 3. Verify via Worker /api/app/session & sync D1 ecosystem state
+                        when (val syncRes = backendClient.syncSession()) {
+                            is BackendResult.Success -> {
+                                val sync = syncRes.data
+                                _backendSessionSync.value = sync
+                                if (sync.serverTimeMs > 0L) {
+                                    updateTrustedServerAnchor(sync.serverTimeMs)
+                                }
+                                if (sync.trialStatus != null) {
+                                    _freeTrialStatus.value = sync.trialStatus
+                                }
+                                if (sync.isAdmin) {
+                                    claimedAdmin = true
+                                    claimedRole = AdminRole.fromVerifiedClaimOrNull(sync.verifiedRole)
+                                        ?: claimedRole
+                                        ?: AdminRole.SUPER_ADMIN
+                                }
+                            }
+                            else -> Unit
+                        }
+
+                        _verifiedServerAdmin.value = claimedAdmin
+                        _verifiedAdminRole.value = claimedRole
+                        if (!claimedAdmin) {
+                            _isInAdminSpace.value = false
+                            _isUnlocked.value = false
+                            _selectedRole.value = null
+                        }
+
+                        // Refresh public & authenticated ecosystem endpoints (trial, referrals, crypto, releases)
+                        refreshBackendEcosystemInternal(claimedAdmin)
+
+                        try {
+                            repository.ensureUserProfile(
+                                displayName = displayName,
+                                email = email
+                            )
+                            syncPendingConfigDeletes(uid)
+                            val serverMs = subscriptionRepository.fetchTrustedServerEpochMs(currentTrustedNowMs())
+                            updateTrustedServerAnchor(serverMs)
+                            repository.observeConfigs().catch { }.collect { remoteConfigs ->
+                                val tombstones = localConfigRepository.getTombstonedIds(uid)
+                                _tombstonedConfigIds.value = tombstones
+                                val validRemote = remoteConfigs.filter { it.id !in tombstones }
+                                if (validRemote.isNotEmpty()) {
+                                    localConfigRepository.saveAllConfigs(validRemote, activeUserId = uid)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.d(TAG, "Firestore sync skipped/fallback: ${e.message}")
                         }
                     }
                 } else {
                     VpnController.setActiveAccountId(null)
+                    _verifiedServerAdmin.value = false
+                    _verifiedAdminRole.value = null
+                    _isEmailVerified.value = false
                     _isInAdminSpace.value = false
                     _isUnlocked.value = false
                     _selectedRole.value = null
+                    _backendSessionSync.value = null
+                    _cryptoInvoices.value = emptyList()
+                    _referralDashboard.value = null
+                    _freeTrialStatus.value = null
+                    _adminRewardRequests.value = emptyList()
+                    _adminReleases.value = emptyList()
                     launch(Dispatchers.IO) {
                         runCatching {
                             _tombstonedConfigIds.value = localConfigRepository.getTombstonedIds(currentActorUid())
@@ -1096,6 +1217,12 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun checkPermission(permission: AdminPermission, actionDescription: String): Boolean {
+        if (!isCurrentUserAdmin()) {
+            val deniedMsgFa = "دسترسی غیرمجاز: حساب کاربری شما مجوز مدیریت تاییدشده از سرور را ندارد."
+            val deniedMsgEn = "Unauthorized: Your account lacks server-verified administrator privileges."
+            _uiMessage.value = UiMessage.Error(if (isPersianLanguage.value) deniedMsgFa else deniedMsgEn)
+            return false
+        }
         val role = currentRole.value
         if (!role.hasPermission(permission)) {
             val deniedMsgFa = "خطای سطح دسترسی: نقش فعلی (${role.titleFa}) اجازه $actionDescription را ندارد."
@@ -1278,18 +1405,45 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun hasConfiguredAdminPin(): Boolean = securityManager.hasConfiguredPin()
+
+    fun configureInitialAdminPin(newPin: String) {
+        if (!isCurrentUserAdmin()) {
+            checkPermission(AdminPermission.MANAGE_SETTINGS, "تنظیم پین امنیتی مدیر")
+            return
+        }
+        val user = safeFirebaseUser() ?: return
+        val validation = InputValidator.validateAdminPin(newPin)
+        if (validation is ValidationResult.Invalid) {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) validation.firstMessageFa() else validation.firstMessageEn()
+            )
+            return
+        }
+        val (ok, msg) = securityManager.configureInitialPin(user.uid, currentRole.value, newPin)
+        if (ok) {
+            _isUnlocked.value = true
+            _uiMessage.value = UiMessage.Success(msg)
+        } else {
+            _uiMessage.value = UiMessage.Error(msg)
+        }
+    }
+
     fun getRecoveryToken(): String {
         return securityManager.getRecoveryToken()
     }
 
     fun switchRole(role: AdminRole) {
+        if (!isCurrentUserAdmin()) {
+            checkPermission(AdminPermission.MANAGE_SETTINGS, "تغییر نقش مدیریت")
+            return
+        }
         val uid = currentActorUid()
         _selectedRole.value = role
 
         viewModelScope.launch {
             try {
                 if (safeFirebaseUser() != null) {
-                    repository.updateUserRole(role.id)
                     repository.addAuditLog(
                         AuthAuditLog(
                             userId = uid,
@@ -1920,11 +2074,8 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
 
-        // User opening/pasting an Admin-issued activation link (tmsvpn://activate?plan=...&ref=TMS-...&actor=...)
+        // User opening/pasting an activation link: never self-activate client-side; submit verification request to server
         val matchesUser = payload.targetUserId.isNullOrBlank() || payload.targetUserId == actorUid
-        val hasAdminToken = !payload.actorId.isNullOrBlank() &&
-            payload.referenceCode?.startsWith("TMS-", ignoreCase = true) == true
-
         if (!matchesUser) {
             _uiMessage.value = UiMessage.Error(
                 if (isPersianLanguage.value) {
@@ -1936,51 +2087,12 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
 
-        if (hasAdminToken) {
-            viewModelScope.launch {
-                _subscriptionBusy.value = true
-                try {
-                    val now = currentTrustedNowMs()
-                    val (activated, event) = SubscriptionLifecycleEngine.activateAfterPaymentConfirmation(
-                        subscriptionId = userSubscription.value?.subscriptionId ?: "sub_$actorUid",
-                        userId = actorUid,
-                        userEmail = actorEmail,
-                        plan = plan,
-                        actorId = payload.actorId ?: "admin_link",
-                        trustedServerNowMs = now,
-                        existingSubscription = userSubscription.value
-                    )
-                    localConfigRepository.cacheSubscription(activated, now)
-                    localConfigRepository.cacheSubscriptionHistory(listOf(event))
-                    localConfigRepository.syncRegisteredUserSubscriptionStatus(actorUid, "active")
-                    val allocBatch = localConfigRepository.executeLocalAllocationOrRotation(
-                        targetSubscriptions = listOf(activated),
-                        activeConnectedEndpointByUser = emptyMap(),
-                        actorUid = payload.actorId ?: "admin_link",
-                        triggerMode = "DEEP_LINK",
-                        nowMs = now,
-                        forceManual = true
-                    )
-                    val count = allocBatch.allocationsByUser[actorUid]?.size ?: 0
-                    _uiMessage.value = UiMessage.Success(
-                        if (isPersianLanguage.value) {
-                            "اشتراک ${plan.titleFa} با لینک فعال‌سازی شد ($count IP اختصاصی)"
-                        } else {
-                            "${plan.titleEn} activated via link ($count dedicated IPs)"
-                        }
-                    )
-                } finally {
-                    _subscriptionBusy.value = false
-                }
-            }
-        } else {
-            submitSubscriptionRequest(
-                plan = plan,
-                actionType = "NEW",
-                referenceCode = payload.referenceCode ?: "LINK-${System.currentTimeMillis() % 10000}",
-                note = "Submitted via tmsvpn://activate deep link"
-            )
-        }
+        submitSubscriptionRequest(
+            plan = plan,
+            actionType = "LINK_VERIFICATION",
+            referenceCode = payload.referenceCode ?: "LINK-${System.currentTimeMillis() % 10000}",
+            note = "Submitted via tmsvpn://activate deep link for server confirmation"
+        )
     }
 
     fun runIspAutoTune(context: Context) {
@@ -2044,7 +2156,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
 
     fun importSubscriptionUrl(url: String) {
         if (_isSubscriptionImporting.value) return
-        val uid = safeFirebaseUser()?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
+        val uid = safeFirebaseUser()?.uid ?: "local_user"
         viewModelScope.launch {
             _isSubscriptionImporting.value = true
             try {
@@ -2154,7 +2266,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     // --- CONFIG MANAGEMENT ---
 
     fun importBatchConfigs(rawBatchText: String) {
-        val uid = safeFirebaseUser()?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
+        val uid = safeFirebaseUser()?.uid ?: "local_user"
         val parseResults = VpnConfigParser.parseMultiple(rawBatchText, uid)
 
         var addedCount = 0
@@ -2221,7 +2333,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun importConfig(rawUri: String) {
-        val uid = safeFirebaseUser()?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
+        val uid = safeFirebaseUser()?.uid ?: "local_user"
         val parseResult = VpnConfigParser.parse(rawUri, uid)
         if (!parseResult.isSuccess || parseResult.config == null) {
             val err = parseResult.errorMessage ?: "خطا در تجزیه ساختار کانفیگ"
@@ -2298,7 +2410,7 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
         transport: String = "tcp",
         sni: String = ""
     ) {
-        val uid = safeFirebaseUser()?.uid ?: LocalUserAuthManager.offlineUserFlow.value?.uid ?: "local_user"
+        val uid = safeFirebaseUser()?.uid ?: "local_user"
         val trimmedServer = server.trim()
         if (trimmedServer.isBlank()) {
             _uiMessage.value = UiMessage.Error("آدرس سرور نمی‌تواند خالی باشد / Server address is required")
@@ -3982,6 +4094,406 @@ class TmsVpnViewModel(application: Application) : AndroidViewModel(application) 
                 }
             } finally {
                 _ticketBusy.value = false
+            }
+        }
+    }
+
+    // --- BACKEND ECOSYSTEM METHODS (CRYPTO PAYMENTS, REFERRALS, FREE TRIAL, APK RELEASES) ---
+
+    fun refreshBackendEcosystem(pendingReferralCode: String? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            if (!pendingReferralCode.isNullOrBlank()) {
+                backendClient.qualifyReferralOnLogin(pendingReferralCode)
+            }
+            when (val syncRes = backendClient.syncSession()) {
+                is BackendResult.Success -> {
+                    val sync = syncRes.data
+                    _backendSessionSync.value = sync
+                    if (sync.serverTimeMs > 0L) {
+                        updateTrustedServerAnchor(sync.serverTimeMs)
+                    }
+                    if (sync.trialStatus != null) {
+                        _freeTrialStatus.value = sync.trialStatus
+                    }
+                    if (sync.isAdmin && !_verifiedServerAdmin.value) {
+                        _verifiedServerAdmin.value = true
+                        _verifiedAdminRole.value = AdminRole.fromVerifiedClaimOrNull(sync.verifiedRole)
+                            ?: AdminRole.SUPER_ADMIN
+                    }
+                }
+                else -> Unit
+            }
+            refreshBackendEcosystemInternal(isCurrentUserAdmin())
+        }
+    }
+
+    private suspend fun refreshBackendEcosystemInternal(isAdminUser: Boolean) {
+        when (val trialRes = backendClient.getFreeTrialStatus()) {
+            is BackendResult.Success -> _freeTrialStatus.value = trialRes.data
+            else -> Unit
+        }
+        when (val refRes = backendClient.getReferralDashboard()) {
+            is BackendResult.Success -> _referralDashboard.value = refRes.data
+            else -> Unit
+        }
+        when (val invRes = backendClient.listCryptoInvoices(isAdminScope = isAdminUser)) {
+            is BackendResult.Success -> _cryptoInvoices.value = invRes.data
+            else -> Unit
+        }
+        when (val relRes = backendClient.getLatestRelease()) {
+            is BackendResult.Success -> _latestRelease.value = relRes.data
+            else -> Unit
+        }
+        if (isAdminUser) {
+            when (val rewardRes = backendClient.adminListReferralRewardRequests()) {
+                is BackendResult.Success -> _adminRewardRequests.value = rewardRes.data
+                else -> Unit
+            }
+            when (val releasesRes = backendClient.adminListReleases()) {
+                is BackendResult.Success -> _adminReleases.value = releasesRes.data
+                else -> Unit
+            }
+        }
+    }
+
+    private fun describeBackendFailure(err: BackendResult<Any?>, fallbackFa: String): String {
+        return when (err) {
+            is BackendResult.Unauthenticated -> if (isPersianLanguage.value) {
+                "ابتدا با ایمیل خود وارد حساب کاربری شوید."
+            } else {
+                "Please sign in first."
+            }
+            is BackendResult.HttpError -> err.message.ifBlank { "$fallbackFa (HTTP ${err.httpCode})" }
+            is BackendResult.NetworkError -> if (isPersianLanguage.value) {
+                "خطای ارتباط با سرور: ${err.message}"
+            } else {
+                "Network error: ${err.message}"
+            }
+            is BackendResult.Success -> fallbackFa
+        }
+    }
+
+    fun createCryptoInvoice(plan: SubscriptionPlanId, asset: CryptoAsset) {
+        if (_cryptoBusy.value) return
+        viewModelScope.launch {
+            _cryptoBusy.value = true
+            try {
+                when (val res = backendClient.createCryptoInvoice(plan.id, asset)) {
+                    is BackendResult.Success -> {
+                        val invoice = res.data
+                        _activeCryptoInvoice.value = invoice
+                        _cryptoInvoices.update { list -> listOf(invoice) + list.filterNot { it.invoiceId == invoice.invoiceId } }
+                        _uiMessage.value = UiMessage.Success(
+                            if (isPersianLanguage.value) {
+                                "فاکتور رمزارزی (${asset.symbol}) صادر شد. مبلغ دقیق را قبل از انقضا واریز و تایید کنید."
+                            } else {
+                                "${asset.symbol} invoice created. Transfer the exact amount before expiry."
+                            }
+                        )
+                    }
+                    else -> {
+                        _uiMessage.value = UiMessage.Error(describeBackendFailure(res, "خطا در صدور فاکتور رمزارزی"))
+                    }
+                }
+            } finally {
+                _cryptoBusy.value = false
+            }
+        }
+    }
+
+    fun verifyCryptoInvoice(invoiceId: String, txHash: String) {
+        val cleanHash = txHash.trim()
+        if (cleanHash.length < 16) {
+            _uiMessage.value = UiMessage.Error(
+                if (isPersianLanguage.value) "شناسه تراکنش (TxHash) معتبر وارد کنید." else "Enter a valid transaction hash (TxHash)."
+            )
+            return
+        }
+        if (_cryptoBusy.value) return
+        viewModelScope.launch {
+            _cryptoBusy.value = true
+            try {
+                when (val res = backendClient.verifyCryptoInvoice(invoiceId, cleanHash)) {
+                    is BackendResult.Success -> {
+                        val updated = res.data
+                        _activeCryptoInvoice.value = updated
+                        _cryptoInvoices.update { list ->
+                            list.map { if (it.invoiceId == updated.invoiceId) updated else it }
+                                .ifEmpty { listOf(updated) }
+                        }
+                        if (updated.status == CryptoInvoiceStatus.CONFIRMED) {
+                            refreshBackendEcosystem()
+                            _uiMessage.value = UiMessage.Success(
+                                if (isPersianLanguage.value) {
+                                    "تراکنش روی شبکه تایید شد و اشتراک شما فعال گردید."
+                                } else {
+                                    "On-chain payment confirmed and subscription activated."
+                                }
+                            )
+                        } else {
+                            _uiMessage.value = UiMessage.Success(
+                                updated.statusMessage.ifBlank {
+                                    if (isPersianLanguage.value) {
+                                        "وضعیت تراکنش: ${updated.status.titleFa}"
+                                    } else {
+                                        "Transaction status: ${updated.status.titleEn}"
+                                    }
+                                }
+                            )
+                        }
+                    }
+                    else -> {
+                        _uiMessage.value = UiMessage.Error(describeBackendFailure(res, "تایید تراکنش ناموفق بود"))
+                    }
+                }
+            } finally {
+                _cryptoBusy.value = false
+            }
+        }
+    }
+
+    fun selectCryptoInvoice(invoice: CryptoPaymentInvoice) {
+        _activeCryptoInvoice.value = invoice
+    }
+
+    fun dismissActiveCryptoInvoice() {
+        _activeCryptoInvoice.value = null
+    }
+
+    fun activateFreeTrial() {
+        if (_trialBusy.value) return
+        viewModelScope.launch {
+            _trialBusy.value = true
+            try {
+                when (val res = backendClient.activateFreeTrial()) {
+                    is BackendResult.Success -> {
+                        val status = res.data
+                        _freeTrialStatus.value = status
+                        if (status.active) {
+                            _trialGrantedBanner.value = status
+                            refreshBackendEcosystem()
+                            _uiMessage.value = UiMessage.Success(
+                                if (isPersianLanguage.value) {
+                                    "تست رایگان ۲۴ ساعته برای شما فعال شد!"
+                                } else {
+                                    "Your 24-hour free trial is now active!"
+                                }
+                            )
+                        } else {
+                            val remain = ReferralAndCryptoCalculator.formatDurationCountdown(
+                                status.cooldownRemainingSeconds,
+                                isPersianLanguage.value
+                            )
+                            _uiMessage.value = UiMessage.Error(
+                                status.lastReason.ifBlank {
+                                    if (isPersianLanguage.value) {
+                                        "تست رایگان هر ۷ روز یک بار قابل دریافت است ($remain باقی‌مانده)."
+                                    } else {
+                                        "Free trial allowed once every 7 days ($remain remaining)."
+                                    }
+                                }
+                            )
+                        }
+                    }
+                    else -> {
+                        _uiMessage.value = UiMessage.Error(describeBackendFailure(res, "خطا در فعال‌سازی تست رایگان"))
+                    }
+                }
+            } finally {
+                _trialBusy.value = false
+            }
+        }
+    }
+
+    fun dismissTrialGrantedBanner() {
+        _trialGrantedBanner.value = null
+    }
+
+    fun claimReferralReward(milestoneThreshold: Int) {
+        if (_referralBusy.value) return
+        viewModelScope.launch {
+            _referralBusy.value = true
+            try {
+                when (val res = backendClient.claimReferralReward(milestoneThreshold)) {
+                    is BackendResult.Success -> {
+                        refreshBackendEcosystem()
+                        _uiMessage.value = UiMessage.Success(
+                            if (isPersianLanguage.value) {
+                                "درخواست پاداش جایگاه $milestoneThreshold دعوت ثبت و به پنل مدیر ارسال شد."
+                            } else {
+                                "Reward claim for $milestoneThreshold referrals submitted for admin review."
+                            }
+                        )
+                    }
+                    else -> {
+                        _uiMessage.value = UiMessage.Error(describeBackendFailure(res, "خطا در ثبت درخواست پاداش"))
+                    }
+                }
+            } finally {
+                _referralBusy.value = false
+            }
+        }
+    }
+
+    fun adminRefreshEcosystemData() {
+        if (!checkPermission(AdminPermission.VIEW_USERS, "بارگذاری داده‌های اکوسیستم")) return
+        viewModelScope.launch(Dispatchers.IO) {
+            refreshBackendEcosystemInternal(isAdminUser = true)
+        }
+    }
+
+    fun adminReviewReferralReward(requestId: String, approve: Boolean, adminNote: String) {
+        if (!checkPermission(AdminPermission.MANAGE_USERS, "بررسی درخواست پاداش معرفی")) return
+        if (_referralBusy.value) return
+        viewModelScope.launch {
+            _referralBusy.value = true
+            try {
+                when (val res = backendClient.adminReviewReferralReward(requestId, approve, adminNote)) {
+                    is BackendResult.Success -> {
+                        val updated = res.data
+                        _adminRewardRequests.update { list ->
+                            list.map { if (it.requestId == updated.requestId) updated else it }
+                        }
+                        _uiMessage.value = UiMessage.Success(
+                            if (isPersianLanguage.value) {
+                                if (approve) "پاداش رفرال تایید شد" else "درخواست پاداش رد شد"
+                            } else {
+                                if (approve) "Referral reward approved" else "Referral reward rejected"
+                            }
+                        )
+                    }
+                    else -> {
+                        _uiMessage.value = UiMessage.Error(describeBackendFailure(res, "خطا در بررسی درخواست پاداش"))
+                    }
+                }
+            } finally {
+                _referralBusy.value = false
+            }
+        }
+    }
+
+    fun adminUploadApkRelease(
+        fileName: String,
+        apkBytes: ByteArray,
+        versionName: String,
+        versionCode: Int,
+        releaseNotes: String,
+        publishImmediately: Boolean
+    ) {
+        if (!checkPermission(AdminPermission.MANAGE_SETTINGS, "انتشار نسخه جدید APK")) return
+        if (_releaseBusy.value) return
+        viewModelScope.launch {
+            _releaseBusy.value = true
+            try {
+                when (
+                    val res = backendClient.adminUploadApkRelease(
+                        fileName = fileName,
+                        apkBytes = apkBytes,
+                        versionName = versionName,
+                        versionCode = versionCode,
+                        releaseNotes = releaseNotes,
+                        publishImmediately = publishImmediately
+                    )
+                ) {
+                    is BackendResult.Success -> {
+                        val rel = res.data
+                        _adminReleases.update { list -> listOf(rel) + list.filterNot { it.releaseId == rel.releaseId } }
+                        if (rel.isPublished) {
+                            _latestRelease.value = rel
+                        }
+                        _uiMessage.value = UiMessage.Success(
+                            if (isPersianLanguage.value) {
+                                "نسخه ${rel.versionName} با موفقیت روی سرور بارگذاری شد"
+                            } else {
+                                "Release ${rel.versionName} uploaded successfully"
+                            }
+                        )
+                    }
+                    else -> {
+                        _uiMessage.value = UiMessage.Error(describeBackendFailure(res, "خطا در آپلود فایل APK"))
+                    }
+                }
+            } finally {
+                _releaseBusy.value = false
+            }
+        }
+    }
+
+    fun adminToggleReleasePublish(releaseId: String, publish: Boolean) {
+        if (!checkPermission(AdminPermission.MANAGE_SETTINGS, "تغییر وضعیت انتشار نسخه APK")) return
+        if (_releaseBusy.value) return
+        viewModelScope.launch {
+            _releaseBusy.value = true
+            try {
+                when (val res = backendClient.adminSetReleasePublished(releaseId, publish)) {
+                    is BackendResult.Success -> {
+                        val updated = res.data
+                        _adminReleases.update { list ->
+                            list.map { if (it.releaseId == updated.releaseId) updated else it }
+                        }
+                        refreshBackendEcosystem()
+                        _uiMessage.value = UiMessage.Success(
+                            if (isPersianLanguage.value) {
+                                if (publish) "نسخه منتشر شد" else "نسخه از انتشار خارج شد"
+                            } else {
+                                if (publish) "Release published" else "Release unpublished"
+                            }
+                        )
+                    }
+                    else -> {
+                        _uiMessage.value = UiMessage.Error(describeBackendFailure(res, "خطا در تغییر وضعیت انتشار"))
+                    }
+                }
+            } finally {
+                _releaseBusy.value = false
+            }
+        }
+    }
+
+    fun recordApkDownload(releaseId: String) {
+        viewModelScope.launch {
+            when (val res = backendClient.recordReleaseDownload(releaseId)) {
+                is BackendResult.Success -> _latestRelease.value = res.data
+                else -> Unit
+            }
+        }
+    }
+
+    fun sendVerificationEmail() {
+        viewModelScope.launch {
+            val res = userAuthManager.sendEmailVerification()
+            if (res.isSuccess) {
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) {
+                        "ایمیل تایید به نشانی شما ارسال شد."
+                    } else {
+                        "Verification email sent."
+                    }
+                )
+            } else {
+                _uiMessage.value = UiMessage.Error(
+                    res.exceptionOrNull()?.localizedMessage ?: "خطا در ارسال ایمیل تایید"
+                )
+            }
+        }
+    }
+
+    fun sendPasswordResetEmailFromProfile() {
+        val email = currentActorEmail()
+        viewModelScope.launch {
+            val res = userAuthManager.sendPasswordReset(email)
+            if (res.isSuccess) {
+                _uiMessage.value = UiMessage.Success(
+                    if (isPersianLanguage.value) {
+                        "لینک تغییر رمز عبور به $email ارسال شد."
+                    } else {
+                        "Password reset link sent to $email."
+                    }
+                )
+            } else {
+                _uiMessage.value = UiMessage.Error(
+                    res.exceptionOrNull()?.localizedMessage ?: "خطا در ارسال ایمیل بازیابی"
+                )
             }
         }
     }

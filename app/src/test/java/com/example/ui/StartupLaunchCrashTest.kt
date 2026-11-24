@@ -5,18 +5,22 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTextInput
 import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.sqlite.db.SupportSQLiteOpenHelper
 import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.core.app.ApplicationProvider
 import com.example.MainActivity
 import com.example.data.local.TmsVpnRoomDatabase
-import com.example.data.security.LocalUserAuthManager
+import com.google.firebase.Firebase
+import com.google.firebase.FirebaseApp
+import com.google.firebase.FirebaseOptions
+import com.google.firebase.auth.auth
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -36,12 +40,22 @@ class StartupLaunchCrashTest {
     @Before
     fun setUp() {
         context = ApplicationProvider.getApplicationContext()
-        LocalUserAuthManager.clearOfflineSession(context)
+        if (FirebaseApp.getApps(context).isEmpty()) {
+            FirebaseApp.initializeApp(
+                context,
+                FirebaseOptions.Builder()
+                    .setApplicationId("1:123456789012:android:abcdef1234567890")
+                    .setApiKey("AIzaSyDummyTestApiKeyForUnitTestsOnly")
+                    .setProjectId("tms-vpn-test")
+                    .build()
+            )
+        }
+        runCatching { Firebase.auth.signOut() }
     }
 
     @After
     fun tearDown() {
-        LocalUserAuthManager.clearOfflineSession(context)
+        runCatching { Firebase.auth.signOut() }
     }
 
     @Test
@@ -50,42 +64,22 @@ class StartupLaunchCrashTest {
             composeRule.onAllNodesWithTag("auth_email_submit_button").fetchSemanticsNodes().isNotEmpty()
         }
         composeRule.onNodeWithTag("auth_email_submit_button").assertIsDisplayed()
+        composeRule.onNodeWithTag("auth_forgot_password_button").performScrollTo().assertIsDisplayed()
     }
 
     @Test
-    fun signedInStandardUserLaunchRendersUserHomeWithoutCrash() {
-        val authManager = LocalUserAuthManager(context)
-        val res = authManager.signInOrRegisterOfflineEmail(
-            rawEmail = "startup.user@tmsvpn.ir",
-            rawPassword = "UserPass#2026",
-            rawDisplayName = "Startup User",
-            requireExplicitSignUp = true
-        )
-        assertTrue(res.isSuccess)
-
-        composeRule.activityRule.scenario.recreate()
-        composeRule.waitUntil(timeoutMillis = 6_000L) {
-            composeRule.onAllNodesWithTag("home_connect_button").fetchSemanticsNodes().isNotEmpty()
+    fun authScreenValidatesEmailInputWithoutOfflineBypass() {
+        composeRule.waitUntil(timeoutMillis = 5_000L) {
+            composeRule.onAllNodesWithTag("auth_email_input").fetchSemanticsNodes().isNotEmpty()
         }
-        composeRule.onNodeWithTag("home_connect_button").performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithTag("home_combo_shield_switch").performScrollTo().assertIsDisplayed()
-    }
+        composeRule.onNodeWithTag("auth_email_input").performScrollTo().performTextInput("invalid-email")
+        composeRule.onNodeWithTag("auth_password_input").performScrollTo().performTextInput("pass123")
+        composeRule.onNodeWithTag("auth_email_submit_button").performScrollTo().performClick()
 
-    @Test
-    fun signedInAdminLaunchRendersManagementOverviewWithoutCrash() {
-        val authManager = LocalUserAuthManager(context)
-        val res = authManager.signInOrRegisterOfflineEmail(
-            rawEmail = LocalUserAuthManager.ADMIN_EMAIL,
-            rawPassword = "@ALI1384alii",
-            requireExplicitSignUp = false
-        )
-        assertTrue(res.isSuccess)
-
-        composeRule.activityRule.scenario.recreate()
-        composeRule.waitUntil(timeoutMillis = 6_000L) {
-            composeRule.onAllNodesWithTag("admin_overview_screen").fetchSemanticsNodes().isNotEmpty()
+        composeRule.waitUntil(timeoutMillis = 3_000L) {
+            composeRule.onAllNodesWithTag("auth_error_text").fetchSemanticsNodes().isNotEmpty()
         }
-        composeRule.onNodeWithTag("admin_overview_screen").assertIsDisplayed()
+        composeRule.onNodeWithTag("auth_error_text").assertIsDisplayed()
     }
 
     @Test

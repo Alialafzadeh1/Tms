@@ -42,6 +42,9 @@
                 <data
                     android:scheme="tmsvpn"
                     android:host="activate" />
+                <data
+                    android:scheme="tmsvpn"
+                    android:host="refer" />
             </intent-filter>
         </activity>
 

@@ -27,14 +27,16 @@ service cloud.firestore {
       return val is timestamp && val <= request.time;
     }
 
-    // Bootstrapped primary super-admin verified email check (O(1), safe inside allow list)
+    // Server-verified custom claims admin check (O(1), zero raw email assumptions)
     function isBootstrappedAdmin() {
-      return isSignedIn() &&
-             request.auth.token.email_verified == true &&
-             request.auth.token.email == 'alafzadehali@gmail.com';
+      return isSignedIn() && (
+             request.auth.token.admin == true ||
+             request.auth.token.role == 'SUPER_ADMIN' ||
+             request.auth.token.role == 'admin'
+      );
     }
 
-    // Full Admin check for get/create/update/delete (verified email OR registered /admins/{uid})
+    // Full Admin check for get/create/update/delete (verified custom claim OR registered /admins/{uid})
     function isAdmin() {
       return isBootstrappedAdmin() ||
              (isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
@@ -617,6 +619,68 @@ service cloud.firestore {
 
         allow update, delete: if false;
       }
+    }
+
+    // --- CRYPTO PAYMENT INVOICES (SERVER-CONTROLLED ONLY) ---
+    match /crypto_invoices/{invoiceId} {
+      allow get: if isSignedIn() && isValidId(invoiceId) && (existing().userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isBootstrappedAdmin());
+      // Only backend / admin workers create or verify crypto invoices (prevents spoofed CONFIRMED status)
+      allow create, update: if isAdmin() && isValidId(invoiceId);
+      allow delete: if false;
+    }
+
+    // --- 1-DAY FREE TRIAL COOLDOWN & GRANTS (1 PER 7 DAYS SERVER-ENFORCED) ---
+    match /trial_grants/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
+      allow list: if isBootstrappedAdmin();
+      // Only backend / admin workers can grant or update trial cooldown timestamps
+      allow create, update: if isAdmin() && isValidId(userId) && incoming().userId == userId;
+      allow delete: if false;
+    }
+
+    // --- REFERRAL CODES, REFERRAL TRACKING & CUMULATIVE REWARD REQUESTS ---
+    match /referral_codes/{code} {
+      allow get: if isSignedIn() && isValidId(code) && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.ownerUid == request.auth.uid || isBootstrappedAdmin());
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /referrals/{referralId} {
+      allow get: if isSignedIn() && isValidId(referralId) &&
+                    (existing().referrerUid == request.auth.uid || existing().referredUid == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.referrerUid == request.auth.uid || isBootstrappedAdmin());
+      // Server-side qualification only (bot start + APK download click + Firebase app login)
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /referral_reward_requests/{requestId} {
+      allow get: if isSignedIn() && isValidId(requestId) && (existing().userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isBootstrappedAdmin());
+
+      // Client can only submit PENDING reward requests for valid milestones (2, 4, 10)
+      allow create: if isSignedIn() &&
+                       isValidId(requestId) &&
+                       incoming().userId == request.auth.uid &&
+                       incoming().status == 'PENDING' &&
+                       (incoming().milestoneThreshold == 2 || incoming().milestoneThreshold == 4 || incoming().milestoneThreshold == 10) &&
+                       !('reviewedAt' in incoming()) &&
+                       isValidTimestamp(incoming().createdAt);
+
+      // Only admin/backend can approve or reject reward requests
+      allow update: if isAdmin() &&
+                       isValidId(requestId) &&
+                       incoming().userId == existing().userId &&
+                       (incoming().status == 'APPROVED' || incoming().status == 'REJECTED' || incoming().status == 'PENDING');
+
+      allow delete: if false;
+    }
+
+    // --- DYNAMIC APK RELEASES (R2 METADATA) ---
+    match /app_releases/{releaseId} {
+      allow get: if isValidId(releaseId) && (existing().isPublished == true || isAdmin());
+      allow list: if resource.data.isPublished == true || isBootstrappedAdmin();
+      allow create, update, delete: if isAdmin() && isValidId(releaseId);
     }
   }
 }

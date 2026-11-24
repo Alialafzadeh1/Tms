@@ -1,282 +1,340 @@
 package com.example.data.security
 
 import android.content.Context
-import android.util.Base64
 import android.util.Log
 import androidx.credentials.ClearCredentialStateRequest
 import androidx.credentials.CredentialManager
-import com.example.data.local.RegisteredUserEntity
+import com.example.data.model.AdminRole
 import com.google.firebase.Firebase
+import com.google.firebase.FirebaseNetworkException
+import com.google.firebase.auth.FirebaseAuthException
+import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
+import com.google.firebase.auth.FirebaseAuthInvalidUserException
+import com.google.firebase.auth.FirebaseAuthUserCollisionException
+import com.google.firebase.auth.FirebaseUser
+import com.google.firebase.auth.UserProfileChangeRequest
 import com.google.firebase.auth.auth
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.tasks.await
 import java.security.MessageDigest
-import java.security.SecureRandom
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
 
-private const val TAG = "UserAuthSession"
-private const val PREFS_NAME = "tms_local_intranet_auth"
-private const val KEY_ACTIVE_EMAIL = "active_offline_email"
-private const val KEY_HASH_PREFIX = "pw_hash_"
-private const val KEY_SALT_PREFIX = "pw_salt_"
-private const val KEY_NAME_PREFIX = "display_name_"
-private const val KEY_CREATED_PREFIX = "created_at_"
-private const val KEY_REGISTERED_EMAILS = "registered_emails_index"
+private const val TAG = "FirebaseUserAuth"
 
-private const val ADMIN_PW_SALT = "tms-admin-vault-salt-2026"
-private const val ADMIN_PW_HASH_B64 = "C6Xr4uUsQHB39tH0Oi4OQLCTKQSN1GeEbTbLz319cT4="
+/**
+ * Pure validated credential payload returned before calling Firebase Auth.
+ */
+sealed interface CredentialValidationResult {
+    data class Valid(
+        val email: String,
+        val password: String,
+        val displayName: String
+    ) : CredentialValidationResult
 
-data class AuthenticatedUser(
+    data class Invalid(val messageFa: String, val messageEn: String) : CredentialValidationResult
+}
+
+data class VerifiedFirebaseSession(
     val uid: String,
-    val username: String,
     val email: String,
-    val role: String = "USER",
-    val isOfflineIntranetMode: Boolean = false,
-    val isAdmin: Boolean = false
+    val displayName: String,
+    val emailVerified: Boolean,
+    val idToken: String,
+    val isServerAdmin: Boolean,
+    val verifiedAdminRole: AdminRole?
 )
 
-data class LocalEmailAuthResult(
+data class FirebaseAuthResult(
     val isSuccess: Boolean,
-    val user: AuthenticatedUser? = null,
+    val user: FirebaseUser? = null,
+    val session: VerifiedFirebaseSession? = null,
     val isNewAccount: Boolean = false,
-    val errorMessage: String? = null
+    val verificationEmailSent: Boolean = false,
+    val errorMessageFa: String? = null,
+    val errorMessageEn: String? = null
 )
 
 /**
- * Unified Email & Password Authentication Manager for TMS VPN / TMS NEXUS AI.
+ * Real Firebase Email/Password Authentication & Token Verification Manager.
  *
- * - Authenticates both standard users and Super Admin (`alafzadehali@gmail.com`) via salted PBKDF2-HMAC-SHA256.
- * - Maintains user display name, UID (`intranet_<hash>` for stable ID parity), and registered user index
- *   so the Admin Panel sees every registered user immediately.
+ * Security guarantees:
+ * - Zero hardcoded passwords, hashes, salts, or offline bypass flows.
+ * - Canonical user identity is strictly Firebase `uid`.
+ * - Admin privileges are never determined by raw email strings; they come strictly
+ *   from verified Firebase ID token custom claims (`admin == true` / `role`) and
+ *   backend / Firestore verification.
  */
 class LocalUserAuthManager(private val context: Context) {
 
     companion object {
-        const val ADMIN_EMAIL = "alafzadehali@gmail.com"
+        private val EMAIL_REGEX = Regex("^[A-Za-z0-9+_.-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$")
 
-        private val _offlineUserFlow = MutableStateFlow<AuthenticatedUser?>(null)
-        val offlineUserFlow: StateFlow<AuthenticatedUser?> = _offlineUserFlow.asStateFlow()
+        fun validateCredentialsInput(
+            rawEmail: String,
+            rawPassword: String,
+            rawDisplayName: String = "",
+            isSignUp: Boolean = false
+        ): CredentialValidationResult {
+            val email = rawEmail.trim().lowercase()
+            val password = rawPassword
+            val displayName = rawDisplayName.trim()
 
-        fun isAdminEmail(email: String?): Boolean {
-            return email?.trim()?.equals(ADMIN_EMAIL, ignoreCase = true) == true
-        }
-
-        fun restoreOfflineSession(context: Context): AuthenticatedUser? {
-            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val savedEmail = prefs.getString(KEY_ACTIVE_EMAIL, null)?.trim()?.lowercase()
-            if (savedEmail.isNullOrBlank()) {
-                _offlineUserFlow.value = null
-                return null
-            }
-            val storedName = prefs.getString("$KEY_NAME_PREFIX${sha256Hex(savedEmail)}", null).orEmpty()
-            val restored = buildEmailUser(savedEmail, storedName)
-            _offlineUserFlow.value = restored
-            return restored
-        }
-
-        fun clearOfflineSession(context: Context) {
-            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            prefs.edit().remove(KEY_ACTIVE_EMAIL).apply()
-            _offlineUserFlow.value = null
-        }
-
-        fun getAllRegisteredPrefProfiles(context: Context): List<RegisteredUserEntity> {
-            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val emails = (prefs.getStringSet(KEY_REGISTERED_EMAILS, emptySet()).orEmpty() +
-                listOfNotNull(prefs.getString(KEY_ACTIVE_EMAIL, null)))
-                .map { it.trim().lowercase() }
-                .filter { it.isNotBlank() }
-                .distinct()
-
-            val now = System.currentTimeMillis()
-            return emails.map { email ->
-                val emailKey = sha256Hex(email)
-                val user = buildEmailUser(email, prefs.getString("$KEY_NAME_PREFIX$emailKey", null).orEmpty())
-                val created = prefs.getLong("$KEY_CREATED_PREFIX$emailKey", now)
-                RegisteredUserEntity(
-                    userId = user.uid,
-                    displayName = user.username,
-                    email = user.email,
-                    role = user.role,
-                    maxDevices = 10,
-                    dataLimitBytes = 500.0 * 1024 * 1024 * 1024,
-                    subscriptionStatus = if (user.isAdmin) "active" else "expired",
-                    createdAtMs = created,
-                    updatedAtMs = now
+            if (!EMAIL_REGEX.matches(email)) {
+                return CredentialValidationResult.Invalid(
+                    messageFa = "لطفاً یک نشانی ایمیل معتبر وارد کنید",
+                    messageEn = "Please enter a valid email address"
                 )
             }
-        }
-
-        private fun buildEmailUser(normalizedEmail: String, customName: String = ""): AuthenticatedUser {
-            val uidSuffix = sha256Hex(normalizedEmail).take(16)
-            val admin = isAdminEmail(normalizedEmail)
-            val resolvedName = customName.trim().ifBlank {
-                if (admin) "Super Admin" else normalizedEmail.substringBefore("@").ifBlank { "TMS User" }
-            }
-            return AuthenticatedUser(
-                uid = "intranet_$uidSuffix",
-                username = resolvedName,
-                email = normalizedEmail,
-                role = if (admin) "SUPER_ADMIN" else "USER",
-                isOfflineIntranetMode = false,
-                isAdmin = admin
-            )
-        }
-
-        private fun sha256Hex(text: String): String {
-            val bytes = MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8))
-            return bytes.joinToString("") { "%02x".format(it) }
-        }
-    }
-
-    fun getActiveSessionUser(): AuthenticatedUser? {
-        val fbUser = runCatching { Firebase.auth.currentUser }.getOrNull()
-        if (fbUser != null) {
-            val admin = isAdminEmail(fbUser.email)
-            val displayName = fbUser.displayName?.takeIf { it.isNotBlank() }
-                ?: fbUser.email?.substringBefore("@")?.takeIf { it.isNotBlank() }
-                ?: "TMS User"
-            return AuthenticatedUser(
-                uid = fbUser.uid,
-                username = displayName,
-                email = fbUser.email.orEmpty(),
-                role = if (admin) "SUPER_ADMIN" else "USER",
-                isOfflineIntranetMode = false,
-                isAdmin = admin
-            )
-        }
-        return _offlineUserFlow.value ?: restoreOfflineSession(context)
-    }
-
-    fun signInOrRegisterOfflineEmail(
-        rawEmail: String,
-        rawPassword: String,
-        rawDisplayName: String = "",
-        requireExplicitSignUp: Boolean? = null
-    ): LocalEmailAuthResult {
-        val email = rawEmail.trim().lowercase()
-        val password = rawPassword.trim()
-        val displayName = rawDisplayName.trim()
-
-        if (!isValidEmail(email)) {
-            return LocalEmailAuthResult(
-                isSuccess = false,
-                errorMessage = "لطفاً یک نشانی ایمیل معتبر وارد کنید"
-            )
-        }
-        if (password.length < 6) {
-            return LocalEmailAuthResult(
-                isSuccess = false,
-                errorMessage = "رمز عبور باید حداقل ۶ کاراکتر باشد"
-            )
-        }
-
-        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val emailKey = sha256Hex(email)
-        val currentIndex = prefs.getStringSet(KEY_REGISTERED_EMAILS, emptySet()).orEmpty().toMutableSet()
-
-        // Strict verification for the reserved Super Admin email (never permits arbitrary registration)
-        if (isAdminEmail(email)) {
-            if (requireExplicitSignUp == true) {
-                return LocalEmailAuthResult(
-                    isSuccess = false,
-                    errorMessage = "حساب مدیریت ارشد از پیش ثبت شده است؛ لطفاً از بخش ورود اقدام کنید"
+            if (password.length < 6) {
+                return CredentialValidationResult.Invalid(
+                    messageFa = "رمز عبور باید حداقل ۶ کاراکتر باشد",
+                    messageEn = "Password must be at least 6 characters"
                 )
             }
-            val candidateDigest = pbkdf2HmacSha256(
+            if (isSignUp && displayName.isNotBlank() && displayName.length < 2) {
+                return CredentialValidationResult.Invalid(
+                    messageFa = "نام نمایشی باید حداقل ۲ کاراکتر باشد",
+                    messageEn = "Display name must be at least 2 characters"
+                )
+            }
+            return CredentialValidationResult.Valid(
+                email = email,
                 password = password,
-                salt = ADMIN_PW_SALT.toByteArray(Charsets.UTF_8)
+                displayName = displayName
             )
-            val expectedDigest = Base64.decode(ADMIN_PW_HASH_B64, Base64.NO_WRAP)
-            if (!MessageDigest.isEqual(expectedDigest, candidateDigest)) {
-                return LocalEmailAuthResult(
-                    isSuccess = false,
-                    errorMessage = "رمز عبور برای این ایمیل اشتباه است"
-                )
+        }
+
+        /**
+         * Computes the legacy offline UID (`intranet_<16-hex>`) strictly as a read-only
+         * source identifier for migrating old Room data into the canonical Firebase UID.
+         */
+        fun computeLegacyIntranetUid(email: String): String {
+            val normalized = email.trim().lowercase()
+            if (normalized.isBlank()) return ""
+            val bytes = MessageDigest.getInstance("SHA-256").digest(normalized.toByteArray(Charsets.UTF_8))
+            val hex = bytes.joinToString("") { "%02x".format(it) }.take(16)
+            return "intranet_$hex"
+        }
+
+        fun extractVerifiedClaims(
+            claims: Map<String, Any>,
+            uid: String,
+            email: String,
+            displayName: String,
+            emailVerified: Boolean,
+            token: String
+        ): VerifiedFirebaseSession {
+            val rawAdminClaim = claims["admin"] == true
+            val rawRoleClaim = claims["role"]?.toString()?.trim()
+            val roleFromClaim = AdminRole.fromVerifiedClaimOrNull(rawRoleClaim)
+            val isAdmin = rawAdminClaim || roleFromClaim != null
+            return VerifiedFirebaseSession(
+                uid = uid,
+                email = email,
+                displayName = displayName,
+                emailVerified = emailVerified,
+                idToken = token,
+                isServerAdmin = isAdmin,
+                verifiedAdminRole = when {
+                    roleFromClaim != null -> roleFromClaim
+                    rawAdminClaim -> AdminRole.SUPER_ADMIN
+                    else -> null
+                }
+            )
+        }
+
+        fun mapFirebaseAuthException(error: Throwable): Pair<String, String> {
+            return when (error) {
+                is FirebaseAuthInvalidUserException -> {
+                    "حسابی با این ایمیل یافت نشد؛ لطفاً ابتدا ثبت‌نام کنید." to
+                        "No account found for this email. Please register first."
+                }
+                is FirebaseAuthInvalidCredentialsException -> {
+                    "ایمیل یا رمز عبور نامعتبر است." to
+                        "Invalid email or password."
+                }
+                is FirebaseAuthUserCollisionException -> {
+                    "این ایمیل قبلاً ثبت‌نام شده است؛ از بخش ورود وارد شوید." to
+                        "This email is already registered. Please sign in instead."
+                }
+                is FirebaseNetworkException -> {
+                    "عدم دسترسی به سرور احراز هویت؛ اتصال اینترنت خود را بررسی کنید." to
+                        "Network error reaching authentication server. Check connectivity."
+                }
+                is FirebaseAuthException -> {
+                    when (error.errorCode) {
+                        "ERROR_TOO_MANY_REQUESTS" ->
+                            "تعداد تلاش‌ها بیش از حد مجاز بوده است؛ چند دقیقه صبر کنید." to
+                                "Too many attempts. Please wait a few minutes."
+                        "ERROR_USER_DISABLED" ->
+                            "این حساب کاربری غیرفعال شده است." to
+                                "This account has been disabled."
+                        "ERROR_WEAK_PASSWORD" ->
+                            "رمز عبور ضعیف است؛ رمز قویتری انتخاب کنید." to
+                                "Password is too weak. Choose a stronger password."
+                        "ERROR_OPERATION_NOT_ALLOWED" ->
+                            "ورود با ایمیل و رمز عبور در پروژه Firebase فعال نشده است." to
+                                "Email/Password sign-in is not enabled in Firebase Console."
+                        else -> (error.localizedMessage ?: "خطای احراز هویت") to
+                            (error.localizedMessage ?: "Authentication failed")
+                    }
+                }
+                else -> (error.localizedMessage ?: "خطای احراز هویت") to
+                    (error.localizedMessage ?: "Authentication error")
             }
-            currentIndex.add(email)
-            val resolvedName = displayName.ifBlank {
-                prefs.getString("$KEY_NAME_PREFIX$emailKey", null) ?: "Super Admin"
-            }
-            prefs.edit()
-                .putString(KEY_ACTIVE_EMAIL, email)
-                .putString("$KEY_NAME_PREFIX$emailKey", resolvedName)
-                .putStringSet(KEY_REGISTERED_EMAILS, currentIndex)
-                .apply()
-            val adminUser = buildEmailUser(email, resolvedName)
-            _offlineUserFlow.value = adminUser
-            return LocalEmailAuthResult(
+        }
+    }
+
+    fun getCurrentFirebaseUser(): FirebaseUser? = runCatching { Firebase.auth.currentUser }.getOrNull()
+
+    suspend fun signInWithFirebaseEmail(
+        rawEmail: String,
+        rawPassword: String
+    ): FirebaseAuthResult {
+        val validation = validateCredentialsInput(rawEmail, rawPassword, isSignUp = false)
+        if (validation is CredentialValidationResult.Invalid) {
+            return FirebaseAuthResult(
+                isSuccess = false,
+                errorMessageFa = validation.messageFa,
+                errorMessageEn = validation.messageEn
+            )
+        }
+        val valid = validation as CredentialValidationResult.Valid
+
+        return try {
+            val result = Firebase.auth.signInWithEmailAndPassword(valid.email, valid.password).await()
+            val user = result.user ?: return FirebaseAuthResult(
+                isSuccess = false,
+                errorMessageFa = "نشست کاربر پس از ورود دریافت نشد.",
+                errorMessageEn = "Signed-in user session unavailable."
+            )
+            val session = getVerifiedFirebaseSession(user, forceRefresh = true)
+            FirebaseAuthResult(
                 isSuccess = true,
-                user = adminUser,
-                isNewAccount = false,
-                errorMessage = null
+                user = user,
+                session = session,
+                isNewAccount = false
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "Firebase sign-in failed: ${t.message}")
+            val (fa, en) = mapFirebaseAuthException(t)
+            FirebaseAuthResult(isSuccess = false, errorMessageFa = fa, errorMessageEn = en)
+        }
+    }
+
+    suspend fun registerWithFirebaseEmail(
+        rawDisplayName: String,
+        rawEmail: String,
+        rawPassword: String
+    ): FirebaseAuthResult {
+        val validation = validateCredentialsInput(
+            rawEmail = rawEmail,
+            rawPassword = rawPassword,
+            rawDisplayName = rawDisplayName,
+            isSignUp = true
+        )
+        if (validation is CredentialValidationResult.Invalid) {
+            return FirebaseAuthResult(
+                isSuccess = false,
+                errorMessageFa = validation.messageFa,
+                errorMessageEn = validation.messageEn
             )
         }
+        val valid = validation as CredentialValidationResult.Valid
 
-        val storedHash = prefs.getString("$KEY_HASH_PREFIX$emailKey", null)
-        val storedSaltB64 = prefs.getString("$KEY_SALT_PREFIX$emailKey", null)
+        return try {
+            val result = Firebase.auth.createUserWithEmailAndPassword(valid.email, valid.password).await()
+            val user = result.user ?: return FirebaseAuthResult(
+                isSuccess = false,
+                errorMessageFa = "خطا در ایجاد حساب کاربری Firebase.",
+                errorMessageEn = "Failed creating Firebase account."
+            )
 
-        val isNewAccount: Boolean
-        if (storedHash != null && storedSaltB64 != null) {
-            if (requireExplicitSignUp == true) {
-                return LocalEmailAuthResult(
-                    isSuccess = false,
-                    errorMessage = "این ایمیل قبلاً ثبت‌نام شده است؛ از بخش ورود وارد شوید"
-                )
+            val desiredName = valid.displayName.ifBlank {
+                valid.email.substringBefore("@").ifBlank { "TMS User" }
             }
-            val salt = Base64.decode(storedSaltB64, Base64.NO_WRAP)
-            val candidateHash = hashPassword(password, salt)
-            val expectedBytes = Base64.decode(storedHash, Base64.NO_WRAP)
-            val actualBytes = Base64.decode(candidateHash, Base64.NO_WRAP)
-            if (!MessageDigest.isEqual(expectedBytes, actualBytes)) {
-                return LocalEmailAuthResult(
-                    isSuccess = false,
-                    errorMessage = "رمز عبور برای این ایمیل اشتباه است"
-                )
+            runCatching {
+                val req = UserProfileChangeRequest.Builder()
+                    .setDisplayName(desiredName)
+                    .build()
+                user.updateProfile(req).await()
             }
-            isNewAccount = false
-        } else {
-            if (requireExplicitSignUp == false) {
-                return LocalEmailAuthResult(
-                    isSuccess = false,
-                    errorMessage = "حسابی با این ایمیل یافت نشد؛ لطفاً ابتدا ثبت‌نام کنید"
-                )
-            }
-            val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
-            val derivedHash = hashPassword(password, salt)
-            val saltB64 = Base64.encodeToString(salt, Base64.NO_WRAP)
-            val nowMs = System.currentTimeMillis()
-            prefs.edit()
-                .putString("$KEY_HASH_PREFIX$emailKey", derivedHash)
-                .putString("$KEY_SALT_PREFIX$emailKey", saltB64)
-                .putLong("$KEY_CREATED_PREFIX$emailKey", nowMs)
-                .apply()
-            isNewAccount = true
+
+            val verificationSent = runCatching {
+                user.sendEmailVerification().await()
+                true
+            }.getOrDefault(false)
+
+            val session = getVerifiedFirebaseSession(user, forceRefresh = true)
+            FirebaseAuthResult(
+                isSuccess = true,
+                user = user,
+                session = session,
+                isNewAccount = true,
+                verificationEmailSent = verificationSent
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "Firebase registration failed: ${t.message}")
+            val (fa, en) = mapFirebaseAuthException(t)
+            FirebaseAuthResult(isSuccess = false, errorMessageFa = fa, errorMessageEn = en)
         }
+    }
 
-        currentIndex.add(email)
-        val storedName = prefs.getString("$KEY_NAME_PREFIX$emailKey", null).orEmpty()
-        val effectiveName = displayName.ifBlank { storedName.ifBlank { email.substringBefore("@") } }
-        prefs.edit()
-            .putString(KEY_ACTIVE_EMAIL, email)
-            .putString("$KEY_NAME_PREFIX$emailKey", effectiveName)
-            .putStringSet(KEY_REGISTERED_EMAILS, currentIndex)
-            .apply()
+    suspend fun sendPasswordReset(rawEmail: String): Result<Unit> {
+        val email = rawEmail.trim().lowercase()
+        if (!EMAIL_REGEX.matches(email)) {
+            return Result.failure(IllegalArgumentException("لطفاً یک نشانی ایمیل معتبر وارد کنید"))
+        }
+        return try {
+            Firebase.auth.sendPasswordResetEmail(email).await()
+            Result.success(Unit)
+        } catch (t: Throwable) {
+            val (fa, _) = mapFirebaseAuthException(t)
+            Result.failure(IllegalStateException(fa, t))
+        }
+    }
 
-        val user = buildEmailUser(email, effectiveName)
-        _offlineUserFlow.value = user
-        return LocalEmailAuthResult(
-            isSuccess = true,
-            user = user,
-            isNewAccount = isNewAccount,
-            errorMessage = null
-        )
+    suspend fun sendEmailVerification(): Result<Unit> {
+        val user = getCurrentFirebaseUser()
+            ?: return Result.failure(IllegalStateException("ابتدا وارد حساب کاربری خود شوید"))
+        return try {
+            user.sendEmailVerification().await()
+            Result.success(Unit)
+        } catch (t: Throwable) {
+            val (fa, _) = mapFirebaseAuthException(t)
+            Result.failure(IllegalStateException(fa, t))
+        }
+    }
+
+    suspend fun getVerifiedFirebaseSession(
+        user: FirebaseUser? = getCurrentFirebaseUser(),
+        forceRefresh: Boolean = false
+    ): VerifiedFirebaseSession? {
+        val activeUser = user ?: return null
+        return try {
+            val tokenResult = activeUser.getIdToken(forceRefresh).await()
+            val token = tokenResult.token.orEmpty()
+            val email = activeUser.email.orEmpty()
+            val displayName = activeUser.displayName?.takeIf { it.isNotBlank() }
+                ?: email.substringBefore("@").ifBlank { "TMS User" }
+            extractVerifiedClaims(
+                claims = tokenResult.claims,
+                uid = activeUser.uid,
+                email = email,
+                displayName = displayName,
+                emailVerified = activeUser.isEmailVerified,
+                token = token
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed retrieving Firebase ID token claims: ${t.message}")
+            null
+        }
+    }
+
+    suspend fun getFreshIdToken(forceRefresh: Boolean = false): String? {
+        val user = getCurrentFirebaseUser() ?: return null
+        return runCatching { user.getIdToken(forceRefresh).await().token }.getOrNull()
     }
 
     suspend fun logout() {
-        clearOfflineSession(context)
         try {
             CredentialManager.create(context).clearCredentialState(ClearCredentialStateRequest())
         } catch (e: Exception) {
@@ -285,53 +343,4 @@ class LocalUserAuthManager(private val context: Context) {
             runCatching { Firebase.auth.signOut() }
         }
     }
-
-    private fun isValidEmail(email: String): Boolean {
-        val at = email.indexOf('@')
-        val dot = email.lastIndexOf('.')
-        return at > 0 && dot > at + 1 && dot < email.length - 1 && !email.contains(' ')
-    }
-
-    private fun hashPassword(password: String, salt: ByteArray): String {
-        val dk = pbkdf2HmacSha256(password, salt)
-        return Base64.encodeToString(dk, Base64.NO_WRAP)
-    }
-
-    private fun pbkdf2HmacSha256(
-        password: String,
-        salt: ByteArray,
-        iterations: Int = 10_000,
-        keyLenBytes: Int = 32
-    ): ByteArray {
-        val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(password.toByteArray(Charsets.UTF_8), "HmacSHA256"))
-
-        val hashLen = 32
-        val blocks = (keyLenBytes + hashLen - 1) / hashLen
-        val result = ByteArray(blocks * hashLen)
-        val intBlock = ByteArray(4)
-
-        for (blockIndex in 1..blocks) {
-            intBlock[0] = ((blockIndex ushr 24) and 0xFF).toByte()
-            intBlock[1] = ((blockIndex ushr 16) and 0xFF).toByte()
-            intBlock[2] = ((blockIndex ushr 8) and 0xFF).toByte()
-            intBlock[3] = (blockIndex and 0xFF).toByte()
-
-            mac.reset()
-            mac.update(salt)
-            var u = mac.doFinal(intBlock)
-            val t = u.copyOf()
-
-            for (iter in 1 until iterations) {
-                mac.reset()
-                u = mac.doFinal(u)
-                for (j in t.indices) {
-                    t[j] = (t[j].toInt() xor u[j].toInt()).toByte()
-                }
-            }
-            System.arraycopy(t, 0, result, (blockIndex - 1) * hashLen, hashLen)
-        }
-        return result.copyOf(keyLenBytes)
-    }
 }
-

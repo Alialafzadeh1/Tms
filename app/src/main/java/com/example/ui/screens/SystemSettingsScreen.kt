@@ -98,7 +98,9 @@ fun SystemSettingsScreen(
     onLockSession: () -> Unit,
     onVerifyPin: (pin: String) -> Boolean,
     getRecoveryToken: () -> String,
-    onSignOutComplete: () -> Unit
+    onSignOutComplete: () -> Unit,
+    hasConfiguredPin: Boolean = true,
+    onConfigureInitialPin: (newPin: String) -> Unit = {}
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -111,9 +113,11 @@ fun SystemSettingsScreen(
     var showChangePinModal by remember { mutableStateOf(false) }
     var showEmergencyModal by remember { mutableStateOf(false) }
     var showUnlockModal by remember { mutableStateOf(false) }
+    var showSetupInitialPinModal by remember { mutableStateOf(false) }
 
     var oldPinInput by remember { mutableStateOf("") }
     var newPinInput by remember { mutableStateOf("") }
+    var initialPinInput by remember { mutableStateOf("") }
     var recoveryTokenInput by remember { mutableStateOf("") }
     var emergencyNewPinInput by remember { mutableStateOf("") }
     var unlockPinInput by remember { mutableStateOf("") }
@@ -249,6 +253,15 @@ fun SystemSettingsScreen(
                                 contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
                             ) {
                                 Text(text = if (isPersian) "قفل نشست" else "Lock", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                        } else if (!hasConfiguredPin) {
+                            Button(
+                                onClick = { showSetupInitialPinModal = true },
+                                colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen, contentColor = Color(0xFF021B10)),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                            ) {
+                                Text(text = if (isPersian) "تنظیم پین" else "Setup PIN", fontSize = 11.sp, fontWeight = FontWeight.Bold)
                             }
                         } else {
                             Button(
@@ -595,7 +608,7 @@ fun SystemSettingsScreen(
                 onClick = {
                     coroutineScope.launch {
                         withContext(NonCancellable) {
-                            LocalUserAuthManager.clearOfflineSession(context)
+                            LocalUserAuthManager(context).logout()
                             try {
                                 credentialManager.clearCredentialState(ClearCredentialStateRequest())
                             } catch (e: Exception) {
@@ -652,7 +665,7 @@ fun SystemSettingsScreen(
                     OutlinedTextField(
                         value = oldPinInput,
                         onValueChange = { oldPinInput = it },
-                        label = { Text("پین قبلی (پیش‌فرض: 123456)") },
+                        label = { Text(if (isPersian) "پین فعلی" else "Current PIN") },
                         modifier = Modifier.fillMaxWidth(),
                         visualTransformation = PasswordVisualTransformation(),
                         colors = OutlinedTextFieldDefaults.colors(
@@ -818,7 +831,7 @@ fun SystemSettingsScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        text = if (isPersian) "جهت فعال‌سازی نشست امن، پین ۶ رقمی مدیر را وارد کنید (پیش‌فرض: 123456):" else "Enter master 6-digit security PIN to unlock session (default: 123456):",
+                        text = if (isPersian) "جهت فعال‌سازی نشست امن، پین اختصاصی مدیر را وارد کنید:" else "Enter your custom administrator security PIN to unlock session:",
                         fontSize = 12.sp,
                         color = TextWhitePrimary
                     )
@@ -856,6 +869,62 @@ fun SystemSettingsScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showUnlockModal = false }) {
+                    Text(text = if (isPersian) "انصراف" else "Cancel", color = TextGraySecondary)
+                }
+            }
+        )
+    }
+
+    if (showSetupInitialPinModal) {
+        AlertDialog(
+            onDismissRequest = { showSetupInitialPinModal = false },
+            containerColor = CardSurfaceDark,
+            title = {
+                Text(
+                    text = if (isPersian) "تنظیم پین امنیتی مدیر" else "Configure Initial Admin PIN",
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MetallicGold
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = if (isPersian) "یک پین اختصاصی حداقل ۶ رقمی برای محافظت نشست کنسول مدیریت انتخاب کنید:" else "Choose a custom 6+ character security PIN to protect admin console sessions:",
+                        fontSize = 12.sp,
+                        color = TextWhitePrimary
+                    )
+                    OutlinedTextField(
+                        value = initialPinInput,
+                        onValueChange = { initialPinInput = it },
+                        label = { Text(if (isPersian) "پین امنیتی جدید" else "New Security PIN") },
+                        modifier = Modifier.fillMaxWidth(),
+                        visualTransformation = PasswordVisualTransformation(),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = MetallicGold,
+                            unfocusedBorderColor = BorderGoldMuted,
+                            focusedTextColor = TextWhitePrimary,
+                            unfocusedTextColor = TextWhitePrimary
+                        ),
+                        singleLine = true
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onConfigureInitialPin(initialPinInput)
+                        initialPinInput = ""
+                        showSetupInitialPinModal = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen, contentColor = Color(0xFF021B10)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text(text = if (isPersian) "ثبت پین" else "Save PIN", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSetupInitialPinModal = false }) {
                     Text(text = if (isPersian) "انصراف" else "Cancel", color = TextGraySecondary)
                 }
             }

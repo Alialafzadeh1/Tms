@@ -7,7 +7,6 @@ import com.example.data.model.FailoverPolicy
 import com.example.data.model.UserProfile
 import com.example.data.model.VpnConfig
 import com.example.data.model.VpnServer
-import com.example.data.security.LocalUserAuthManager
 import com.google.firebase.Firebase
 import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.FirebaseAuth
@@ -428,12 +427,11 @@ class VpnRepository(private val dbProvider: () -> FirebaseFirestore?) {
         val docRef = db.collection("users").document(uid)
         val snapshot = docRef.get().await()
         if (!snapshot.exists()) {
-            val isAdminAccount = LocalUserAuthManager.isAdminEmail(email)
             val payload = mapOf(
                 "userId" to uid,
                 "displayName" to (if (displayName.isNotBlank()) displayName else "TMS User"),
                 "email" to (if (email.isNotBlank()) email else "$uid@tmsvpn.local"),
-                "role" to if (isAdminAccount) "SUPER_ADMIN" else "user",
+                "role" to "user",
                 "deviceCount" to 1,
                 "maxDevices" to 10,
                 "dataUsageBytes" to 0.0,
@@ -533,6 +531,16 @@ class VpnRepository(private val dbProvider: () -> FirebaseFirestore?) {
         } catch (e: Exception) {
             handleFirestoreError(e, OperationType.UPDATE, docRef.path)
             throw e
+        }
+    }
+
+    suspend fun verifyAdminDocumentExists(uid: String = requireUserId()): Boolean {
+        val database = dbProvider() ?: return false
+        return try {
+            val snapshot = database.collection("admins").document(uid).get().await()
+            snapshot.exists()
+        } catch (_: Exception) {
+            false
         }
     }
 }

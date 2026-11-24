@@ -74,14 +74,18 @@ enum class AdminRole(
     fun hasPermission(permission: AdminPermission): Boolean = permissions.contains(permission)
 
     companion object {
-        fun fromString(roleStr: String?): AdminRole {
-            return when (roleStr?.uppercase()) {
+        fun fromVerifiedClaimOrNull(roleStr: String?): AdminRole? {
+            return when (roleStr?.trim()?.uppercase()) {
                 "SUPER_ADMIN", "ADMIN" -> SUPER_ADMIN
                 "SERVER_MANAGER" -> SERVER_MANAGER
                 "USER_ADMIN" -> USER_ADMIN
                 "AUDITOR", "OPERATOR" -> AUDITOR
-                else -> SUPER_ADMIN
+                else -> null
             }
+        }
+
+        fun fromString(roleStr: String?): AdminRole {
+            return fromVerifiedClaimOrNull(roleStr) ?: AUDITOR
         }
     }
 }

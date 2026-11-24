@@ -81,15 +81,20 @@ import com.example.data.local.CleanIpAddressType
 import com.example.data.local.CleanIpEntity
 import com.example.data.local.CleanIpHealthStatus
 import com.example.data.model.AllocationHistoryRecord
+import com.example.data.model.AppReleaseInfo
+import com.example.data.model.CryptoPaymentInvoice
 import com.example.data.model.InventoryShortageAlert
 import com.example.data.model.ManagedEndpoint
 import com.example.data.model.PaymentRequestRecord
+import com.example.data.model.ReferralRewardRequest
+import com.example.data.model.ReferralRewardStatus
 import com.example.data.model.RotationAuditLog
 import com.example.data.model.SubscriptionPlanId
 import com.example.data.model.SubscriptionStatus
 import com.example.data.model.UserProfile
 import com.example.data.model.UserSubscription
 import com.example.data.subscription.SubscriptionLifecycleEngine
+import com.example.ui.components.AdminEcosystemTabContent
 import com.example.ui.theme.BorderGoldHighlight
 import com.example.ui.theme.BorderGoldMuted
 import com.example.ui.theme.CardSurfaceDark
@@ -110,7 +115,8 @@ import java.util.Locale
 private enum class AdminSubSection(val titleFa: String, val titleEn: String) {
     SUBSCRIPTIONS("اشتراک‌ها و تاییدها", "Subscriptions"),
     INVENTORY("استخر IP اختصاصی", "Endpoint Pool"),
-    SHORTAGES_LOGS("کمبود و لاگ چرخش", "Alerts & Logs")
+    SHORTAGES_LOGS("کمبود و لاگ چرخش", "Alerts & Logs"),
+    RELEASES_REFERRALS("پاداش و انتشار نسخه", "Rewards & APK")
 }
 
 @Composable
@@ -153,7 +159,16 @@ fun AdminSubscriptionScreen(
     onAddIpOnlyEndpoints: (String) -> Unit = {},
     preselectedGrantUid: String = "",
     preselectedGrantEmail: String = "",
-    openGrantTrigger: Int = 0
+    openGrantTrigger: Int = 0,
+    adminRewardRequests: List<ReferralRewardRequest> = emptyList(),
+    adminReleases: List<AppReleaseInfo> = emptyList(),
+    adminCryptoInvoices: List<CryptoPaymentInvoice> = emptyList(),
+    referralBusy: Boolean = false,
+    releaseBusy: Boolean = false,
+    onReviewReferralReward: (requestId: String, approve: Boolean, note: String) -> Unit = { _, _, _ -> },
+    onUploadApkRelease: (fileName: String, bytes: ByteArray, versionName: String, versionCode: Int, notes: String, publish: Boolean) -> Unit = { _, _, _, _, _, _ -> },
+    onToggleReleasePublish: (releaseId: String, publish: Boolean) -> Unit = { _, _ -> },
+    onRefreshEcosystem: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
@@ -209,10 +224,12 @@ fun AdminSubscriptionScreen(
             ) {
                 AdminSubSection.entries.forEach { section ->
                     val selected = activeSection == section
+                    val pendingRewardsCount = adminRewardRequests.count { it.status == ReferralRewardStatus.PENDING }
                     val badge = when (section) {
                         AdminSubSection.SUBSCRIPTIONS -> if (pendingRequests.isNotEmpty()) " (${pendingRequests.size})" else ""
                         AdminSubSection.INVENTORY -> " (${endpointInventory.size})"
                         AdminSubSection.SHORTAGES_LOGS -> if (unresolvedAlertsCount > 0) " ($unresolvedAlertsCount)" else ""
+                        AdminSubSection.RELEASES_REFERRALS -> if (pendingRewardsCount > 0) " ($pendingRewardsCount)" else ""
                     }
                     FilterChip(
                         selected = selected,
@@ -1075,6 +1092,23 @@ fun AdminSubscriptionScreen(
                             Text(text = log.details, fontSize = 11.sp, color = TextWhitePrimary)
                         }
                     }
+                }
+            }
+
+            AdminSubSection.RELEASES_REFERRALS -> {
+                item {
+                    AdminEcosystemTabContent(
+                        rewardRequests = adminRewardRequests,
+                        releases = adminReleases,
+                        cryptoInvoices = adminCryptoInvoices,
+                        referralBusy = referralBusy,
+                        releaseBusy = releaseBusy,
+                        isPersian = isPersian,
+                        onReviewReferralReward = onReviewReferralReward,
+                        onUploadApkRelease = onUploadApkRelease,
+                        onToggleReleasePublish = onToggleReleasePublish,
+                        onRefreshEcosystem = onRefreshEcosystem
+                    )
                 }
             }
         }

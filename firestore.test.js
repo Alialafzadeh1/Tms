@@ -20,6 +20,8 @@ function adminContext() {
   return testEnv.authenticatedContext(ADMIN_UID, {
     email: ADMIN_EMAIL,
     email_verified: true,
+    admin: true,
+    role: "SUPER_ADMIN",
   });
 }
 
@@ -631,4 +633,98 @@ test("Allocation History & Concurrent MVCC Double-Assignment Prevention: immutab
     throw new Error("Expected transactional exclusivity check to reject second assignment");
   }
 });
+
+test("Hardened admin claims & ecosystem collections (crypto, trial, referrals, app_releases)", async () => {
+  const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
+  const spoofEmailOnlyDb = testEnv.authenticatedContext("email_only_uid", {
+    email: ADMIN_EMAIL,
+    email_verified: true,
+  }).firestore();
+  const adminDb = adminContext().firestore();
+
+  // Verified email WITHOUT admin custom claim MUST NOT grant admin powers
+  await assertFails(
+    spoofEmailOnlyDb.collection("app_releases").doc("rel_1").set({
+      releaseId: "rel_1",
+      versionName: "2.0.0",
+      versionCode: 20,
+      downloadUrl: "https://tms-vpn-bot-core.24z1qne0u9xs.workers.dev/r2/app.apk",
+      isPublished: true,
+    })
+  );
+
+  // Admin can create unpublished and published APK releases
+  await assertSucceeds(
+    adminDb.collection("app_releases").doc("rel_pub").set({
+      releaseId: "rel_pub",
+      versionName: "2.1.0",
+      versionCode: 21,
+      downloadUrl: "https://tms-vpn-bot-core.24z1qne0u9xs.workers.dev/r2/pub.apk",
+      isPublished: true,
+    })
+  );
+  await assertSucceeds(
+    adminDb.collection("app_releases").doc("rel_draft").set({
+      releaseId: "rel_draft",
+      versionName: "2.2.0-rc1",
+      versionCode: 22,
+      downloadUrl: "https://tms-vpn-bot-core.24z1qne0u9xs.workers.dev/r2/draft.apk",
+      isPublished: false,
+    })
+  );
+
+  // Regular user can read published release, denied unpublished draft
+  await assertSucceeds(aliceDb.collection("app_releases").doc("rel_pub").get());
+  await assertFails(aliceDb.collection("app_releases").doc("rel_draft").get());
+
+  // User cannot forge crypto_invoices or trial_grants directly
+  await assertFails(
+    aliceDb.collection("crypto_invoices").doc("inv_fake").set({
+      invoiceId: "inv_fake",
+      userId: ALICE_UID,
+      status: "CONFIRMED",
+      createdAt: pastDate(),
+    })
+  );
+  await assertFails(
+    aliceDb.collection("trial_grants").doc(ALICE_UID).set({
+      userId: ALICE_UID,
+      activatedAtMs: Date.now(),
+      expiresAtMs: Date.now() + 86400000,
+      nextEligibleAtMs: Date.now() + 7 * 86400000,
+    })
+  );
+
+  // User can submit PENDING referral reward request for milestone 2, cannot submit pre-APPROVED
+  await assertSucceeds(
+    aliceDb.collection("referral_reward_requests").doc("req_alice_2").set({
+      userId: ALICE_UID,
+      milestoneThreshold: 2,
+      rewardGb: 1.0,
+      status: "PENDING",
+      createdAt: pastDate(),
+    })
+  );
+  await assertFails(
+    aliceDb.collection("referral_reward_requests").doc("req_alice_hack").set({
+      userId: ALICE_UID,
+      milestoneThreshold: 10,
+      rewardGb: 10.0,
+      status: "APPROVED",
+      createdAt: pastDate(),
+    })
+  );
+  await assertFails(
+    aliceDb.collection("referral_reward_requests").doc("req_alice_2").update({
+      status: "APPROVED",
+    })
+  );
+  await assertSucceeds(
+    adminDb.collection("referral_reward_requests").doc("req_alice_2").update({
+      status: "APPROVED",
+      adminNote: "Verified",
+    })
+  );
+});
+
 
